@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=64
+EXPECTED_MIGRATION_COUNT=65
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "064_wallet_backup_blobs.sql" ]] \
-  || die "unexpected migration-064 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "065_private_invoice_presentations.sql" ]] \
+  || die "unexpected migration-065 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -249,6 +249,40 @@ assert_empty_name_cutover_refusal() {
   echo "test-db: migration $number refused nonempty ownership state transactionally"
 }
 
+assert_private_invoice_cutover_refusal() {
+  local database="$1"
+  local migration="$2"
+  local scratch="${database}_migration_065_nonempty"
+  local refusal_output rollback_state
+
+  docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$scratch"
+  docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$scratch"
+  docker exec "$CONTAINER" psql --no-psqlrc --set ON_ERROR_STOP=1 \
+    --username "$PG_USER" --dbname "$scratch" \
+    --command "INSERT INTO invoices (nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, rate_minor_per_btc, rate_locks_until, bitcoin_address, accept_btc, accept_ln, accept_liquid, status, pricing_mode, presentation_status, settlement_status, expires_at) VALUES (NULL, repeat('6', 64), 'wallet', NULL, NULL, 21000, NULL, TIMESTAMPTZ '2030-01-01 00:00:00+00', 'bc1q065refusal0000000000000000000000000000000000000', TRUE, FALSE, FALSE, 'unpaid', 'sat_fixed', 'unpaid', 'none', TIMESTAMPTZ '2030-01-01 00:00:00+00');" >/dev/null
+
+  if refusal_output="$(
+    docker exec --interactive "$CONTAINER" \
+      psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" --dbname "$scratch" \
+        --set "runtime_role=$RUNTIME_ROLE" < "$migration" 2>&1
+  )"; then
+    die "migration 065 unexpectedly accepted an existing wallet invoice"
+  fi
+  [[ "$refusal_output" == *"migration 065 refuses wallet-origin rows"* ]] \
+    || die "migration 065 returned the wrong nonempty-wallet failure: $refusal_output"
+
+  rollback_state="$(
+    docker exec "$CONTAINER" \
+      psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --username "$PG_USER" --dbname "$scratch" \
+        --command "SELECT (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name IN ('recipient_label', 'public_description', 'invoice_number'))::TEXT || ':' || (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name IN ('client_request_id', 'client_request_digest', 'presentation_envelope'))::TEXT || ':' || (SELECT COUNT(*) FROM invoices WHERE origin = 'wallet')::TEXT"
+  )"
+  [[ "$rollback_state" == "3:0:1" ]] \
+    || die "migration 065 leaked cutover state after refusal ($rollback_state)"
+  docker exec "$CONTAINER" dropdb --username "$PG_USER" "$scratch"
+  echo "test-db: migration 065 refused an existing wallet invoice transactionally"
+}
+
 apply_migrations() {
   local database="$1"
   local with_hooks="$2"
@@ -270,6 +304,9 @@ apply_migrations() {
     if [[ "$with_hooks" == "true" && "$base" == "059_remove_surface_alias" ]]; then
       assert_empty_name_cutover_refusal "$database" "$migration" "059"
     fi
+    if [[ "$with_hooks" == "true" && "$base" == "065_private_invoice_presentations" ]]; then
+      assert_private_invoice_cutover_refusal "$database" "$migration"
+    fi
     if [[ "$base" == "053_recovery_address_commitments" \
        || "$base" == "054_fee_policy_authority" \
        || "$base" == "055_merchant_settlement_lifecycle" \
@@ -281,7 +318,8 @@ apply_migrations() {
        || "$base" == "061_invoice_quote_versions" \
        || "$base" == "062_invoice_quote_provider_attempts" \
        || "$base" == "063_checkout_private_memo" \
-       || "$base" == "064_wallet_backup_blobs" ]]; then
+       || "$base" == "064_wallet_backup_blobs" \
+       || "$base" == "065_private_invoice_presentations" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

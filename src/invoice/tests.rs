@@ -9,9 +9,8 @@ fn create_payload_field_order() {
         "5000",
         "",
         "",
-        "coffee",
-        "Alice",
-        "INV-1",
+        "00000000-0000-0000-0000-000000000001",
+        "AQAA",
         "false",
         "true",
         "true",
@@ -26,9 +25,8 @@ fn create_payload_field_order() {
             "5000",
             "",
             "",
-            "coffee",
-            "Alice",
-            "INV-1",
+            "00000000-0000-0000-0000-000000000001",
+            "AQAA",
             "false",
             "true",
             "true",
@@ -250,6 +248,7 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "partially_paid",
@@ -260,9 +259,6 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
         amount_sat: 10_000,
         remaining_amount_sat: 2_500,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: true,
         accept_ln: true,
         accept_liquid: true,
@@ -308,6 +304,7 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -318,9 +315,6 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
@@ -359,11 +353,32 @@ fn template_qr_loading_failure_does_not_block_the_payment_state_machine() {
 }
 
 #[test]
+fn private_presentation_is_wallet_only_and_cannot_hide_payment_instructions() {
+    let mut template = payment_template_fixture("unpaid", "unpaid", "none", true);
+    let private_html = template.render().expect("private template renders");
+    assert!(private_html.contains("id=\"private-invoice-presentation\""));
+    assert!(private_html.contains("/pwa-assets/private-invoice.js"));
+    assert!(private_html.contains("Copy private link"));
+    assert!(private_html.contains("Share private link"));
+    assert!(private_html.contains("You can still pay using the instructions below."));
+    assert!(private_html.contains("id=\"rail-lightning\""));
+    assert!(private_html.contains("copyBtn.addEventListener('click'"));
+
+    template.private_presentation = false;
+    let checkout_html = template.render().expect("checkout template renders");
+    assert!(!checkout_html.contains("id=\"private-invoice-presentation\""));
+    assert!(!checkout_html.contains("/pwa-assets/private-invoice.js"));
+    assert!(!checkout_html.contains("Copy private link"));
+    assert!(checkout_html.contains("id=\"rail-lightning\""));
+}
+
+#[test]
 fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -374,9 +389,6 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
@@ -419,6 +431,7 @@ fn template_liquid_uri_pins_lbtc_asset() {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -429,9 +442,6 @@ fn template_liquid_uri_pins_lbtc_asset() {
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: false,
         accept_ln: false,
         accept_liquid: true,
@@ -455,12 +465,13 @@ fn template_liquid_uri_pins_lbtc_asset() {
 }
 
 #[test]
-fn invoice_template_escapes_user_text_and_js_literals() {
+fn invoice_template_escapes_payment_js_literals() {
     let attack = r#"</script><img src=x onerror=alert(1)>&"#;
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -471,9 +482,6 @@ fn invoice_template_escapes_user_text_and_js_literals() {
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
-        public_description: Some(attack),
-        recipient_name: Some(attack),
-        invoice_number: Some(attack),
         accept_btc: true,
         accept_ln: false,
         accept_liquid: false,
@@ -492,7 +500,6 @@ fn invoice_template_escapes_user_text_and_js_literals() {
     let html = tpl.render().expect("template renders");
     assert!(!html.contains("</script><img"));
     assert!(!html.contains("<img src=x"));
-    assert!(html.contains("&lt;/script&gt;"));
     assert!(html.contains("\\u003c/script\\u003e"));
     assert!(html.contains("\\u0026"));
 }
@@ -503,6 +510,7 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
         nym: "secretnym",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -513,9 +521,6 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: false,
@@ -730,6 +735,7 @@ fn payment_template_fixture(
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
+        private_presentation: true,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status,
@@ -740,9 +746,6 @@ fn payment_template_fixture(
         amount_sat: 10_000,
         remaining_amount_sat: 2_500,
         fiat_display: None,
-        public_description: None,
-        recipient_name: None,
-        invoice_number: None,
         accept_btc: true,
         accept_ln: true,
         accept_liquid: true,
@@ -810,39 +813,101 @@ fn anonymous_checkout_create_accepts_only_the_current_wire_shapes() {
     }
 }
 
+fn presentation_envelope_fixture() -> String {
+    let mut envelope = vec![0_u8; PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES];
+    envelope[0] = PRIVATE_INVOICE_PRESENTATION_VERSION;
+    URL_SAFE_NO_PAD.encode(envelope)
+}
+
 #[test]
-fn signed_invoice_create_accepts_only_the_canonical_recipient_name_wire_key() {
+fn signed_invoice_create_requires_only_the_encrypted_presentation_contract() {
     let canonical = serde_json::json!({
         "npub": "11".repeat(32),
         "amount_sat": 1_000,
-        "recipient_name": "Alice",
+        "client_request_id": "00000000-0000-0000-0000-000000000001",
+        "presentation_envelope": presentation_envelope_fixture(),
+        "accept_ln": true,
+        "liquid_address": "lq1qqexample",
         "timestamp": 1,
         "signature": "22".repeat(64)
     });
     let parsed: CreateSignedRequest = serde_json::from_value(canonical).unwrap();
-    assert_eq!(parsed.recipient_label.as_deref(), Some("Alice"));
+    assert_eq!(
+        parsed.client_request_id,
+        Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+    );
+    assert_eq!(
+        decode_private_invoice_presentation(&parsed.presentation_envelope)
+            .unwrap()
+            .len(),
+        PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES
+    );
 
-    let legacy = serde_json::json!({
-        "npub": "11".repeat(32),
-        "amount_sat": 1_000,
-        "recipient_label": "Alice",
-        "timestamp": 1,
-        "signature": "22".repeat(64)
-    });
-    let error = serde_json::from_value::<CreateSignedRequest>(legacy).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("unknown field `recipient_label`"));
+    for plaintext_field in [
+        "recipient_label",
+        "recipient_name",
+        "public_description",
+        "invoice_number",
+        "payer_name",
+        "payee_name",
+        "payment_deadline",
+    ] {
+        let mut legacy = serde_json::json!({
+            "npub": "11".repeat(32),
+            "amount_sat": 1_000,
+            "client_request_id": "00000000-0000-0000-0000-000000000001",
+            "presentation_envelope": presentation_envelope_fixture(),
+            "timestamp": 1,
+            "signature": "22".repeat(64)
+        });
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert(plaintext_field.to_string(), serde_json::json!("forbidden"));
+        let error = serde_json::from_value::<CreateSignedRequest>(legacy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{plaintext_field}`")),
+            "unexpected error for {plaintext_field}: {error}"
+        );
+    }
+}
 
-    let extra = serde_json::json!({
-        "npub": "11".repeat(32),
-        "amount_sat": 1_000,
-        "recipient_name": "Alice",
-        "unexpected": true,
-        "timestamp": 1,
-        "signature": "22".repeat(64)
-    });
-    assert!(serde_json::from_value::<CreateSignedRequest>(extra).is_err());
+#[test]
+fn private_invoice_envelope_rejects_wrong_size_version_and_noncanonical_base64() {
+    let valid = presentation_envelope_fixture();
+    assert!(decode_private_invoice_presentation(&valid).is_ok());
+
+    let mut wrong_version = vec![0_u8; PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES];
+    wrong_version[0] = 2;
+    assert!(decode_private_invoice_presentation(&URL_SAFE_NO_PAD.encode(wrong_version)).is_err());
+    assert!(decode_private_invoice_presentation("AQAA").is_err());
+    assert!(decode_private_invoice_presentation(&format!("{valid}=")).is_err());
+}
+
+#[test]
+fn private_invoice_interoperability_fixture_matches_server_framing() {
+    use sha2::{Digest, Sha256};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/private_invoice_v1.json")).unwrap();
+    let encoded = fixture["presentation_envelope_base64url"].as_str().unwrap();
+    let envelope = decode_private_invoice_presentation(encoded).unwrap();
+
+    assert_eq!(
+        envelope.len(),
+        fixture["presentation_envelope_length"].as_u64().unwrap() as usize
+    );
+    assert_eq!(envelope[0], PRIVATE_INVOICE_PRESENTATION_VERSION);
+    assert_eq!(
+        hex::encode(Sha256::digest(&envelope)),
+        fixture["presentation_envelope_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(&envelope),
+        fixture["presentation_envelope_base64url"].as_str().unwrap()
+    );
 }
 
 fn invoice_fixture() -> db::Invoice {
@@ -858,13 +923,10 @@ fn invoice_fixture() -> db::Invoice {
         amount_sat: 10_000,
         rate_minor_per_btc: None,
         memo: None,
-        recipient_label: None,
         bitcoin_address: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: false,
-        public_description: None,
-        invoice_number: None,
         liquid_address: None,
         liquid_address_index: None,
         status: "unpaid".to_string(),

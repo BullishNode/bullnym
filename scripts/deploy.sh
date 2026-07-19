@@ -295,6 +295,14 @@ automatic_binary_rollback_allowed() {
     return 1
   fi
 
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 65)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 65)); }; then
+    echo "automatic rollback refused: migration 065 replaces wallet-invoice plaintext with required encrypted presentations" >&2
+    return 1
+  fi
+
   if [[ "$candidate_version" =~ ^[0-9]+$ \
         && "$previous_version" =~ ^[0-9]+$ ]] \
       && ((10#$candidate_version >= 57 && 10#$previous_version >= 57)); then

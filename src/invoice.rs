@@ -24,6 +24,7 @@
 //! Status-poll and Lightning lazy-fetch helpers remain shared across linked
 //! and unlinked invoices via `id`-only paths:
 //!    - `GET  /api/v1/invoices/<id>/status`
+//!    - `GET  /api/v1/invoices/<id>/presentation` (opaque ciphertext only)
 //!    - `POST /api/v1/invoices/<id>/lightning`
 
 use std::net::SocketAddr;
@@ -37,6 +38,8 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -202,10 +205,13 @@ const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
 const FIAT_QUOTE_WINDOW_SECS: i64 = 5 * 60;
 
-/// Per-field length caps for wallet-origin invoice fields.
-const PUBLIC_DESCRIPTION_MAX: usize = 1000;
-const RECIPIENT_LABEL_MAX: usize = 100;
-const INVOICE_NUMBER_MAX: usize = 50;
+/// private-invoice-v1 envelope: one version byte, 12-byte AES-GCM nonce,
+/// 4096-byte padded ciphertext, and 16-byte authentication tag.
+pub const PRIVATE_INVOICE_PRESENTATION_VERSION: u8 = 1;
+pub const PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES: usize = 1 + 12 + 4096 + 16;
+const PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BASE64_LEN: usize =
+    PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES / 3 * 4;
+const PRIVATE_INVOICE_CREATE_DIGEST_DOMAIN: &[u8] = b"bullnym-private-invoice-create-v1";
 pub(crate) const LIQUID_BTC_ASSET_ID: &str =
     "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
 
@@ -925,9 +931,6 @@ async fn create_anonymous_for_kind(
         rate_minor_per_btc: None,
         rate_lock_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
         memo: note,
-        recipient_label: None,
-        public_description: None,
-        invoice_number: None,
         // Checkout-origin: direct BTC stays disabled on the invoice row.
         // Donation Page BTC, when available, is represented separately as a
         // Boltz chain-swap lockup so bitcoin_watcher never mistakes the
@@ -1102,6 +1105,9 @@ struct InvoicePaymentTpl<'a> {
     /// generic branch as `is_unlinked`. Distinct concept from `is_unlinked`
     /// (which means "no owner at all").
     hide_owner: bool,
+    /// True only for wallet-origin native merchant invoices. Anonymous
+    /// checkout pages never attempt private-presentation decryption.
+    private_presentation: bool,
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
@@ -1114,11 +1120,6 @@ struct InvoicePaymentTpl<'a> {
     amount_sat: i64,
     remaining_amount_sat: i64,
     fiat_display: Option<String>,
-    /// Wallet-origin public-facing fields. Askama auto-escapes every
-    /// `{{ }}` interpolation; do NOT add `|safe` to these in the template.
-    public_description: Option<&'a str>,
-    recipient_name: Option<&'a str>,
-    invoice_number: Option<&'a str>,
     accept_btc: bool,
     accept_ln: bool,
     accept_liquid: bool,
@@ -1417,6 +1418,7 @@ async fn render_invoice_template(
         nym,
         is_unlinked,
         hide_owner,
+        private_presentation: inv.origin == "wallet",
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
@@ -1430,9 +1432,6 @@ async fn render_invoice_template(
         amount_sat: inv.amount_sat,
         remaining_amount_sat: remaining_sat,
         fiat_display,
-        public_description: inv.public_description.as_deref(),
-        recipient_name: inv.recipient_label.as_deref(),
-        invoice_number: inv.invoice_number.as_deref(),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
@@ -1451,6 +1450,61 @@ async fn render_invoice_template(
     };
     tpl.render()
         .map_err(|e| AppError::DbError(format!("template render: {e}")))
+}
+
+// =====================================================================
+// GET /api/v1/invoices/:id/presentation
+// =====================================================================
+
+#[derive(Serialize)]
+pub struct PrivateInvoicePresentationResponse {
+    /// Canonical unpadded base64url private-invoice-v1 envelope. The AES key
+    /// exists only in the payer's URL fragment and is never sent here.
+    pub presentation_envelope: String,
+}
+
+pub async fn private_presentation(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Result<Json<PrivateInvoicePresentationResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
+    let is_whitelisted = ip
+        .map(|ip| state.ip_whitelist.contains(ip))
+        .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::InvoiceStatus,
+        peer,
+        &headers,
+        "invoice_private_presentation",
+        Some(&id_str),
+    );
+    if !is_whitelisted && !is_certification_allowed {
+        if let Some(ip) = ip {
+            state
+                .rate_limiter
+                .check_invoice_status_per_source(ip)
+                .await?;
+        }
+    }
+
+    let id = parse_invoice_id(&id_str)?;
+    let envelope = db::get_private_invoice_presentation(&state.db, id)
+        .await?
+        .ok_or(AppError::InvoiceNotFound(id_str))?;
+    if envelope.len() != PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES
+        || envelope.first().copied() != Some(PRIVATE_INVOICE_PRESENTATION_VERSION)
+    {
+        return Err(AppError::DbError(format!(
+            "invoice {id} has an invalid private presentation envelope"
+        )));
+    }
+    Ok(Json(PrivateInvoicePresentationResponse {
+        presentation_envelope: URL_SAFE_NO_PAD.encode(envelope),
+    }))
 }
 
 // =====================================================================
@@ -3846,15 +3900,14 @@ async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db:
 // IMPORTANT: nym is NOT part of these payload helpers. It is passed
 // separately as `nym_or_empty` to `auth::verify_la_v2` / `build_la_v2_message`.
 
-/// 13 fields in fixed order. The byte sequence is the wire contract.
+/// 12 fields in fixed order. The byte sequence is the wire contract.
 #[allow(clippy::too_many_arguments)]
 fn create_payload_fields<'a>(
     amount_sat_or_empty: &'a str,
     fiat_amount_minor_or_empty: &'a str,
     fiat_currency_or_empty: &'a str,
-    public_description_or_empty: &'a str,
-    recipient_name_or_empty: &'a str,
-    invoice_number_or_empty: &'a str,
+    client_request_id: &'a str,
+    presentation_envelope: &'a str,
     accept_btc_bool: &'a str,
     accept_ln_bool: &'a str,
     accept_liquid_bool: &'a str,
@@ -3862,14 +3915,13 @@ fn create_payload_fields<'a>(
     liquid_address_or_empty: &'a str,
     liquid_blinding_key_hex_or_empty: &'a str,
     expires_at_unix: &'a str,
-) -> [&'a str; 13] {
+) -> [&'a str; 12] {
     [
         amount_sat_or_empty,
         fiat_amount_minor_or_empty,
         fiat_currency_or_empty,
-        public_description_or_empty,
-        recipient_name_or_empty,
-        invoice_number_or_empty,
+        client_request_id,
+        presentation_envelope,
         accept_btc_bool,
         accept_ln_bool,
         accept_liquid_bool,
@@ -3878,6 +3930,43 @@ fn create_payload_fields<'a>(
         liquid_blinding_key_hex_or_empty,
         expires_at_unix,
     ]
+}
+
+fn private_invoice_create_digest(npub: &str, nym_or_empty: &str, fields: &[&str]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PRIVATE_INVOICE_CREATE_DIGEST_DOMAIN);
+    hasher.update([0]);
+    hasher.update(npub.as_bytes());
+    hasher.update([0]);
+    hasher.update(nym_or_empty.as_bytes());
+    hasher.update([0]);
+    for field in fields {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
+}
+
+fn decode_private_invoice_presentation(value: &str) -> Result<Vec<u8>, AppError> {
+    if value.len() != PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BASE64_LEN {
+        return Err(AppError::InvalidAmount(format!(
+            "presentation_envelope must be exactly {PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BASE64_LEN} base64url characters"
+        )));
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        AppError::InvalidAmount(
+            "presentation_envelope must use canonical unpadded base64url".into(),
+        )
+    })?;
+    if decoded.len() != PRIVATE_INVOICE_PRESENTATION_ENVELOPE_BYTES
+        || decoded.first().copied() != Some(PRIVATE_INVOICE_PRESENTATION_VERSION)
+        || URL_SAFE_NO_PAD.encode(&decoded) != value
+    {
+        return Err(AppError::InvalidAmount(
+            "presentation_envelope is not a canonical private-invoice-v1 envelope".into(),
+        ));
+    }
+    Ok(decoded)
 }
 
 fn cancel_payload_fields(invoice_id: &str) -> [&str; 1] {
@@ -3915,13 +4004,8 @@ pub struct CreateSignedRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
-    pub public_description: Option<String>,
-    /// `recipient_name` on the wire; mapped to the `recipient_label`
-    /// column in storage (no DB rename — defer to a v2 schema migration
-    /// if ever needed).
-    #[serde(rename = "recipient_name")]
-    pub recipient_label: Option<String>,
-    pub invoice_number: Option<String>,
+    pub client_request_id: Uuid,
+    pub presentation_envelope: String,
     #[serde(default)]
     pub accept_btc: bool,
     #[serde(default)]
@@ -3939,7 +4023,39 @@ pub struct CreateSignedRequest {
 #[derive(Serialize)]
 pub struct CreateSignedResponse {
     pub invoice_id: Uuid,
-    pub share_url: String,
+    /// Fragmentless base URL. Mobile appends its locally held viewing key and
+    /// exposes only that complete private link through Copy/Share/QR.
+    pub invoice_url: String,
+}
+
+fn private_invoice_base_url(state: &AppState, linked_nym: Option<&str>, id: Uuid) -> String {
+    match linked_nym {
+        Some(nym) => format!("https://{}/{}/i/{}", state.config.domain, nym, id),
+        None => format!("https://{}/invoice/{}", state.config.domain, id),
+    }
+}
+
+fn create_signed_response(
+    state: &AppState,
+    linked_nym: Option<&str>,
+    resolution: db::WalletInvoiceCreateResolution,
+) -> Result<Json<CreateSignedResponse>, AppError> {
+    let invoice = match resolution {
+        db::WalletInvoiceCreateResolution::Created(invoice) => invoice,
+        db::WalletInvoiceCreateResolution::Reused(invoice) => {
+            tracing::info!(
+                event = "invoice_create_reused",
+                invoice_id = %invoice.id,
+                "returning existing wallet-origin invoice for idempotent create retry"
+            );
+            invoice
+        }
+        db::WalletInvoiceCreateResolution::Conflict => return Err(AppError::InvoiceCreateConflict),
+    };
+    Ok(Json(CreateSignedResponse {
+        invoice_id: invoice.id,
+        invoice_url: private_invoice_base_url(state, linked_nym, invoice.id),
+    }))
 }
 
 pub async fn create_signed_linked(
@@ -3991,31 +4107,84 @@ async fn create_invoice_inner(
     }
 
     // ---- Cheap input validation (BEFORE Schnorr verify) ----
-    if let Some(s) = &req.public_description {
-        if s.len() > PUBLIC_DESCRIPTION_MAX {
-            return Err(AppError::InvalidAmount(format!(
-                "public_description too long (max {PUBLIC_DESCRIPTION_MAX} chars)"
-            )));
-        }
+    // The server validates only the opaque envelope framing. It never parses,
+    // validates, indexes, or logs the private presentation plaintext.
+    if req.client_request_id.get_version_num() != 4 {
+        return Err(AppError::InvalidAmount(
+            "client_request_id must be a random UUID v4".into(),
+        ));
     }
-    if let Some(s) = &req.recipient_label {
-        if s.len() > RECIPIENT_LABEL_MAX {
-            return Err(AppError::InvalidAmount(format!(
-                "recipient_name too long (max {RECIPIENT_LABEL_MAX} chars)"
-            )));
-        }
+    let presentation_envelope = decode_private_invoice_presentation(&req.presentation_envelope)?;
+
+    // ---- Build v2 payload + verify Schnorr sig ----
+    let amount_sat_str = req.amount_sat.map(|n| n.to_string()).unwrap_or_default();
+    let fiat_minor_str = req
+        .fiat_amount_minor
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let fiat_currency_str = req.fiat_currency.clone().unwrap_or_default();
+    let client_request_id_str = req.client_request_id.to_string();
+    let accept_btc_str = req.accept_btc.to_string();
+    let accept_ln_str = req.accept_ln.to_string();
+    let accept_liquid_str = req.accept_liquid.to_string();
+    let bitcoin_address_str = req.bitcoin_address.clone().unwrap_or_default();
+    let liquid_address_str = req.liquid_address.clone().unwrap_or_default();
+    let liquid_blinding_key_str = req.liquid_blinding_key_hex.clone().unwrap_or_default();
+    let expires_str = req
+        .expires_at_unix
+        .map(|expires_at_unix| expires_at_unix.to_string())
+        .unwrap_or_default();
+    let fields = create_payload_fields(
+        &amount_sat_str,
+        &fiat_minor_str,
+        &fiat_currency_str,
+        &client_request_id_str,
+        &req.presentation_envelope,
+        &accept_btc_str,
+        &accept_ln_str,
+        &accept_liquid_str,
+        &bitcoin_address_str,
+        &liquid_address_str,
+        &liquid_blinding_key_str,
+        &expires_str,
+    );
+    let nym_or_empty = linked_nym.as_deref().unwrap_or("");
+    auth::verify_la_v2(
+        ACTION_CREATE,
+        &req.npub,
+        nym_or_empty,
+        &fields,
+        req.timestamp,
+        &req.signature,
+    )?;
+    let request_digest = private_invoice_create_digest(&req.npub, nym_or_empty, &fields);
+
+    // ---- Ownership check: linked vs unlinked ----
+    if let Some(nym) = linked_nym.as_deref() {
+        assert_nym_owner(state, nym, &req.npub).await?;
     }
-    if let Some(s) = &req.invoice_number {
-        if s.len() > INVOICE_NUMBER_MAX {
-            return Err(AppError::InvalidAmount(format!(
-                "invoice_number too long (max {INVOICE_NUMBER_MAX} chars)"
-            )));
-        }
+    // For unlinked: signing npub IS the canonical npub_owner. No nym
+    // assertion needed; the v2 byte sequence binds nym_or_empty="" to the
+    // sig already.
+
+    // A response-loss retry resolves before rate/admission/provider gates. A
+    // matching request returns the original URL; a reused identifier with a
+    // different signed payload is an explicit conflict.
+    if let Some(resolution) = db::resolve_wallet_invoice_create(
+        &state.db,
+        &req.npub,
+        req.client_request_id,
+        &request_digest,
+    )
+    .await?
+    {
+        return create_signed_response(state, linked_nym.as_deref(), resolution);
     }
 
     // Rail coherence — server-side echo of the SQL CHECKs in migration 021.
-    // Surfacing them here gives the caller a 400 with a useful message
-    // instead of a 500 from a constraint violation deep in INSERT.
+    // Exact authenticated retries have already returned above, so changes to
+    // validators or the wall clock cannot invalidate an operation that was
+    // durably committed before its response was lost.
     if !req.accept_btc && !req.accept_ln && !req.accept_liquid {
         return Err(AppError::InvalidAmount(
             "at least one of accept_btc / accept_ln / accept_liquid must be true".into(),
@@ -4072,60 +4241,7 @@ async fn create_invoice_inner(
         None => MAX_WALLET_EXPIRES_SECS,
     };
 
-    // ---- Build v2 payload + verify Schnorr sig ----
-    let amount_sat_str = req.amount_sat.map(|n| n.to_string()).unwrap_or_default();
-    let fiat_minor_str = req
-        .fiat_amount_minor
-        .map(|n| n.to_string())
-        .unwrap_or_default();
-    let fiat_currency_str = req.fiat_currency.clone().unwrap_or_default();
-    let public_description_str = req.public_description.clone().unwrap_or_default();
-    let recipient_label_str = req.recipient_label.clone().unwrap_or_default();
-    let invoice_number_str = req.invoice_number.clone().unwrap_or_default();
-    let accept_btc_str = req.accept_btc.to_string();
-    let accept_ln_str = req.accept_ln.to_string();
-    let accept_liquid_str = req.accept_liquid.to_string();
-    let bitcoin_address_str = req.bitcoin_address.clone().unwrap_or_default();
-    let liquid_address_str = req.liquid_address.clone().unwrap_or_default();
-    let liquid_blinding_key_str = req.liquid_blinding_key_hex.clone().unwrap_or_default();
-    let expires_str = req
-        .expires_at_unix
-        .map(|expires_at_unix| expires_at_unix.to_string())
-        .unwrap_or_default();
-    let fields = create_payload_fields(
-        &amount_sat_str,
-        &fiat_minor_str,
-        &fiat_currency_str,
-        &public_description_str,
-        &recipient_label_str,
-        &invoice_number_str,
-        &accept_btc_str,
-        &accept_ln_str,
-        &accept_liquid_str,
-        &bitcoin_address_str,
-        &liquid_address_str,
-        &liquid_blinding_key_str,
-        &expires_str,
-    );
-    let nym_or_empty = linked_nym.as_deref().unwrap_or("");
-    auth::verify_la_v2(
-        ACTION_CREATE,
-        &req.npub,
-        nym_or_empty,
-        &fields,
-        req.timestamp,
-        &req.signature,
-    )?;
-
-    // ---- Ownership check: linked vs unlinked ----
-    if let Some(nym) = linked_nym.as_deref() {
-        assert_nym_owner(state, nym, &req.npub).await?;
-    }
-    // For unlinked: signing npub IS the canonical npub_owner. No nym
-    // assertion needed; the v2 byte sequence binds nym_or_empty="" to the
-    // sig already.
-
-    // Per-npub bucket AFTER sig verify (auth-bound).
+    // Per-npub bucket AFTER sig verify and retry resolution (auth-bound).
     if !is_whitelisted && !is_certification_allowed {
         state
             .rate_limiter
@@ -4179,9 +4295,6 @@ async fn create_invoice_inner(
         rate_minor_per_btc: None,
         rate_lock_secs: expires_in_secs,
         memo: None,
-        recipient_label: req.recipient_label.as_deref(),
-        public_description: req.public_description.as_deref(),
-        invoice_number: req.invoice_number.as_deref(),
         accept_btc: req.accept_btc,
         accept_ln: req.accept_ln,
         accept_liquid: req.accept_liquid,
@@ -4190,7 +4303,17 @@ async fn create_invoice_inner(
         liquid_blinding_key_hex: req.liquid_blinding_key_hex.as_deref(),
         expires_in_secs,
     };
-    let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
+    let private_create = db::PrivateInvoiceCreate {
+        client_request_id: req.client_request_id,
+        request_digest: &request_digest,
+        presentation_envelope: &presentation_envelope,
+    };
+    let resolution =
+        db::insert_or_reuse_wallet_invoice(&state.db, &new_invoice, &private_create).await?;
+    let invoice = match resolution {
+        db::WalletInvoiceCreateResolution::Created(invoice) => invoice,
+        other => return create_signed_response(state, linked_nym.as_deref(), other),
+    };
 
     // Fiat-fixed invoices defer every provider obligation until an explicit
     // selected-rail quote request has durably created/reused its version.
@@ -4212,10 +4335,6 @@ async fn create_invoice_inner(
         }
     }
 
-    let share_url = match linked_nym.as_deref() {
-        Some(nym) => format!("https://{}/{}/i/{}", state.config.domain, nym, invoice.id),
-        None => format!("https://{}/invoice/{}", state.config.domain, invoice.id),
-    };
     tracing::info!(
         event = "invoice_created",
         invoice_id = %invoice.id,
@@ -4227,10 +4346,11 @@ async fn create_invoice_inner(
         amount_sat = invoice.amount_sat,
         "wallet-origin invoice created"
     );
-    Ok(Json(CreateSignedResponse {
-        invoice_id: invoice.id,
-        share_url,
-    }))
+    create_signed_response(
+        state,
+        linked_nym.as_deref(),
+        db::WalletInvoiceCreateResolution::Created(invoice),
+    )
 }
 
 // =====================================================================
@@ -4381,14 +4501,10 @@ pub struct InvoiceListItem {
     pub remaining_amount_sat: i64,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
-    pub public_description: Option<String>,
     /// Private note attached at checkout (PoS description / donor message).
     /// Returned only on this signed, npub-verified list — never on the public
     /// status or render paths.
     pub memo: Option<String>,
-    #[serde(rename = "recipient_name")]
-    pub recipient_label: Option<String>,
-    pub invoice_number: Option<String>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
@@ -4526,10 +4642,7 @@ pub async fn list_signed(
                 remaining_amount_sat: remaining,
                 fiat_amount_minor: inv.fiat_amount_minor,
                 fiat_currency: inv.fiat_currency,
-                public_description: inv.public_description,
                 memo: inv.memo,
-                recipient_label: inv.recipient_label,
-                invoice_number: inv.invoice_number,
                 accept_btc: inv.accept_btc,
                 accept_ln: inv.accept_ln,
                 accept_liquid: inv.accept_liquid,
@@ -4573,8 +4686,6 @@ pub struct RecoverableInvoiceContext {
     pub amount_sat: i64,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
-    pub public_description: Option<String>,
-    pub invoice_number: Option<String>,
     pub created_at_unix: i64,
 }
 
@@ -4696,8 +4807,6 @@ pub async fn list_recoverable_signed(
                 amount_sat: row.invoice_amount_sat,
                 fiat_amount_minor: row.invoice_fiat_amount_minor,
                 fiat_currency: row.invoice_fiat_currency,
-                public_description: row.invoice_public_description,
-                invoice_number: row.invoice_number,
                 created_at_unix: row.invoice_created_at_unix,
             },
         });

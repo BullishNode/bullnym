@@ -40,13 +40,10 @@ pub struct Invoice {
     pub amount_sat: i64,
     pub rate_minor_per_btc: Option<i64>,
     pub memo: Option<String>,
-    pub recipient_label: Option<String>,
     pub bitcoin_address: Option<String>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
-    pub public_description: Option<String>,
-    pub invoice_number: Option<String>,
     pub liquid_address: Option<String>,
     pub liquid_address_index: Option<i32>,
     pub status: String,
@@ -76,9 +73,7 @@ pub struct Invoice {
 const INVOICE_COLUMNS: &str =
     "id, nym_owner, public_slug, npub_owner, origin, checkout_surface_kind, \
      fiat_amount_minor, fiat_currency, amount_sat, \
-     rate_minor_per_btc, memo, recipient_label, \
-     bitcoin_address, accept_btc, accept_ln, accept_liquid, \
-     public_description, invoice_number, \
+     rate_minor_per_btc, memo, bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
      pricing_mode, settlement_status, presentation_status, \
      direct_settlement_status, swap_settlement_status, \
@@ -117,9 +112,6 @@ pub struct NewInvoice<'a> {
     /// naturally never fires.
     pub rate_lock_secs: i64,
     pub memo: Option<&'a str>,
-    pub recipient_label: Option<&'a str>,
-    pub public_description: Option<&'a str>,
-    pub invoice_number: Option<&'a str>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
@@ -139,6 +131,22 @@ pub struct NewInvoice<'a> {
     pub liquid_blinding_key_hex: Option<&'a str>,
     /// Wall-clock seconds the invoice stays valid from `now()`.
     pub expires_in_secs: i64,
+}
+
+/// Server-opaque fields supplied only by the signed wallet-origin create
+/// path. They deliberately do not appear in [`Invoice`] or `INVOICE_COLUMNS`,
+/// keeping ciphertext and request digests out of ordinary payment, watcher,
+/// list, and diagnostic projections.
+pub struct PrivateInvoiceCreate<'a> {
+    pub client_request_id: Uuid,
+    pub request_digest: &'a [u8],
+    pub presentation_envelope: &'a [u8],
+}
+
+pub enum WalletInvoiceCreateResolution {
+    Created(Invoice),
+    Reused(Invoice),
+    Conflict,
 }
 
 /// Immutable five-minute fiat conversion snapshot.  Provider instructions are
@@ -462,11 +470,11 @@ pub async fn invoice_presentation_received_sat<'e, E: sqlx::PgExecutor<'e>>(
 /// Insert a new invoice row. The caller is responsible for populating
 /// `liquid_address` when `accept_ln` or `accept_liquid` is TRUE — the
 /// `invoices_ln_or_liquid_addr_chk` constraint requires it at INSERT
-/// time. Two supply paths:
-///   - Wallet-origin (Get-paid): the wallet supplies the address.
-///   - Checkout-origin: the caller invokes a Page/POS descriptor allocator or
-///     `allocate_next_liquid_for_permanent_nym`, then passes the result through
-///     `NewInvoice.liquid_address`.
+/// time. This generic entry point is checkout-only: the caller invokes a
+/// Page/POS descriptor allocator or `allocate_next_liquid_for_permanent_nym`,
+/// then passes the result through `NewInvoice.liquid_address`. Wallet-origin
+/// callers must use [`insert_or_reuse_wallet_invoice`] so an invoice cannot be
+/// published without its encrypted presentation and idempotency identity.
 ///
 /// Lightning offers attach via a separate `record_swap` call that sets
 /// `swap_records.invoice_id`; the claimer routes the LN claim to the
@@ -475,21 +483,37 @@ pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
 ) -> Result<Invoice, sqlx::Error> {
+    if invoice.origin != "checkout" {
+        return Err(sqlx::Error::Protocol(
+            "wallet invoices require insert_or_reuse_wallet_invoice".to_string(),
+        ));
+    }
     let mut tx = pool.begin().await?;
+    let inserted = insert_invoice_row(&mut tx, invoice, None).await?;
+    insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
 
-    let inserted = sqlx::query_as::<_, Invoice>(&format!(
+async fn insert_invoice_row(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice: &NewInvoice<'_>,
+    private: Option<&PrivateInvoiceCreate<'_>>,
+) -> Result<Invoice, sqlx::Error> {
+    sqlx::query_as::<_, Invoice>(&format!(
         "INSERT INTO invoices \
             (nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
-             rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
-             public_description, invoice_number, \
-             accept_btc, accept_ln, accept_liquid, \
-             bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
-             public_slug, expires_at, presentation_status, checkout_surface_kind) \
+             rate_minor_per_btc, rate_locks_until, memo, \
+             accept_btc, accept_ln, accept_liquid, bitcoin_address, liquid_address, \
+             pricing_mode, liquid_blinding_key_hex, public_slug, expires_at, \
+             presentation_status, checkout_surface_kind, client_request_id, \
+             client_request_digest, presentation_envelope) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                 NOW() + ($8 || ' seconds')::interval, $9, $10, \
-                 $11, $12, $13, $14, $15, $16, $17, \
-                 CASE WHEN $4::INTEGER IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
-                 $20, NOW() + ($19 || ' seconds')::interval, 'unpaid', $21) \
+                 NOW() + ($8 || ' seconds')::interval, $9, \
+                 $10, $11, $12, $13, $14, \
+                 CASE WHEN $4::INTEGER IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, \
+                 $15, $16, NOW() + ($17 || ' seconds')::interval, \
+                 'unpaid', $18, $19, $20, $21) \
          RETURNING {INVOICE_COLUMNS}"
     ))
     .bind(invoice.nym_owner)
@@ -501,21 +525,27 @@ pub async fn insert_invoice(
     .bind(invoice.rate_minor_per_btc)
     .bind(invoice.rate_lock_secs)
     .bind(invoice.memo)
-    .bind(invoice.recipient_label)
-    .bind(invoice.public_description)
-    .bind(invoice.invoice_number)
     .bind(invoice.accept_btc)
     .bind(invoice.accept_ln)
     .bind(invoice.accept_liquid)
     .bind(invoice.bitcoin_address)
     .bind(invoice.liquid_address)
     .bind(invoice.liquid_blinding_key_hex)
-    .bind(invoice.expires_in_secs)
     .bind(invoice.public_slug)
+    .bind(invoice.expires_in_secs)
     .bind(invoice.checkout_surface_kind)
-    .fetch_one(&mut *tx)
-    .await?;
+    .bind(private.map(|value| value.client_request_id))
+    .bind(private.map(|value| value.request_digest))
+    .bind(private.map(|value| value.presentation_envelope))
+    .fetch_one(&mut **tx)
+    .await
+}
 
+async fn insert_invoice_payment_addresses(
+    tx: &mut Transaction<'_, Postgres>,
+    inserted: &Invoice,
+    invoice: &NewInvoice<'_>,
+) -> Result<(), sqlx::Error> {
     if let Some(address) = invoice.bitcoin_address {
         sqlx::query(
             "INSERT INTO invoice_payment_addresses (invoice_id, rail, address) \
@@ -523,7 +553,7 @@ pub async fn insert_invoice(
         )
         .bind(inserted.id)
         .bind(address)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -534,12 +564,113 @@ pub async fn insert_invoice(
         )
         .bind(inserted.id)
         .bind(address)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
+    Ok(())
+}
+
+async fn existing_wallet_invoice_create<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    npub_owner: &str,
+    client_request_id: Uuid,
+) -> Result<Option<(Uuid, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+        "SELECT id, client_request_digest \
+           FROM invoices \
+          WHERE npub_owner = $1 AND client_request_id = $2",
+    )
+    .bind(npub_owner)
+    .bind(client_request_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Resolve a retry before admission/provider checks. The digest is over the
+/// complete signed create payload excluding timestamp and signature, so a
+/// reused identifier can return an existing invoice only for the same exact
+/// operation.
+pub async fn resolve_wallet_invoice_create(
+    pool: &PgPool,
+    npub_owner: &str,
+    client_request_id: Uuid,
+    request_digest: &[u8],
+) -> Result<Option<WalletInvoiceCreateResolution>, sqlx::Error> {
+    let Some((invoice_id, stored_digest)) =
+        existing_wallet_invoice_create(pool, npub_owner, client_request_id).await?
+    else {
+        return Ok(None);
+    };
+    if stored_digest != request_digest {
+        return Ok(Some(WalletInvoiceCreateResolution::Conflict));
+    }
+    let invoice = get_invoice_by_id(pool, invoice_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    Ok(Some(WalletInvoiceCreateResolution::Reused(invoice)))
+}
+
+/// Serialize same-owner/same-request creates under a transaction advisory
+/// lock. A response-loss retry returns the original invoice; a reused request
+/// identifier carrying different bytes is an explicit conflict.
+pub async fn insert_or_reuse_wallet_invoice(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+    private: &PrivateInvoiceCreate<'_>,
+) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
+    if invoice.origin != "wallet" {
+        return Err(sqlx::Error::Protocol(
+            "private invoice create requires origin=wallet".to_string(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    let lock_key = format!(
+        "private-invoice-create:{}:{}",
+        invoice.npub_owner, private.client_request_id
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+
+    if let Some((invoice_id, stored_digest)) =
+        existing_wallet_invoice_create(&mut *tx, invoice.npub_owner, private.client_request_id)
+            .await?
+    {
+        if stored_digest != private.request_digest {
+            tx.commit().await?;
+            return Ok(WalletInvoiceCreateResolution::Conflict);
+        }
+        let existing = get_invoice_by_id(&mut *tx, invoice_id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        return Ok(WalletInvoiceCreateResolution::Reused(existing));
+    }
+
+    let inserted = insert_invoice_row(&mut tx, invoice, Some(private)).await?;
+    insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
+
     tx.commit().await?;
-    Ok(inserted)
+    Ok(WalletInvoiceCreateResolution::Created(inserted))
+}
+
+/// Publicly retrievable ciphertext for the payer browser. The query projects
+/// only this one opaque value and never joins it into ordinary invoice reads.
+pub async fn get_private_invoice_presentation(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT presentation_envelope \
+           FROM invoices \
+          WHERE id = $1 AND origin = 'wallet'",
+    )
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Return the invoice's current quote or create exactly one new five-minute

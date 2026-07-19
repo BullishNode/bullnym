@@ -140,8 +140,6 @@ invoice can carry more than one), `refund_due` first, oldest first:
         "amount_sat": 100000,
         "fiat_amount_minor": 5000,
         "fiat_currency": "CAD",
-        "public_description": "Order 123",
-        "invoice_number": "INV-42",
         "created_at_unix": 1766990000
       }
     }

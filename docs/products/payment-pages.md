@@ -69,8 +69,9 @@ used. The stable address remains watched for late payments and reorgs.
 Checkout may carry an optional private note. Schema
 `063_checkout_private_memo` stores it as a private invoice memo visible only in
 the merchant's signed invoice history; it is not rendered to the payer or
-returned by public status. Recipient label, public description, and invoice
-number remain wallet-origin fields and cannot be attached by public checkout.
+returned by public status. Payer, payee, and invoice-document details belong
+only to the client-encrypted wallet-invoice
+presentation and cannot be attached by public checkout.
 
 ## Flow
 

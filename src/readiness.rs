@@ -9,10 +9,22 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
-const EXPECTED_CHECKOUT_METADATA_EXPRESSION: &str = concat!(
-    "origin='wallet'::textORrecipient_labelISNULLAND",
-    "public_descriptionISNULLANDinvoice_numberISNULL"
+const EXPECTED_PRIVATE_INVOICE_SHAPE_EXPRESSION: &str = concat!(
+    "origin='wallet'::textANDclient_request_idISNOTNULLAND",
+    "client_request_digestISNOTNULLANDoctet_length(client_request_digest)=32AND",
+    "presentation_envelopeISNOTNULLANDCASEWHEN",
+    "octet_length(presentation_envelope)=4125THEN",
+    "get_byte(presentation_envelope,0)=1ELSEfalseENDOR",
+    "origin='checkout'::textANDclient_request_idISNULLAND",
+    "client_request_digestISNULLANDpresentation_envelopeISNULL"
 );
+const EXPECTED_PRIVATE_INVOICE_TRIGGER_DEFINITION: &str = concat!(
+    "CREATETRIGGERinvoices_reject_private_presentation_updateBEFOREUPDATEOF",
+    "client_request_id,client_request_digest,presentation_envelopeONinvoices",
+    "FOREACHROWEXECUTEFUNCTIONreject_invoice_private_presentation_update()"
+);
+const EXPECTED_PRIVATE_INVOICE_TRIGGER_BODY_SHA256: &str =
+    "eaf7c3093aeba6409ea484e8d2570fe480725e7dcd53a920143cacb7c647628b";
 
 const EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION: &str = concat!(
     "num_nonnulls(fee_decision_purpose,fee_decision_rail,fee_decision_target,",
@@ -1175,7 +1187,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     if !schema_marker_present(pool).await?
         || !wallet_backup_storage_invariants_present(pool).await?
-        || !checkout_private_memo_contract_present(pool).await?
+        || !private_invoice_storage_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
@@ -1432,27 +1444,113 @@ async fn wallet_backup_storage_invariants_present(
     .await
 }
 
-async fn checkout_private_memo_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+async fn private_invoice_storage_contract_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
-        "SELECT COALESCE(( \
-            SELECT regexp_replace( \
+        "SELECT \
+            NOT EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'invoices' \
+                   AND column_name IN ( \
+                       'recipient_label', 'public_description', 'invoice_number' \
+                   ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('client_request_id', 'uuid'), \
+                    ('client_request_digest', 'bytea'), \
+                    ('presentation_envelope', 'bytea') \
+                ) required(column_name, data_type) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 FROM information_schema.columns column_info \
+                     WHERE column_info.table_schema = 'public' \
+                       AND column_info.table_name = 'invoices' \
+                       AND column_info.column_name = required.column_name \
+                       AND column_info.data_type = required.data_type \
+                       AND column_info.is_nullable = 'YES' \
+                ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = to_regclass('public.invoices') \
+                   AND constraint_info.conname = \
+                       'invoices_private_presentation_shape_check' \
+                   AND constraint_info.contype = 'c' \
+                   AND constraint_info.convalidated \
+                   AND regexp_replace( \
                        pg_get_expr( \
-                           constraint_info.conbin, \
-                           constraint_info.conrelid, \
-                           TRUE \
-                       ), \
-                       '[[:space:]]+', '', 'g' \
+                           constraint_info.conbin, constraint_info.conrelid, TRUE \
+                       ), '[[:space:]]+', '', 'g' \
                    ) = $1 \
-              FROM pg_constraint constraint_info \
-             WHERE constraint_info.conrelid = \
-                       to_regclass('public.invoices') \
-               AND constraint_info.conname = \
-                       'invoices_checkout_no_metadata_chk' \
-               AND constraint_info.contype = 'c' \
-               AND constraint_info.convalidated \
-        ), FALSE)",
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = to_regclass('public.invoices') \
+                   AND constraint_info.conname = 'invoices_owner_client_request_key' \
+                   AND constraint_info.contype = 'u' \
+                   AND constraint_info.convalidated \
+                   AND constraint_info.conkey = ARRAY[ \
+                       (SELECT attribute_info.attnum::SMALLINT \
+                          FROM pg_attribute attribute_info \
+                         WHERE attribute_info.attrelid = \
+                                   to_regclass('public.invoices') \
+                           AND attribute_info.attname = 'npub_owner'), \
+                       (SELECT attribute_info.attnum::SMALLINT \
+                          FROM pg_attribute attribute_info \
+                         WHERE attribute_info.attrelid = \
+                                   to_regclass('public.invoices') \
+                           AND attribute_info.attname = 'client_request_id') \
+                   ]::SMALLINT[] \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                  FROM pg_trigger trigger_info \
+                  JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                  JOIN pg_namespace function_namespace \
+                    ON function_namespace.oid = function_info.pronamespace \
+                 WHERE trigger_info.tgrelid = to_regclass('public.invoices') \
+                   AND trigger_info.tgname = \
+                       'invoices_reject_private_presentation_update' \
+                   AND trigger_info.tgtype = 19 \
+                   AND trigger_info.tgenabled = 'O' \
+                   AND NOT trigger_info.tgisinternal \
+                   AND function_namespace.nspname = 'public' \
+                   AND function_info.proname = \
+                       'reject_invoice_private_presentation_update' \
+                   AND function_info.pronargs = 0 \
+                   AND function_info.prorettype = 'trigger'::REGTYPE \
+                   AND NOT function_info.prosecdef \
+                   AND function_info.proconfig = ARRAY['search_path=pg_catalog'] \
+                   AND regexp_replace( \
+                       pg_get_triggerdef(trigger_info.oid, TRUE), \
+                       '[[:space:]]+', '', 'g' \
+                   ) = $2 \
+                   AND encode( \
+                       sha256(convert_to(function_info.prosrc, 'UTF8')), 'hex' \
+                   ) = $3 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM aclexplode(COALESCE( \
+                           function_info.proacl, \
+                           acldefault('f', function_info.proowner) \
+                       )) acl \
+                        WHERE acl.grantee = 0 \
+                          AND acl.privilege_type = 'EXECUTE' \
+                   ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM pg_index index_info \
+                  JOIN pg_attribute attribute_info \
+                    ON attribute_info.attrelid = index_info.indrelid \
+                   AND attribute_info.attnum = ANY(index_info.indkey) \
+                 WHERE index_info.indrelid = to_regclass('public.invoices') \
+                   AND attribute_info.attname = 'presentation_envelope' \
+            )",
     )
-    .bind(EXPECTED_CHECKOUT_METADATA_EXPRESSION)
+    .bind(EXPECTED_PRIVATE_INVOICE_SHAPE_EXPRESSION)
+    .bind(EXPECTED_PRIVATE_INVOICE_TRIGGER_DEFINITION)
+    .bind(EXPECTED_PRIVATE_INVOICE_TRIGGER_BODY_SHA256)
     .fetch_one(pool)
     .await
 }

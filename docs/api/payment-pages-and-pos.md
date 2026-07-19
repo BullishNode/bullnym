@@ -155,9 +155,10 @@ note is limited to 280 Unicode characters. Schema `063_checkout_private_memo` st
 as the invoice's private `memo`, exposed only by the owning merchant's signed
 invoice list. Public status and rendered invoice routes never return it.
 Checkout-supplied `recipient_label`, `public_description`, and `invoice_number`
-are outside this request contract and must not be accepted or persisted. The
-schema constraint rejects any checkout row that carries those wallet-only
-fields even though it permits `memo`.
+are outside this request contract and are rejected as unknown fields. The
+private-invoice schema removes those plaintext columns entirely and prevents
+checkout rows from carrying a wallet-origin encrypted presentation, while
+continuing to permit the separate private `memo`.
 
 Fiat minor units follow the precision endpoint (`2500` is USD 25.00, while
 CRC has zero decimal places). Fiat checkout creation stores the exact
