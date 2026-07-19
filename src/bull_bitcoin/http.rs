@@ -17,6 +17,13 @@ use crate::config::BullBitcoinConfig;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RpcCallKind {
+    EligibilityPreflight,
+    CreateOrder,
+    ReadOrder,
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpBullBitcoinApi {
     endpoint: Url,
@@ -46,7 +53,7 @@ impl HttpBullBitcoinApi {
         &self,
         key: &ScopedApiKey,
         body: String,
-        create_call: bool,
+        call_kind: RpcCallKind,
     ) -> Result<Value, BullBitcoinError> {
         let api_key =
             HeaderValue::from_str(key.expose()).map_err(|_| BullBitcoinError::InvalidApiKey)?;
@@ -70,7 +77,7 @@ impl HttpBullBitcoinApi {
             return Err(BullBitcoinError::Upstream);
         }
         if !status.is_success() {
-            return Err(if create_call {
+            return Err(if call_kind == RpcCallKind::CreateOrder {
                 BullBitcoinError::Policy
             } else {
                 BullBitcoinError::Upstream
@@ -81,7 +88,7 @@ impl HttpBullBitcoinApi {
         let envelope: Value =
             serde_json::from_slice(&bytes).map_err(|_| BullBitcoinError::MalformedResponse)?;
         if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
-            return Err(classify_rpc_error(error, create_call));
+            return Err(classify_rpc_error(error, call_kind));
         }
         envelope
             .get("result")
@@ -101,7 +108,9 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
             "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{{\"fiatCurrency\":\"{}\"}}}}",
             currency.as_str(),
         );
-        let result = self.post_rpc(key, body, false).await?;
+        let result = self
+            .post_rpc(key, body, RpcCallKind::EligibilityPreflight)
+            .await?;
         match result.as_object() {
             Some(object)
                 if object.len() == 1
@@ -122,7 +131,7 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
             return Err(BullBitcoinError::Integrity);
         }
         let body = build_create_body(request);
-        let result = self.post_rpc(key, body, true).await?;
+        let result = self.post_rpc(key, body, RpcCallKind::CreateOrder).await?;
         parse_created_order(&result, request)
     }
 
@@ -134,7 +143,7 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
         let body = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrder\",\"params\":{{\"orderId\":\"{order_id}\"}}}}"
         );
-        let result = self.post_rpc(key, body, false).await?;
+        let result = self.post_rpc(key, body, RpcCallKind::ReadOrder).await?;
         let order = result.get("element").unwrap_or(&result);
         let observation = parse_order_observation(order)?;
         if observation.order_id != order_id {
@@ -185,11 +194,21 @@ fn classify_transport_error(error: reqwest::Error) -> BullBitcoinError {
     }
 }
 
-fn classify_rpc_error(error: &Value, create_call: bool) -> BullBitcoinError {
-    if error.pointer("/data/apiError/code").and_then(Value::as_str)
-        == Some("SELL_TO_BALANCE_KYC_REQUIRED")
+fn classify_rpc_error(error: &Value, call_kind: RpcCallKind) -> BullBitcoinError {
+    if call_kind == RpcCallKind::EligibilityPreflight
+        && error.pointer("/data/apiError/code").and_then(Value::as_str)
+            == Some("SELL_TO_BALANCE_KYC_REQUIRED")
     {
         return BullBitcoinError::BenchmarkEligibilityDenied;
+    }
+    // API-Orders intentionally hides a method when the authenticated key does
+    // not carry its permission. This method is a required part of the pinned
+    // Bullnym/API-Orders release contract, so MethodNotFound on the preflight
+    // is a wrong-scope credential result. Reads retain their legacy mapping.
+    if call_kind == RpcCallKind::EligibilityPreflight
+        && error.get("code").and_then(Value::as_i64) == Some(-32601)
+    {
+        return BullBitcoinError::Authentication;
     }
     if let Some(operator) = error
         .pointer("/data/reason/limit/conditionalOperator")
@@ -214,7 +233,7 @@ fn classify_rpc_error(error: &Value, create_call: bool) -> BullBitcoinError {
         || message.contains("forbidden")
     {
         BullBitcoinError::Authentication
-    } else if create_call {
+    } else if call_kind == RpcCallKind::CreateOrder {
         BullBitcoinError::Policy
     } else {
         BullBitcoinError::Upstream
@@ -617,6 +636,30 @@ mod tests {
         );
         task.abort();
 
+        async fn wrong_scope() -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "bullnym",
+                "error": {
+                    "code": -32601,
+                    "message": "The method does not exist / is not available.",
+                    "data": {"method": "validateSellToBalance"}
+                }
+            }))
+        }
+        let (client, task) = client_for_app(
+            Router::new().route("/ak/api-orders", post(wrong_scope)),
+            1_000,
+        )
+        .await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
+                .await,
+            Err(BullBitcoinError::Authentication)
+        );
+        task.abort();
+
         async fn unavailable() -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -747,7 +790,7 @@ mod tests {
             }}}
         });
         assert_eq!(
-            classify_rpc_error(&minimum, true),
+            classify_rpc_error(&minimum, RpcCallKind::CreateOrder),
             BullBitcoinError::Minimum
         );
         assert_eq!(
@@ -755,20 +798,35 @@ mod tests {
                 &serde_json::json!({
                     "data": {"apiError": {"code": "SELL_TO_BALANCE_KYC_REQUIRED"}}
                 }),
-                false
+                RpcCallKind::EligibilityPreflight
             ),
             BullBitcoinError::BenchmarkEligibilityDenied
         );
         assert_eq!(
-            classify_rpc_error(&serde_json::json!({"message": "API key denied"}), false),
+            classify_rpc_error(
+                &serde_json::json!({"message": "API key denied"}),
+                RpcCallKind::ReadOrder
+            ),
             BullBitcoinError::Authentication
         );
         assert_eq!(
             classify_rpc_error(
                 &serde_json::json!({"message": "secret provider details"}),
-                true
+                RpcCallKind::CreateOrder
             ),
             BullBitcoinError::Policy
+        );
+        let hidden_method = serde_json::json!({
+            "code": -32601,
+            "message": "The method does not exist / is not available."
+        });
+        assert_eq!(
+            classify_rpc_error(&hidden_method, RpcCallKind::EligibilityPreflight),
+            BullBitcoinError::Authentication
+        );
+        assert_eq!(
+            classify_rpc_error(&hidden_method, RpcCallKind::ReadOrder),
+            BullBitcoinError::Upstream
         );
     }
 }
