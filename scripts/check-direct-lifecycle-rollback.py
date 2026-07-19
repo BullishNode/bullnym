@@ -12,6 +12,7 @@ SWAP_KEY_LINEAGE_VERSION = 50
 RECOVERY_COMMITMENT_VERSION = 53
 MERCHANT_SETTLEMENT_VERSION = 55
 WALLET_BACKUP_VERSION = 64
+BULL_BITCOIN_SETTLEMENT_VERSION = 67
 
 
 def schema_version(marker: str) -> int | None:
@@ -80,6 +81,16 @@ def main() -> int:
                 "rollback refused: migration 064 advances the exact schema marker; "
                 "restore the matching pre-064 database together with the older "
                 "binary and PWA",
+                file=sys.stderr,
+            )
+            return 1
+
+    if current_version is not None and current_version >= BULL_BITCOIN_SETTLEMENT_VERSION:
+        if previous_version is None or previous_version < BULL_BITCOIN_SETTLEMENT_VERSION:
+            print(
+                "rollback refused: migration 067 established the Bull Bitcoin "
+                "fiat-settlement schema boundary; restore the matching pre-067 "
+                "database together with the older binary and PWA",
                 file=sys.stderr,
             )
             return 1
