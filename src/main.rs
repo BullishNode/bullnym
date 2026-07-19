@@ -1017,6 +1017,10 @@ fn build_router(state: AppState) -> Router {
             get(fiat_settlement::configuration),
         )
         .route(
+            "/api/v1/fiat-settlements",
+            get(fiat_settlement::settlements),
+        )
+        .route(
             "/api/v1/fiat-settlement/:product",
             put(fiat_settlement::set)
                 .delete(fiat_settlement::delete_product)

@@ -30,9 +30,11 @@ pub const BODY_LIMIT_BYTES: usize = 2_048;
 pub const ACTION_SET: &str = "fiat-settlement-set";
 pub const ACTION_DELETE_PRODUCT: &str = "fiat-settlement-delete";
 pub const ACTION_GET: &str = "fiat-settlement-get";
+pub const ACTION_LIST_SETTLEMENTS: &str = "fiat-settlement-list";
 pub const ACTION_DELETE_CREDENTIAL: &str = "bull-bitcoin-credential-delete";
 
 const VERSION_FIELD: &str = "1";
+const LIST_LIMIT_MAX: i64 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +110,18 @@ pub struct DeleteCredentialRequest {
     pub signature: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettlementListQuery {
+    pub version: u16,
+    pub npub: String,
+    pub timestamp: u64,
+    pub signature: String,
+    pub page: i64,
+    #[serde(rename = "pageSize")]
+    pub page_size: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingResponse {
@@ -132,6 +146,56 @@ pub struct ConfigurationResponse {
     pub version: u16,
     pub settings: Vec<SettingResponse>,
     pub credential_status: CredentialStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FiatSettlementEntry {
+    pub amount_minor: Option<i64>,
+    pub currency: String,
+    pub order_id: Uuid,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinSettlementEntry {
+    pub amount_sat: i64,
+    pub network: &'static str,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FiatConversionOverride {
+    pub status: &'static str,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LightningAddressSettlementEntry {
+    Fiat {
+        fiat: FiatSettlementEntry,
+    },
+    Mixed {
+        bitcoin: BitcoinSettlementEntry,
+        fiat: FiatSettlementEntry,
+    },
+    BitcoinFallback {
+        fiat_conversion: FiatConversionOverride,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettlementListResponse {
+    pub version: u16,
+    pub settlements: Vec<LightningAddressSettlementEntry>,
+    pub page: i64,
+    #[serde(rename = "pageSize")]
+    pub page_size: i64,
+    pub has_more: bool,
 }
 
 pub async fn set(
@@ -241,6 +305,65 @@ pub async fn configuration(
         .await
         .map_err(map_store_error)?;
     configuration_response(result)
+}
+
+pub async fn settlements(
+    State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Query(query): Query<SettlementListQuery>,
+) -> Result<Response, AppError> {
+    gate(&state, peer_opt, &headers, "fiat_settlement_list").await?;
+    if !(1..=1_000).contains(&query.page) {
+        return Err(AppError::InvalidAmount(
+            "page must be between 1 and 1000".into(),
+        ));
+    }
+    if !(1..=LIST_LIMIT_MAX).contains(&query.page_size) {
+        return Err(AppError::InvalidAmount(
+            "pageSize must be between 1 and 100".into(),
+        ));
+    }
+    let page_size = query.page_size;
+    let page_field = query.page.to_string();
+    let page_size_field = page_size.to_string();
+    verify_identity_request(
+        ACTION_LIST_SETTLEMENTS,
+        query.version,
+        &query.npub,
+        &[VERSION_FIELD, &page_field, &page_size_field],
+        query.timestamp,
+        &query.signature,
+    )?;
+
+    let offset = (query.page - 1)
+        .checked_mul(page_size)
+        .ok_or_else(|| AppError::InvalidAmount("settlement page is out of range".into()))?;
+    let mut rows = db::lightning_address_bull_bitcoin_settlement_projections(
+        &state.db,
+        &query.npub,
+        offset,
+        page_size + 1,
+    )
+    .await
+    .map_err(|_| AppError::DbError("fiat-settlement list failed".into()))?;
+    let has_more = rows.len() > page_size as usize;
+    rows.truncate(page_size as usize);
+    let settlements = rows
+        .into_iter()
+        .map(project_lightning_address_settlement)
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    Ok(private_no_store(
+        Json(SettlementListResponse {
+            version: CONTRACT_VERSION,
+            settlements,
+            page: query.page,
+            page_size,
+            has_more,
+        })
+        .into_response(),
+    ))
 }
 
 pub async fn delete_credential(
@@ -458,6 +581,79 @@ fn configuration_response(
     ))
 }
 
+fn project_lightning_address_settlement(
+    row: db::LightningAddressBullBitcoinSettlementProjection,
+) -> Result<LightningAddressSettlementEntry, AppError> {
+    if row.funding_route.as_deref() == Some("bitcoin_fallback") {
+        let reason = match row.fallback_category.as_deref() {
+            Some("below_minimum") => "below_minimum",
+            Some("invalid_split") => "invalid_split",
+            Some("conversion_unavailable" | "ambiguous_create") | None => "conversion_unavailable",
+            Some(_) => "conversion_unavailable",
+        };
+        return Ok(LightningAddressSettlementEntry::BitcoinFallback {
+            fiat_conversion: FiatConversionOverride {
+                status: "overridden",
+                reason,
+            },
+        });
+    }
+    if row.funding_route.as_deref() != Some("bull_bitcoin") {
+        return Err(AppError::DbError(
+            "invalid Lightning Address settlement route".into(),
+        ));
+    }
+    let order_id = row.bull_bitcoin_order_id.ok_or_else(|| {
+        AppError::DbError("Lightning Address settlement lacks its order binding".into())
+    })?;
+    let status = match row.settlement_status.as_str() {
+        "pending" => "pending",
+        "settled" => "settled",
+        "unavailable" | "integrity_error" => "unavailable",
+        _ => {
+            return Err(AppError::DbError(
+                "invalid Lightning Address settlement status".into(),
+            ))
+        }
+    };
+    let fiat = FiatSettlementEntry {
+        amount_minor: (status == "settled")
+            .then_some(row.credited_fiat_minor)
+            .flatten(),
+        currency: row.fiat_currency,
+        order_id,
+        status: status.to_owned(),
+    };
+    match row.purpose.as_str() {
+        "fiat_only" => Ok(LightningAddressSettlementEntry::Fiat { fiat }),
+        "mixed" => {
+            let amount_sat = row
+                .merchant_bitcoin_sat
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| {
+                    AppError::DbError(
+                        "mixed Lightning Address settlement lacks merchant output evidence".into(),
+                    )
+                })?;
+            Ok(LightningAddressSettlementEntry::Mixed {
+                bitcoin: BitcoinSettlementEntry {
+                    amount_sat,
+                    network: "liquid",
+                    status: if row.merchant_bitcoin_settled {
+                        "settled".to_owned()
+                    } else {
+                        "pending".to_owned()
+                    },
+                },
+                fiat,
+            })
+        }
+        _ => Err(AppError::DbError(
+            "invalid Lightning Address settlement purpose".into(),
+        )),
+    }
+}
+
 fn private_no_store(mut response: Response) -> Response {
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
@@ -581,5 +777,67 @@ mod tests {
             signature: sign(&keypair, &message),
         };
         assert!(verify_set_request(Product::Pos, request).is_ok());
+    }
+
+    #[test]
+    fn lightning_address_projection_exposes_only_exact_merchant_accounting() {
+        let order_id = Uuid::new_v4();
+        let projected = project_lightning_address_settlement(
+            db::LightningAddressBullBitcoinSettlementProjection {
+                purpose: "mixed".into(),
+                bull_bitcoin_order_id: Some(order_id),
+                fiat_currency: "CAD".into(),
+                settlement_status: "settled".into(),
+                credited_fiat_minor: Some(12_345),
+                funding_route: Some("bull_bitcoin".into()),
+                fallback_category: None,
+                merchant_bitcoin_sat: Some(60_000),
+                merchant_bitcoin_settled: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            LightningAddressSettlementEntry::Mixed {
+                bitcoin: BitcoinSettlementEntry {
+                    amount_sat: 60_000,
+                    network: "liquid",
+                    status: "settled".into(),
+                },
+                fiat: FiatSettlementEntry {
+                    amount_minor: Some(12_345),
+                    currency: "CAD".into(),
+                    order_id,
+                    status: "settled".into(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn lightning_address_projection_collapses_fallback_details() {
+        let projected = project_lightning_address_settlement(
+            db::LightningAddressBullBitcoinSettlementProjection {
+                purpose: "mixed".into(),
+                bull_bitcoin_order_id: Some(Uuid::new_v4()),
+                fiat_currency: "USD".into(),
+                settlement_status: "none".into(),
+                credited_fiat_minor: None,
+                funding_route: Some("bitcoin_fallback".into()),
+                fallback_category: Some("ambiguous_create".into()),
+                merchant_bitcoin_sat: None,
+                merchant_bitcoin_settled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            LightningAddressSettlementEntry::BitcoinFallback {
+                fiat_conversion: FiatConversionOverride {
+                    status: "overridden",
+                    reason: "conversion_unavailable",
+                },
+            }
+        );
     }
 }

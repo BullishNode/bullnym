@@ -167,6 +167,23 @@ pub struct InvoiceBullBitcoinSettlementProjection {
     pub merchant_bitcoin_settled: bool,
 }
 
+/// Privacy-minimal local projection for the signed Lightning Address
+/// settlement list. It intentionally omits payer instructions, payer rails,
+/// requested/received Bitcoin amounts, provider state, transaction IDs,
+/// account identity, and credential references.
+#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+pub struct LightningAddressBullBitcoinSettlementProjection {
+    pub purpose: String,
+    pub bull_bitcoin_order_id: Option<Uuid>,
+    pub fiat_currency: String,
+    pub settlement_status: String,
+    pub credited_fiat_minor: Option<i64>,
+    pub funding_route: Option<String>,
+    pub fallback_category: Option<String>,
+    pub merchant_bitcoin_sat: Option<i64>,
+    pub merchant_bitcoin_settled: bool,
+}
+
 const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
      credential_id, product, purpose, payer_rail, \
      request_key, fiat_percentage, fiat_currency, terms_version, provider_state, \
@@ -449,6 +466,51 @@ where
     )
     .bind(owner_npub)
     .bind(invoice_ids)
+    .fetch_all(executor)
+    .await
+}
+
+pub async fn lightning_address_bull_bitcoin_settlement_projections<'e, E>(
+    executor: E,
+    owner_npub: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<LightningAddressBullBitcoinSettlementProjection>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT settlement.purpose, settlement.bull_bitcoin_order_id, \
+                settlement.fiat_currency, settlement.settlement_status, \
+                settlement.credited_fiat_minor, settlement.funding_route, \
+                settlement.fallback_category, \
+                merchant.authorized_amount_sat AS merchant_bitcoin_sat, \
+                COALESCE(reverse_swap.status = 'claimed' \
+                         AND reverse_swap.claim_txid = merchant.txid, FALSE) \
+                    AS merchant_bitcoin_settled \
+           FROM bull_bitcoin_settlements settlement \
+           JOIN users account ON account.npub = settlement.owner_npub \
+            AND account.is_active \
+           LEFT JOIN bull_bitcoin_claim_outputs merchant \
+             ON merchant.settlement_id = settlement.id \
+            AND merchant.role = 'merchant' \
+           LEFT JOIN swap_records reverse_swap \
+             ON reverse_swap.id = settlement.reverse_swap_id \
+          WHERE settlement.owner_npub = $1 \
+            AND settlement.product = 'lightning_address' \
+            AND settlement.invoice_id IS NULL \
+            AND ( \
+                (settlement.provider_state = 'bound' \
+                 AND settlement.funding_route = 'bull_bitcoin' \
+                 AND settlement.funding_committed_at IS NOT NULL) \
+                OR settlement.funding_route = 'bitcoin_fallback' \
+            ) \
+          ORDER BY settlement.created_at DESC, settlement.id DESC \
+          OFFSET $2 LIMIT $3",
+    )
+    .bind(owner_npub)
+    .bind(offset)
+    .bind(limit)
     .fetch_all(executor)
     .await
 }

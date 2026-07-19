@@ -721,6 +721,10 @@ fn test_app(state: AppState) -> Router {
             get(fiat_settlement::configuration),
         )
         .route(
+            "/api/v1/fiat-settlements",
+            get(fiat_settlement::settlements),
+        )
+        .route(
             "/api/v1/fiat-settlement/:product",
             put(fiat_settlement::set).delete(fiat_settlement::delete_product),
         )
@@ -3087,6 +3091,159 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
     .await
     .unwrap();
     assert_eq!(material_after, (true, true, true));
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_isolated() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(27_500),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: true,
+    }))
+    .await;
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, fake, "fiat-la-list-owner").await;
+    let request = fiat_only_test_request(&owner_npub, credential_id, "fiat-la-list-intent");
+    let settlement_id =
+        match pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap()
+        {
+            FiatOnlyInstructionOutcome::BullBitcoin { settlement_id, .. } => settlement_id,
+            other => panic!("expected Bull Bitcoin instruction, got {other:?}"),
+        };
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+
+    let app = test_app(state);
+    let timestamp = auth_timestamp();
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "10"],
+        timestamp,
+    );
+    let (status, headers, body) = get_json_with_headers(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(headers.get("pragma").unwrap(), "no-cache");
+    assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(
+        body,
+        json!({
+            "version": 1,
+            "settlements": [{
+                "kind": "fiat",
+                "fiat": {
+                    "amount_minor": 12_345,
+                    "currency": "CAD",
+                    "order_id": order_id,
+                    "status": "settled",
+                }
+            }],
+            "page": 1,
+            "pageSize": 10,
+            "has_more": false,
+        })
+    );
+    let serialized = body.to_string();
+    for forbidden in [
+        settlement_id.to_string(),
+        credential_id.to_string(),
+        owner_npub.clone(),
+        "27500".into(),
+        "25000".into(),
+        "bbak-".into(),
+        "payer_instruction".into(),
+        "actual_received".into(),
+    ] {
+        assert!(!serialized.contains(&forbidden), "leaked {forbidden}");
+    }
+
+    let other_keypair = Keypair::new(&Secp256k1::new(), &mut secp256k1::rand::thread_rng());
+    let other_npub = other_keypair.x_only_public_key().0.to_string();
+    pay_service::db::create_user(&pool, "fiat-la-list-other", &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let other_timestamp = auth_timestamp();
+    let other_signature = sign_la_action_with_timestamp(
+        &other_keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &other_npub,
+        "",
+        &["1", "1", "10"],
+        other_timestamp,
+    );
+    let (other_status, other_body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={other_npub}&page=1&pageSize=10&timestamp={other_timestamp}&signature={other_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(other_status, StatusCode::OK, "{other_body:?}");
+    assert!(other_body["settlements"].as_array().unwrap().is_empty());
+
+    let forged_timestamp = auth_timestamp();
+    let forged_signature = sign_la_action_with_timestamp(
+        &other_keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "10"],
+        forged_timestamp,
+    );
+    let (forged_status, _) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=10&timestamp={forged_timestamp}&signature={forged_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED);
+
+    let oversized_timestamp = auth_timestamp();
+    let oversized_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "101"],
+        oversized_timestamp,
+    );
+    let (oversized_status, oversized_body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=101&timestamp={oversized_timestamp}&signature={oversized_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(oversized_status, StatusCode::OK);
+    assert_eq!(oversized_body["code"], "InvalidAmount");
+
     cleanup_db(&pool).await;
 }
 
