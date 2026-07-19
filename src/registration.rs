@@ -409,6 +409,10 @@ pub struct LookupResponse {
     /// availability.
     pub nym: String,
     pub lightning_address_online: bool,
+    /// The stable Lightning Address for this permanent nym. This remains
+    /// present while the address is offline so clients can display it and
+    /// explain what will become payable when it is reactivated.
+    pub lightning_address: String,
     /// The one permanent owner alias, when it has been claimed.
     pub alias: Option<String>,
     pub public_name_policy: &'static str,
@@ -450,6 +454,7 @@ pub async fn lookup_by_npub(
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration for this key".to_string()))?;
     Ok(Json(LookupResponse {
+        lightning_address: format!("{}@{}", status.nym, state.config.domain),
         nym: status.nym,
         lightning_address_online: status.lightning_address_online,
         alias: status.alias,
