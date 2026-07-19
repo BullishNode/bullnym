@@ -22,9 +22,9 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl,
-    lnurl_comment_history, nostr, og_image, pricer, rate_limit, readiness, reconciler,
-    recovery_address_registration, registration, startup_provider_reconciliation,
+    donation_page, donation_render, fee_runtime, gc, get_paid_transaction_history, invoice,
+    ip_whitelist, lnurl, lnurl_comment_history, nostr, og_image, pricer, rate_limit, readiness,
+    reconciler, recovery_address_registration, registration, startup_provider_reconciliation,
     swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, wallet_backup, AppState,
@@ -966,6 +966,10 @@ fn build_router(state: AppState) -> Router {
     let pwa_dist_dir = state.config.pwa.dist_dir.clone();
 
     let mut router: Router<AppState> = Router::new()
+        .route(
+            "/api/v1/get-paid/transactions",
+            get(get_paid_transaction_history::list_signed),
+        )
         .route(
             "/api/v1/lnurl/comments",
             get(lnurl_comment_history::list_signed),

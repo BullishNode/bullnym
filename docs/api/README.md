@@ -16,6 +16,7 @@ Opaque wallet-backup storage is defined by `src/wallet_backup.rs`.
 - [Discovery, pricing, permanent nyms, and availability](nyms-and-discovery.md)
 - [Payment Page and POS APIs](payment-pages-and-pos.md)
 - [Invoices and payment state](invoices-and-payment-state.md)
+- [Get Paid transaction history](get-paid-transaction-history.md)
 - [Private LNURL payer-comment history](private-lnurl-comments.md)
 - [Chain-swap recovery](chain-swap-recovery.md)
 - [Opaque wallet backups](wallet-backups.md)

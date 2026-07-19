@@ -111,7 +111,7 @@ Example unlinked response:
 
 `invoice_url` is a construction value, not the merchant-facing share value.
 Mobile appends `#v1.<43-character-viewing-key>` locally and exposes only that
-complete private link through its Copy, Share, and QR actions. The view key is
+complete private link through its Copy, Share, and Open actions. The view key is
 never sent to Bullnym. See [private invoice presentation v1](../protocols/private-invoice-v1.md).
 
 An authenticated retry with the same owner, `client_request_id`, and exact

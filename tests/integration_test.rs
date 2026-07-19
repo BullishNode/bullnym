@@ -67,8 +67,9 @@ use pay_service::swap_manifest_store::{
     S3ManifestStoreConfig,
 };
 use pay_service::{
-    certification, claimer, donation_page, donation_render, invoice, lnurl, lnurl_comment_history,
-    nostr, readiness, recovery_address_registration, registration, AppState,
+    certification, claimer, donation_page, donation_render, get_paid_transaction_history, invoice,
+    lnurl, lnurl_comment_history, nostr, readiness, recovery_address_registration, registration,
+    AppState,
 };
 
 use bitcoin::absolute::LockTime;
@@ -388,6 +389,10 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 fn test_app(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/api/v1/get-paid/transactions",
+            get(get_paid_transaction_history::list_signed),
+        )
         .route(
             "/api/v1/lnurl/comments",
             get(lnurl_comment_history::list_signed),
@@ -1774,7 +1779,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "065_private_invoice_presentations"
+        "066_get_paid_transaction_history"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -2015,7 +2020,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "065_private_invoice_presentations"
+        "066_get_paid_transaction_history"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -11468,6 +11473,23 @@ fn lnurl_comment_history_uri(
     )
 }
 
+fn get_paid_transaction_history_uri(
+    keypair: &Keypair,
+    npub: &str,
+    cursor: &str,
+    limit: i64,
+    timestamp: u64,
+) -> String {
+    let message = get_paid_transaction_history::build_get_paid_transaction_history_message(
+        npub, cursor, limit, timestamp,
+    )
+    .unwrap();
+    let signature = sign_with_keypair(keypair, &message);
+    format!(
+        "/api/v1/get-paid/transactions?npub={npub}&timestamp={timestamp}&signature={signature}&cursor={cursor}&limit={limit}"
+    )
+}
+
 async fn persist_evidenced_lnurl_comment(
     pool: &PgPool,
     owner_npub: &str,
@@ -11773,6 +11795,350 @@ async fn signed_lnurl_comment_history_is_private_evidence_gated_paginated_and_re
 
     drop(app);
     restarted_runtime.close().await;
+    cleanup_db(&admin).await;
+}
+
+async fn insert_history_checkout_invoice(
+    pool: &PgPool,
+    nym: &str,
+    npub: &str,
+    surface_kind: &str,
+    liquid_address: &str,
+    memo: &str,
+) -> pay_service::db::Invoice {
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some(nym),
+            public_slug: None,
+            npub_owner: npub,
+            origin: "checkout",
+            checkout_surface_kind: Some(surface_kind),
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: Some(memo),
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(liquid_address),
+            liquid_blinding_key_hex: Some("12".repeat(32).as_str()),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn record_settled_history_payment(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    address: &str,
+    tx_byte: char,
+) {
+    let txid = tx_byte.to_string().repeat(64);
+    let event_key = format!("liquid_direct:{txid}:0");
+    let tolerances = pay_service::db::InvoiceAccountingTolerances {
+        payment_grace_secs: 0,
+        btc_sat: 1,
+        liquid_sat: 1,
+        lightning_sat: 1,
+    };
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            pool,
+            invoice_id,
+            liquid_direct_evidence(&event_key, 1_000, &txid, 0, address),
+            tolerances,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    // The fixture models the watcher's authoritative confirmation transition;
+    // production reaches the same active/verified state through its reducer.
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+            SET accounting_state = 'active', verification_state = 'verified' \
+          WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice_id)
+    .bind(&event_key)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            pool,
+            invoice_id,
+            liquid_direct_evidence(&event_key, 1_000, &txid, 0, address),
+            tolerances,
+        )
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_paid_history_unifies_payment_evidence_without_making_comments_the_resource() {
+    use pay_service::db::{
+        bind_lnurl_comment_instruction, persist_lnurl_comment_intent, NewLnurlCommentIntent,
+    };
+    use pay_service::lnurl_comment::{LnurlCommentIntentKey, LnurlCommentRail, LnurlPayerComment};
+
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let secp = Secp256k1::new();
+    let owner_keypair =
+        Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x41; 32]).unwrap());
+    let other_keypair =
+        Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x42; 32]).unwrap());
+    let owner_npub = owner_keypair.x_only_public_key().0.to_string();
+    let other_npub = other_keypair.x_only_public_key().0.to_string();
+    let nym = "getpaidhistory";
+    pay_service::db::create_user(&admin, nym, &owner_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&admin, "getpaidother", &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    // One successful Lightning Address payment has no comment at all.
+    insert_swap(&admin, nym, "pending", 71).await;
+    let no_comment_swap: (Uuid,) =
+        sqlx::query_as("SELECT id FROM swap_records WHERE boltz_swap_id = $1")
+            .bind("boltz-getpaidhistory-71")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    pay_service::db::update_swap_status(
+        &runtime,
+        no_comment_swap.0,
+        pay_service::db::SwapStatus::Claimed,
+        Some(&"a".repeat(64)),
+    )
+    .await
+    .unwrap();
+
+    // A second payment carries exact private text bound to its exact swap.
+    insert_swap(&admin, nym, "pending", 72).await;
+    let commented_swap: (Uuid,) =
+        sqlx::query_as("SELECT id FROM swap_records WHERE boltz_swap_id = $1")
+            .bind("boltz-getpaidhistory-72")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    let comment_key = LnurlCommentIntentKey::from_digest([0x43; 32]);
+    let comment_text = "Private payer note — exact";
+    let comment = LnurlPayerComment::try_from(comment_text.to_owned()).unwrap();
+    persist_lnurl_comment_intent(
+        &runtime,
+        &NewLnurlCommentIntent {
+            owner_npub: &owner_npub,
+            nym,
+            idempotency_key: &comment_key,
+            amount_msat: 1_000_000,
+            comment: &comment,
+        },
+    )
+    .await
+    .unwrap();
+    bind_lnurl_comment_instruction(
+        &runtime,
+        &owner_npub,
+        &comment_key,
+        LnurlCommentRail::Lightning,
+        "boltz-getpaidhistory-72",
+    )
+    .await
+    .unwrap();
+    pay_service::db::mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
+        &runtime,
+        commented_swap.0,
+        &"b".repeat(64),
+    )
+    .await
+    .unwrap();
+
+    // An abandoned intent is private state, not a transaction.
+    let abandoned_text = "abandoned and invisible";
+    let abandoned = LnurlPayerComment::try_from(abandoned_text.to_owned()).unwrap();
+    let abandoned_key = LnurlCommentIntentKey::from_digest([0x44; 32]);
+    persist_lnurl_comment_intent(
+        &runtime,
+        &NewLnurlCommentIntent {
+            owner_npub: &owner_npub,
+            nym,
+            idempotency_key: &abandoned_key,
+            amount_msat: 2_000_000,
+            comment: &abandoned,
+        },
+    )
+    .await
+    .unwrap();
+
+    let payment_page = insert_history_checkout_invoice(
+        &admin,
+        nym,
+        &owner_npub,
+        pay_service::db::KIND_PAYMENT_PAGE,
+        "lq1historypage",
+        "Donation payer note",
+    )
+    .await;
+    record_settled_history_payment(&admin, payment_page.id, "lq1historypage", 'c').await;
+
+    let pos = insert_history_checkout_invoice(
+        &admin,
+        nym,
+        &owner_npub,
+        pay_service::db::KIND_POS,
+        "lq1historypos",
+        "POS payer note",
+    )
+    .await;
+    record_settled_history_payment(&admin, pos.id, "lq1historypos", 'd').await;
+
+    let wallet_candidate =
+        private_invoice_test_candidate(&owner_npub, "bc1qgetpaidhistorywalletinvoice");
+    let wallet_invoice = insert_test_wallet_invoice(&admin, &wallet_candidate)
+        .await
+        .unwrap();
+    let wallet_txid = "e".repeat(64);
+    let tolerances = pay_service::db::InvoiceAccountingTolerances {
+        payment_grace_secs: 0,
+        btc_sat: 1,
+        liquid_sat: 1,
+        lightning_sat: 1,
+    };
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            &admin,
+            wallet_invoice.id,
+            bitcoin_direct_evidence(
+                &format!("bitcoin_direct:{wallet_txid}:0"),
+                21_000,
+                &wallet_txid,
+                0,
+                "bc1qgetpaidhistorywalletinvoice",
+            ),
+            tolerances,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+            SET accounting_state = 'inactive', deactivated_at = NOW(), \
+                deactivation_reason = 'reorged' \
+          WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(wallet_invoice.id)
+    .bind(format!("bitcoin_direct:{wallet_txid}:0"))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(runtime.clone()));
+    let timestamp = auth_timestamp();
+    let first_uri = get_paid_transaction_history_uri(&owner_keypair, &owner_npub, "", 3, timestamp);
+    let (first_status, first_headers, first_page) = get_json_with_headers(&app, &first_uri).await;
+    assert_eq!(first_status, StatusCode::OK, "{first_page:?}");
+    assert_eq!(
+        first_headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(first_page["transactions"].as_array().unwrap().len(), 3);
+    let cursor = first_page["next_cursor"].as_str().unwrap();
+    let second_uri =
+        get_paid_transaction_history_uri(&owner_keypair, &owner_npub, cursor, 3, timestamp);
+    let (second_status, second_page) = get_path(&app, &second_uri).await;
+    assert_eq!(second_status, StatusCode::OK, "{second_page:?}");
+
+    let all_items = first_page["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second_page["transactions"].as_array().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(all_items.len(), 5);
+    let sources = all_items
+        .iter()
+        .map(|item| item["source"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        sources,
+        std::collections::HashSet::from([
+            "lightning_address",
+            "invoice",
+            "payment_page",
+            "point_of_sale",
+        ])
+    );
+    assert_eq!(
+        all_items
+            .iter()
+            .filter(|item| item["source"] == "lightning_address")
+            .count(),
+        2
+    );
+    assert!(all_items
+        .iter()
+        .filter(|item| item["source"] == "lightning_address")
+        .all(|item| item["settlement_state"] == "settled"));
+    assert!(all_items
+        .iter()
+        .filter(|item| matches!(
+            item["source"].as_str(),
+            Some("payment_page" | "point_of_sale")
+        ))
+        .all(|item| item["settlement_state"] == "pending"));
+    let wallet_item = all_items
+        .iter()
+        .find(|item| item["source"] == "invoice")
+        .unwrap();
+    assert_eq!(wallet_item["settlement_state"], "problem");
+    assert_eq!(wallet_item["invoice_id"], wallet_invoice.id.to_string());
+    let no_comment_item = all_items
+        .iter()
+        .find(|item| item["transaction_id"] == no_comment_swap.0.to_string())
+        .unwrap();
+    assert!(!no_comment_item.as_object().unwrap().contains_key("comment"));
+    let unique_ids = all_items
+        .iter()
+        .map(|item| {
+            (
+                item["source"].as_str().unwrap(),
+                item["transaction_id"].as_str().unwrap(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique_ids.len(), all_items.len());
+    assert!(all_items.iter().any(|item| item["comment"] == comment_text));
+    let wire = format!("{first_page} {second_page}");
+    assert!(!wire.contains(abandoned_text));
+
+    let forged_message = get_paid_transaction_history::build_get_paid_transaction_history_message(
+        &owner_npub,
+        "",
+        3,
+        timestamp,
+    )
+    .unwrap();
+    let forged_signature = sign_with_keypair(&other_keypair, &forged_message);
+    let forged_uri = format!(
+        "/api/v1/get-paid/transactions?npub={owner_npub}&timestamp={timestamp}&signature={forged_signature}&cursor=&limit=3"
+    );
+    let (forged_status, forged_body) = get_path(&app, &forged_uri).await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED);
+    assert!(forged_body.get("transactions").is_none());
+
     cleanup_db(&admin).await;
 }
 

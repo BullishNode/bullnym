@@ -234,6 +234,19 @@ columns that no longer exist, so automatic binary rollback is forbidden. Roll
 forward, or restore the complete validated pre-065 database and matching
 binary while all writers remain stopped.
 
+## Migration 066 Get Paid transaction history
+
+Apply `066_get_paid_transaction_history.sql` as the privileged schema owner
+with `--set runtime_role=bullnym_app` while Bullnym writers are stopped. It
+adds the immutable first-payment-observation timestamp used for Lightning
+Address history, backfills existing payment-bearing swaps from the closest
+durable lifecycle evidence, and installs the bounded history indexes.
+
+Start only a matching schema-066 binary after migration. Readiness verifies
+the timestamp column, immutable stamping trigger, indexes, and runtime read
+privilege before serving traffic. The endpoint reads existing swap and invoice
+payment evidence; it does not create or mutate accounting events.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes
