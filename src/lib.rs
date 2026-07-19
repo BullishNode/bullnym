@@ -41,6 +41,7 @@ pub mod fee_refresh_cycle;
 pub mod fee_runtime;
 pub mod fiat_quote_credit;
 pub mod gc;
+pub mod get_paid_transaction_history;
 pub mod invoice;
 pub mod ip_whitelist;
 pub mod liquid_fee_adapter;

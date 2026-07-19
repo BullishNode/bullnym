@@ -41,6 +41,7 @@ unlinked invoice operations it is the empty string.
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
 | list received LNURL comments | `lnurl-comment-history` | `page`, then `pageSize`; the nym slot is the empty string and `npub` must be canonical lowercase hex |
+| list Get Paid transactions | `get-paid-transaction-list` | `cursor_or_empty`, then `limit`; the nym slot is the empty string and `npub` must be canonical lowercase hex |
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 | register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
 | look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |

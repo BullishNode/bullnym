@@ -1188,6 +1188,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     if !schema_marker_present(pool).await?
         || !wallet_backup_storage_invariants_present(pool).await?
         || !private_invoice_storage_contract_present(pool).await?
+        || !get_paid_history_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
@@ -1321,6 +1322,52 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn get_paid_history_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'public' \
+                AND table_name = 'swap_records' \
+                AND column_name = 'payment_first_observed_at' \
+                AND data_type = 'timestamp with time zone' \
+                AND is_nullable = 'YES' \
+         ) \
+         AND EXISTS ( \
+             SELECT 1 \
+               FROM pg_trigger trigger_info \
+               JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+              WHERE trigger_info.tgrelid = to_regclass('public.swap_records') \
+                AND trigger_info.tgname = \
+                    'swap_records_stamp_payment_first_observed' \
+                AND trigger_info.tgenabled = 'O' \
+                AND NOT trigger_info.tgisinternal \
+                AND function_info.proname = 'stamp_payment_first_observed' \
+                AND function_info.pronargs = 0 \
+                AND function_info.prorettype = 'trigger'::REGTYPE \
+                AND NOT function_info.prosecdef \
+                AND function_info.proconfig = ARRAY['search_path=pg_catalog'] \
+         ) \
+         AND EXISTS ( \
+             SELECT 1 FROM pg_indexes \
+              WHERE schemaname = 'public' \
+                AND tablename = 'swap_records' \
+                AND indexname = 'swap_records_get_paid_history_idx' \
+         ) \
+         AND EXISTS ( \
+             SELECT 1 FROM pg_indexes \
+              WHERE schemaname = 'public' \
+                AND tablename = 'invoices' \
+                AND indexname = 'invoices_get_paid_history_owner_idx' \
+         ) \
+         AND has_column_privilege( \
+             current_user, 'public.swap_records', \
+             'payment_first_observed_at', 'SELECT' \
+         )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn wallet_backup_storage_invariants_present(
