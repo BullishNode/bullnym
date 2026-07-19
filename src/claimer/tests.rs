@@ -8,6 +8,12 @@ use tokio::sync::Mutex;
 
 use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
 
+#[test]
+fn pinned_boltz_client_exposes_fixed_additional_output_options() {
+    let _options = TransactionOptions::default()
+        .with_additional_outputs(vec![("lq1-provider-destination".to_string(), 12_345)]);
+}
+
 fn liquid_builder_fee(rate: f64) -> LiquidBuilderFeeDecision {
     let observation = LiveLiquid::new(
         SatPerVbyte::try_from(rate).unwrap(),

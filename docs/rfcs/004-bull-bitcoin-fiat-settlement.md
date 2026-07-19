@@ -6,7 +6,9 @@
   `API-Orders`, a temporary `boltz-rust` fork, and `bullnym-tests`; later client
   wiring in `bullbitcoin-mobile`
 - Prerequisites: the scoped Bull Bitcoin API-key stack and SatoshiPortal `boltz-rust` PR #162
-- Written against: Bullnym `d9f6443`, `boltz-rust` PR #162 head `d3b8520`, BullishNode covenant commit `c20511854bbd996a74f914fa0327d4601b5d4f62`
+- Written against: Bullnym `d9f6443`, `boltz-rust` PR #162 head `d3b8520`,
+  BullishNode covenant commit `c20511854bbd996a74f914fa0327d4601b5d4f62`,
+  and reviewed 0.3 backport `6b4d4d9bfaf2c18b03cbf406c4d212fa179e3477`
 - Last updated: 2026-07-18
 
 ## 1. Objective
@@ -704,9 +706,11 @@ Bullnym cannot pin PR #162 alone because current main also depends on the
 unmerged `claim_covenant` field at BullishNode commit `c205118...`. Before any
 Bullnym money-path change:
 
-1. create one clean temporary fork branch combining SatoshiPortal PR #162 with
-   `c205118...`;
-2. resolve only the request-struct compatibility conflict;
+1. create one clean temporary fork branch by applying PR #162's four commits on
+   top of `c205118...`;
+2. retain boltz-client 0.3.1 and Bullnym's current LWK/Elements boundary rather
+   than pulling the PR's unrelated 0.4.1 dependency/API changes; resolve only
+   the `claim_covenant` request-struct compatibility;
 3. run the PR's unit, transaction, and multi-output tests;
 4. add a Bullnym compile test using `TransactionOptions::with_additional_outputs`;
 5. push and pin one immutable fork commit in both `Cargo.toml` and

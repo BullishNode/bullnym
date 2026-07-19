@@ -5,7 +5,7 @@ format_version = 1
 
 [boltz_client]
 repository = "https://github.com/BullishNode/boltz-rust.git"
-commit = "c20511854bbd996a74f914fa0327d4601b5d4f62"
+commit = "6b4d4d9bfaf2c18b03cbf406c4d212fa179e3477"
 
 [content]
 pwa_directory = "pwa/dist"
