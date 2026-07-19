@@ -105,6 +105,8 @@ fn invoice_html_response_does_not_mark_pwa_shell() {
     let resp = html_response("<!doctype html><title>invoice</title>".to_string());
 
     assert!(!resp.headers().contains_key("x-bullnym-pwa-shell"));
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert_eq!(resp.headers()[header::REFERRER_POLICY], "no-referrer");
 }
 
 #[test]
@@ -114,96 +116,52 @@ fn bolt11_reusable_check_uses_embedded_expiry() {
     // after expiry, independently of the merchant invoice lifetime.
     let pr = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
 
-    assert!(bolt11_is_reusable_at(pr, 1_496_314_658 + 3_479));
-    assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_481));
-    assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_601));
-    assert!(!bolt11_is_reusable_at("not-a-bolt11", 1_496_314_658));
+    assert!(bolt11_is_fresh_at(pr, 1_496_314_658 + 3_479));
+    assert!(!bolt11_is_fresh_at(pr, 1_496_314_658 + 3_481));
+    assert!(!bolt11_is_fresh_at(pr, 1_496_314_658 + 3_601));
+    assert!(!bolt11_is_fresh_at("not-a-bolt11", 1_496_314_658));
+
+    // Pre-privacy invoices used a URL (or its hash) as their description.
+    // Even while fresh, those offers must be replaced before being exposed.
+    assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_479));
 }
 
 #[test]
-fn invoice_public_url_builds_linked_and_unlinked_urls() {
-    let id = Uuid::nil();
-
-    assert_eq!(
-        invoice_public_url("bullpay.ca", Some("alice"), None, id),
-        "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000"
-    );
-    assert_eq!(
-        invoice_public_url("bullpay.ca", None, None, id),
-        "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000"
-    );
-    // An alias slug wins over the nym, so the public URL is nym-free.
-    assert_eq!(
-        invoice_public_url("bullpay.ca", Some("alice"), Some("alices-shop"), id),
-        "https://bullpay.ca/a/alices-shop/i/00000000-0000-0000-0000-000000000000"
-    );
+fn boltz_invoice_description_is_generic_and_contains_no_invoice_identifier() {
+    assert_eq!(BOLTZ_INVOICE_DESCRIPTION, "Bullnym payment");
+    assert!(!BOLTZ_INVOICE_DESCRIPTION.contains("http"));
 }
 
 #[test]
-fn boltz_invoice_description_uses_url_when_it_fits() {
-    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
-
-    let description = boltz_invoice_description_for_url(url);
-
-    assert_eq!(description.description.as_deref(), Some(url));
-    assert!(description.description_hash.is_none());
-}
-
-#[test]
-fn max_bullpay_invoice_url_fits_boltz_description_limit() {
-    let url = invoice_public_url(
-        "bullpay.ca",
-        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        None,
-        Uuid::nil(),
-    );
-
-    assert_eq!(url.len(), 90);
-    assert_eq!(
-        boltz_invoice_description_for_url(&url)
-            .description
-            .as_deref(),
-        Some(url.as_str())
-    );
-}
-
-#[test]
-fn boltz_invoice_description_hashes_url_when_too_long() {
-    let url = format!(
-        "https://really-long-bullpay-domain.example/{}/i/00000000-0000-0000-0000-000000000000",
-        "a".repeat(32)
-    );
-
-    let description = boltz_invoice_description_for_url(&url);
-    let expected_hash = hex::encode(Sha256::digest(url.as_bytes()));
-
-    assert!(description.description.is_none());
-    assert_eq!(
-        description.description_hash.as_deref(),
-        Some(expected_hash.as_str())
-    );
-}
-
-#[test]
-fn chain_bip21_is_built_locally_with_exact_amount_and_encoded_invoice_url() {
+fn chain_bip21_is_built_locally_without_an_invoice_url_or_message() {
     let address = "bc1qboltzlockup";
-    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
 
     assert_eq!(
-            build_bitcoin_chain_bip21(address, 10_000, url),
-            "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address&message=https%3A%2F%2Fbullpay.ca%2Falice%2Fi%2F00000000-0000-0000-0000-000000000000"
-        );
+        build_bitcoin_chain_bip21(address, 10_000),
+        "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address"
+    );
+}
+
+#[test]
+fn public_chain_bip21_rebuild_ignores_legacy_persisted_messages() {
+    let rebuilt = public_bitcoin_chain_bip21("bc1qlegacypersistedoffer", 10_000).unwrap();
+
+    assert_eq!(
+        rebuilt,
+        "bitcoin:bc1qlegacypersistedoffer?amount=0.00010000&label=Send%20to%20L-BTC%20address"
+    );
+    assert!(!rebuilt.contains("message="));
+    assert!(!rebuilt.contains("http"));
 }
 
 #[test]
 fn chain_bip21_formats_whole_bitcoin_without_rounding() {
     let address = "bc1qboltzlockup";
-    let url = "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000";
 
     assert_eq!(
-            build_bitcoin_chain_bip21(address, 100_000_001, url),
-            "bitcoin:bc1qboltzlockup?amount=1.00000001&label=Send%20to%20L-BTC%20address&message=https%3A%2F%2Fbullpay.ca%2Finvoice%2F00000000-0000-0000-0000-000000000000"
-        );
+        build_bitcoin_chain_bip21(address, 100_000_001),
+        "bitcoin:bc1qboltzlockup?amount=1.00000001&label=Send%20to%20L-BTC%20address"
+    );
 }
 
 #[test]
@@ -383,6 +341,21 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
     assert!(html.contains("fetchLightning();"));
     assert!(html.contains("method: 'POST'"));
     assert!(html.contains("/lightning"));
+}
+
+#[test]
+fn template_qr_loading_failure_does_not_block_the_payment_state_machine() {
+    let html = payment_template_fixture("unpaid", "unpaid", "none", true)
+        .render()
+        .expect("template renders");
+
+    assert!(html.contains("const paymentQrRenderer = import('/pwa-assets/invoice-qr.js')"));
+    assert!(html.contains(".catch(() => null);"));
+    assert!(html.contains("const renderQr = await paymentQrRenderer;"));
+    assert!(html.contains("if (!renderQr) throw new Error('payment QR renderer unavailable');"));
+    assert!(!html.contains("import { paymentQrDataUrl } from"));
+    assert!(html.contains("fetchLightning();"));
+    assert!(html.contains("copyBtn.addEventListener('click'"));
 }
 
 #[test]

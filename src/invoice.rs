@@ -644,7 +644,7 @@ fn html_response(html: String) -> Response {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("strict-origin-when-cross-origin"),
+        HeaderValue::from_static("no-referrer"),
     );
     h.insert(
         header::CACHE_CONTROL,
@@ -1405,7 +1405,8 @@ async fn render_invoice_template(
         .as_ref()
         .and_then(payer_exposable_bitcoin_chain_offer);
     let bitcoin_chain_address = bitcoin_chain_offer.map(|offer| offer.lockup_address);
-    let bitcoin_chain_bip21 = bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21);
+    let bitcoin_chain_bip21 = bitcoin_chain_offer
+        .and_then(|offer| public_bitcoin_chain_bip21(offer.lockup_address, offer.payer_amount_sat));
     let bitcoin_chain_amount_sat = bitcoin_chain_offer.map(|offer| offer.payer_amount_sat);
     let direct_addresses = public_direct_payment_addresses(&inv);
     let liquid_amount_sat = direct_addresses
@@ -1444,7 +1445,7 @@ async fn render_invoice_template(
         liquid_amount_sat,
         bitcoin_address_js: js_string_literal(direct_addresses.bitcoin)?,
         bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
-        bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
+        bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21.as_deref())?,
         liquid_address_js: js_string_literal(direct_addresses.liquid)?,
         liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
     };
@@ -1629,8 +1630,9 @@ pub async fn status(
         bitcoin_address,
         bitcoin_direct_observations,
         bitcoin_chain_address: bitcoin_chain_offer.map(|offer| offer.lockup_address.to_owned()),
-        bitcoin_chain_bip21: bitcoin_chain_offer
-            .and_then(|offer| offer.lockup_bip21.map(str::to_owned)),
+        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| {
+            public_bitcoin_chain_bip21(offer.lockup_address, offer.payer_amount_sat)
+        }),
         bitcoin_chain_amount_sat: bitcoin_chain_offer.map(|offer| offer.payer_amount_sat),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
@@ -2123,7 +2125,7 @@ async fn ensure_reusable_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
-    let prepared = request_lightning_offer(state, derived_key, amount_sat as u64, &current).await?;
+    let prepared = request_lightning_offer(state, derived_key, amount_sat as u64).await?;
 
     // The allocation above is already durable. Start a short transaction only
     // for provider-result persistence plus the final invoice revalidation.
@@ -2171,7 +2173,8 @@ async fn ensure_reusable_lightning_offer(
     let still_payable = invoice_payment_rails_are_payable(&final_invoice)
         && final_invoice.accept_ln
         && final_invoice.expires_at_unix > unix_now()
-        && final_amount_sat == amount_sat;
+        && final_amount_sat == amount_sat
+        && bolt11_uses_generic_description(&prepared.lightning_pr);
     pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::OfferBeforeCommit)
         .await;
 
@@ -2432,7 +2435,7 @@ async fn ensure_versioned_lightning_offer(
         .await
         .map_err(|error| AppError::DbError(format!("swap key reservation failed: {error}")))?;
         let provider_create =
-            prepare_lightning_provider_create(state, derived_key, merchant_amount_sat, &current)?;
+            prepare_lightning_provider_create(state, derived_key, merchant_amount_sat)?;
         let (request_authority_json, request_authority_sha256) =
             provider_create.canonical_authority()?;
         let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
@@ -2634,6 +2637,11 @@ async fn ensure_versioned_lightning_offer(
     drop(connection);
     if let Some(nym) = lightning_swap_nym(&current) {
         db::touch_user_callback(&state.db, nym).await;
+    }
+    if !bolt11_uses_generic_description(&prepared.lightning_pr) {
+        return Err(AppError::ServiceUnavailable(
+            "Lightning offer uses retired private metadata; refresh the quote and retry".into(),
+        ));
     }
     Ok((resolution.offer.id, prepared.public_offer()))
 }
@@ -2964,16 +2972,9 @@ async fn ensure_versioned_bitcoin_chain_offer(
         InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
     )
     .await;
-    let public_url = invoice_public_url(
-        &state.config.domain,
-        current.nym_owner.as_deref(),
-        current.public_slug.as_deref(),
-        current.id,
-    );
     let lockup_bip21 = build_bitcoin_chain_bip21(
         &provider_result.lockup_address,
         provider_result.user_lock_amount_sat,
-        &public_url,
     );
     let payer_amount_sat = i64::try_from(provider_result.user_lock_amount_sat)
         .map_err(|_| AppError::BoltzError("Bitcoin payer amount exceeds storage range".into()))?;
@@ -3105,8 +3106,8 @@ async fn ensure_versioned_bitcoin_chain_offer(
     Ok((
         offer.id,
         BitcoinChainOffer {
+            lockup_bip21: public_bitcoin_chain_bip21(&exposed.lockup_address, payer_amount_sat),
             lockup_address: exposed.lockup_address,
-            lockup_bip21: exposed.lockup_bip21,
             payer_amount_sat,
         },
     ))
@@ -3171,8 +3172,8 @@ async fn reusable_versioned_bitcoin_chain_offer(
     Ok(ReusableVersionedBitcoinOffer::Ready {
         offer_id: offer.id,
         offer: BitcoinChainOffer {
+            lockup_bip21: public_bitcoin_chain_bip21(&exposed.lockup_address, payer_amount_sat),
             lockup_address: exposed.lockup_address,
-            lockup_bip21: exposed.lockup_bip21,
             payer_amount_sat,
         },
     })
@@ -3223,8 +3224,14 @@ fn payment_tolerance_sat(inv: &db::Invoice, tolerances: db::InvoiceAccountingTol
 }
 
 const BOLT11_REFRESH_MARGIN_SECS: u64 = 120;
+const BOLTZ_INVOICE_DESCRIPTION: &str = "Bullnym payment";
 
-fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
+fn bolt11_uses_generic_description(pr: &str) -> bool {
+    Bolt11Invoice::from_str(pr)
+        .is_ok_and(|invoice| invoice.description().to_string() == BOLTZ_INVOICE_DESCRIPTION)
+}
+
+fn bolt11_is_fresh_at(pr: &str, now_unix: i64) -> bool {
     let Ok(now) = u64::try_from(now_unix) else {
         return false;
     };
@@ -3235,73 +3242,31 @@ fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
     !invoice.would_expire(Duration::from_secs(now_with_margin))
 }
 
+fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
+    bolt11_uses_generic_description(pr) && bolt11_is_fresh_at(pr, now_unix)
+}
+
 fn lightning_swap_nym(invoice: &db::Invoice) -> Option<&str> {
     invoice.nym_owner.as_deref()
 }
 
-/// The invoice's public-facing URL, embedded in payment payloads (bolt11
-/// description, BIP21 `message=`). An invoice created under an alias uses the
-/// nym-free `/a/<slug>/i/<id>` form so the nym never reaches the payer; a
-/// nym-path checkout uses `/<nym>/i/<id>`; a wallet-only invoice uses the
-/// nym-less `/invoice/<id>`.
-fn invoice_public_url(
-    domain: &str,
-    nym_owner: Option<&str>,
-    public_slug: Option<&str>,
-    invoice_id: Uuid,
-) -> String {
-    match (public_slug, nym_owner) {
-        (Some(slug), _) => format!("https://{domain}/a/{slug}/i/{invoice_id}"),
-        (None, Some(nym)) => format!("https://{domain}/{nym}/i/{invoice_id}"),
-        (None, None) => format!("https://{domain}/invoice/{invoice_id}"),
-    }
-}
-
-struct BoltzInvoiceDescription {
-    description: Option<String>,
-    description_hash: Option<String>,
-}
-
-fn boltz_invoice_description_for_url(url: &str) -> BoltzInvoiceDescription {
-    if url.is_ascii() && url.len() <= 100 {
-        return BoltzInvoiceDescription {
-            description: Some(url.to_string()),
-            description_hash: None,
-        };
-    }
-
-    BoltzInvoiceDescription {
-        description: None,
-        description_hash: Some(hex::encode(Sha256::digest(url.as_bytes()))),
-    }
-}
-
-fn build_bitcoin_chain_bip21(address: &str, amount_sat: u64, message: &str) -> String {
+fn build_bitcoin_chain_bip21(address: &str, amount_sat: u64) -> String {
     let whole_btc = amount_sat / 100_000_000;
     let fractional_sat = amount_sat % 100_000_000;
-    let message = percent_encode_query_value(message);
     format!(
-        "bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}&label=Send%20to%20L-BTC%20address&message={message}"
+        "bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}&label=Send%20to%20L-BTC%20address"
     )
+}
+
+fn public_bitcoin_chain_bip21(address: &str, payer_amount_sat: i64) -> Option<String> {
+    let amount_sat = u64::try_from(payer_amount_sat).ok()?;
+    Some(build_bitcoin_chain_bip21(address, amount_sat))
 }
 
 fn build_direct_bitcoin_bip21(address: &str, amount_sat: u64) -> String {
     let whole_btc = amount_sat / 100_000_000;
     let fractional_sat = amount_sat % 100_000_000;
     format!("bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}")
-}
-
-fn percent_encode_query_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 struct PreparedLightningOffer {
@@ -3353,9 +3318,8 @@ async fn request_lightning_offer(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
-    invoice: &db::Invoice,
 ) -> Result<PreparedLightningOffer, AppError> {
-    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat, invoice)?;
+    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat)?;
     let result = state
         .boltz
         .submit_fixed_checkout_reverse_swap(prepared)
@@ -3367,21 +3331,12 @@ fn prepare_lightning_provider_create(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
-    invoice: &db::Invoice,
 ) -> Result<crate::boltz::PreparedFixedCheckoutReverseCreate, AppError> {
-    let public_url = invoice_public_url(
-        &state.config.domain,
-        invoice.nym_owner.as_deref(),
-        invoice.public_slug.as_deref(),
-        invoice.id,
-    );
-    let boltz_description = boltz_invoice_description_for_url(&public_url);
-
     state.boltz.prepare_fixed_checkout_reverse_swap(
         derived_key,
         amount_sat,
-        boltz_description.description.as_deref(),
-        boltz_description.description_hash.as_deref(),
+        Some(BOLTZ_INVOICE_DESCRIPTION),
+        None,
     )
 }
 
@@ -3441,7 +3396,7 @@ async fn create_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
-    let prepared = request_lightning_offer(state, derived_key, amount_sat, invoice).await?;
+    let prepared = request_lightning_offer(state, derived_key, amount_sat).await?;
 
     db::record_swap_with_lineage(
         &state.db,
@@ -3466,6 +3421,11 @@ async fn create_lightning_offer(
     if let Some(nym) = swap_nym {
         db::touch_user_callback(&state.db, nym).await;
     }
+    if !bolt11_uses_generic_description(&prepared.lightning_pr) {
+        return Err(AppError::ServiceUnavailable(
+            "Lightning offer uses retired private metadata; refresh and retry".into(),
+        ));
+    }
     Ok(prepared.public_offer())
 }
 
@@ -3484,7 +3444,6 @@ struct BitcoinChainOffer {
 #[derive(Clone, Copy)]
 struct PayerExposableBitcoinChainOffer<'a> {
     lockup_address: &'a str,
-    lockup_bip21: Option<&'a str>,
     payer_amount_sat: i64,
 }
 
@@ -3496,7 +3455,6 @@ fn payer_exposable_bitcoin_chain_offer(
     }
     Some(PayerExposableBitcoinChainOffer {
         lockup_address: &swap.lockup_address,
-        lockup_bip21: swap.lockup_bip21.as_deref(),
         payer_amount_sat: validated_payer_chain_amount_sat(
             swap.user_lock_amount_sat,
             swap.server_lock_amount_sat,
@@ -3601,8 +3559,8 @@ async fn create_bitcoin_chain_offer_with_faults(
             )
         })?;
         return Ok(Some(BitcoinChainOffer {
+            lockup_bip21: public_bitcoin_chain_bip21(&existing.lockup_address, payer_amount_sat),
             lockup_address: existing.lockup_address,
-            lockup_bip21: existing.lockup_bip21,
             payer_amount_sat,
         }));
     }
@@ -3733,21 +3691,12 @@ async fn create_bitcoin_chain_offer_with_faults(
         .boltz
         .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
         .await?;
-    let public_url = invoice_public_url(
-        &state.config.domain,
-        invoice.nym_owner.as_deref(),
-        invoice.public_slug.as_deref(),
-        invoice.id,
-    );
     // Never forward the provider's BIP21. Its address and amount are merely
     // response fields until the complete response passes local validation;
     // this URI is constructed from those validated values under our own fixed
     // parameter policy.
-    let lockup_bip21 = build_bitcoin_chain_bip21(
-        &result.lockup_address,
-        result.user_lock_amount_sat,
-        &public_url,
-    );
+    let lockup_bip21 =
+        build_bitcoin_chain_bip21(&result.lockup_address, result.user_lock_amount_sat);
     let payer_amount_sat = i64::try_from(result.user_lock_amount_sat).map_err(|_| {
         AppError::BoltzError(
             "validated chain-swap payer amount is outside the response range".into(),

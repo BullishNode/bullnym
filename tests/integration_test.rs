@@ -483,12 +483,14 @@ fn auth_timestamp() -> u64 {
         .as_secs()
 }
 
+const CURRENT_BULLNYM_INVOICE_DESCRIPTION: &str = "Bullnym payment";
+
 fn fresh_bolt11(amount_sat: u64) -> String {
     let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
     let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-admission-test");
     InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
-        .description("Bullnym admission test".into())
+        .description(CURRENT_BULLNYM_INVOICE_DESCRIPTION.into())
         .payment_hash(payment_hash)
         .payment_secret(PaymentSecret([24; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp()))
@@ -502,11 +504,12 @@ fn fresh_bolt11(amount_sat: u64) -> String {
 fn fresh_bolt11_for_payment_hash(
     amount_sat: u64,
     payment_hash: bitcoin::hashes::sha256::Hash,
+    description: &str,
 ) -> String {
     let private_key = SecretKey::from_slice(&[45; 32]).unwrap();
     InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
-        .description("Bullnym protocol-valid reverse fixture".into())
+        .description(description.to_owned())
         .payment_hash(payment_hash)
         .payment_secret(PaymentSecret([27; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp()))
@@ -522,7 +525,7 @@ fn expired_bolt11(amount_sat: u64) -> String {
     let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-expired-admission-test");
     InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
-        .description("Bullnym expired admission test".into())
+        .description(CURRENT_BULLNYM_INVOICE_DESCRIPTION.into())
         .payment_hash(payment_hash)
         .payment_secret(PaymentSecret([25; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp().saturating_sub(3_600)))
@@ -1214,7 +1217,11 @@ fn valid_reverse_response_for_index(
 
     CreateReverseResponse {
         id: swap_id.to_owned(),
-        invoice: Some(fresh_bolt11_for_payment_hash(amount_sat, preimage.sha256)),
+        invoice: Some(fresh_bolt11_for_payment_hash(
+            amount_sat,
+            preimage.sha256,
+            "Bullnym protocol-valid reverse fixture",
+        )),
         swap_tree: SwapTree {
             claim_leaf: Leaf {
                 output: hex::encode(claim_script.as_bytes()),
@@ -1508,7 +1515,16 @@ async fn successful_reverse_barrier_handler(
                 "fixture preimage did not match the production request"
             );
 
-            let invoice = fresh_bolt11_for_payment_hash(*invoice_amount_sat, preimage.sha256);
+            let description = request["description"]
+                .as_str()
+                .expect("fixed checkout request description");
+            assert_eq!(description, CURRENT_BULLNYM_INVOICE_DESCRIPTION);
+            assert!(
+                request.get("descriptionHash").is_none(),
+                "current fixed checkout request unexpectedly used a description hash"
+            );
+            let invoice =
+                fresh_bolt11_for_payment_hash(*invoice_amount_sat, preimage.sha256, description);
             let response = protocol_valid_reverse_response(
                 swap_id,
                 invoice.clone(),

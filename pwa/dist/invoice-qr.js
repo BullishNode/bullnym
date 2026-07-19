@@ -1,0 +1,1 @@
+import{b as e}from"./assets/browser-CjSdxGTc.js";function o(r){return r?e.toDataURL(r,{width:256,margin:4,errorCorrectionLevel:"M",color:{dark:"#0E0E0EFF",light:"#F5F5F5FF"}}):Promise.reject(new Error("payment QR payload is empty"))}export{o as paymentQrDataUrl};

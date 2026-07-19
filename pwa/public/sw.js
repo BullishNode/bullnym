@@ -122,6 +122,7 @@ self.addEventListener('fetch', (event) => {
   // Never cache: this file, the API, invoice creation, or the manifest.
   if (
     url.pathname === '/sw.js' ||
+    url.pathname === '/pwa-assets/invoice-qr.js' ||
     url.pathname.startsWith('/api/') ||
     url.pathname.endsWith('/invoice') ||
     url.pathname.endsWith('/manifest.webmanifest')

@@ -2,7 +2,6 @@
 
 | Method and path | Response/use | Implication |
 |---|---|---|
-| `GET /qr.svg?data=...` | Deterministic 256px-minimum SVG, input 1-4096 UTF-8 bytes | Public/rate-limited. Encode only payment payloads; arbitrary untrusted data may produce unusable dense QRs. |
 | `GET /health` | Liveness response | Proves the process serves HTTP, not that DB/schema/dependencies work. |
 | `GET /ready` | Component JSON and HTTP 200/503 | Checks DB, the complete expected schema marker, and required access to the chain-swap recovery journal plus the live direct-payment reducer's scan/transition journals. Compatibility writers share its projection and Boltz-supersession boundaries. Use for load-balancer readiness. |
 | `GET /version` | Public compatibility fields: service/crate/Bullnym revision, dirty state, runtime mode, expected schema marker, and `public_name_policy: permanent_names_v1` | Use for rollout preflight and support reports. Full verified Boltz, toolchain, target, profile, and PWA provenance remains operator-only through `pay-service --build-info` and startup logs. |

@@ -2827,7 +2827,6 @@ dependencies = [
  "lwk_common",
  "lwk_wollet",
  "object_store",
- "qrcode",
  "regex",
  "reqwest",
  "rustls",
@@ -3072,12 +3071,6 @@ checksum = "43d2564aae5faaf3acb512b35b8bcb9a298d9d8c72d181c598691d800ee78a00"
 dependencies = [
  "bmp-monochrome",
 ]
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

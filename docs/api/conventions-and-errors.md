@@ -2,7 +2,9 @@
 
 All JSON requests use `Content-Type: application/json`. Timestamps are Unix
 seconds. UUIDs are canonical UUID strings. Public page routes return HTML and
-`/qr.svg` returns SVG.
+JSON routes use the response shapes documented below. Private payment pages
+render their QR codes locally in the browser; payment payloads are not sent to
+a server-side QR endpoint.
 
 The server permits cross-origin origins and methods but allows only the
 `Content-Type` request header in browser preflights. Authentication does not

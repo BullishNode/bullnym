@@ -368,6 +368,30 @@ fn exact_bolt11_amount_sat(invoice: &str) -> Result<u64, AppError> {
     Ok(amount_msat / 1_000)
 }
 
+fn validate_bolt11_description_authority(
+    invoice: &str,
+    expected_description: Option<&str>,
+    expected_description_hash: Option<&str>,
+) -> Result<(), AppError> {
+    if expected_description.is_none() && expected_description_hash.is_none() {
+        return Ok(());
+    }
+    let parsed = Bolt11Invoice::from_str(invoice)
+        .map_err(|_| AppError::BoltzError("invalid BOLT11 invoice".into()))?;
+    let actual = parsed.description().to_string();
+    let matches = match (expected_description, expected_description_hash) {
+        (Some(expected), None) => actual == expected,
+        (None, Some(expected)) => actual == expected,
+        _ => false,
+    };
+    if !matches {
+        return Err(AppError::BoltzError(
+            "fixed checkout invoice description did not match immutable request authority".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn is_lower_hex_32(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1221,6 +1245,11 @@ impl BoltzService {
             .invoice
             .clone()
             .ok_or_else(|| AppError::BoltzError("no invoice returned".to_string()))?;
+        validate_bolt11_description_authority(
+            &invoice,
+            authority.request.description.as_deref(),
+            authority.request.description_hash.as_deref(),
+        )?;
         let payer_amount_sat = exact_bolt11_amount_sat(&invoice)?;
         if payer_amount_sat != authority.payer_amount_sat {
             return Err(AppError::BoltzError(format!(
@@ -2177,6 +2206,29 @@ mod tests {
             onchain_amount: 1_020,
             blinding_key: Some(BLINDING_KEY.into()),
         }
+    }
+
+    #[test]
+    fn fixed_checkout_description_must_match_the_immutable_request() {
+        let invoice = reverse_creation_response(ReverseCreationMutation::Valid)
+            .invoice
+            .unwrap();
+
+        assert!(validate_bolt11_description_authority(
+            &invoice,
+            Some("Bullnym reverse validation test"),
+            None,
+        )
+        .is_ok());
+        let error = validate_bolt11_description_authority(
+            &invoice,
+            Some("https://bullpay.ca/private/invoice"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not match immutable request authority"));
     }
 
     #[derive(Debug, Clone, Copy)]
