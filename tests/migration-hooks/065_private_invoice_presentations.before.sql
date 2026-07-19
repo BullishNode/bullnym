@@ -1,7 +1,16 @@
+-- Migration 062's post-hook deliberately leaves a representative wallet row
+-- and quote ledger behind after checking that cutover. Migration 065 is an
+-- authorized empty-database reset, not a legacy-data conversion. Discard the
+-- synthetic upgrade ledger here; test-db separately proves that migration 065
+-- refuses a real nonempty wallet state transactionally.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM invoices WHERE origin = 'wallet') THEN
-        RAISE EXCEPTION 'migration 065 fixture requires no wallet-origin rows';
+    IF NOT EXISTS (
+        SELECT 1 FROM invoices
+         WHERE id = '62000000-0000-0000-0000-000000000001'
+           AND origin = 'wallet'
+    ) THEN
+        RAISE EXCEPTION 'migration 065 fixture lost the migration 062 wallet row';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -25,3 +34,5 @@ BEGIN
     END IF;
 END
 $$;
+
+TRUNCATE TABLE invoices CASCADE;
