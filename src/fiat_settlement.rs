@@ -265,7 +265,7 @@ pub async fn set(
         .ok_or_else(|| map_store_error(FiatSettlementStoreError::CredentialRequired))?;
     state
         .bull_bitcoin
-        .validate_sell_to_balance(validation_key, currency)
+        .validate_sell_to_balance(validation_key)
         .await
         .map_err(map_preflight_error)?;
 

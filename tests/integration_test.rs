@@ -403,7 +403,7 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 #[derive(Clone, Default)]
 struct ScriptedBullBitcoinApi {
-    validation_calls: Arc<Mutex<Vec<FiatCurrency>>>,
+    validation_calls: Arc<AtomicUsize>,
     create_calls: Arc<AtomicUsize>,
     read_calls: Arc<AtomicUsize>,
     validation_results: Arc<Mutex<VecDeque<Result<(), BullBitcoinError>>>>,
@@ -416,8 +416,8 @@ impl ScriptedBullBitcoinApi {
         self.validation_results.lock().await.push_back(result);
     }
 
-    async fn validation_currencies(&self) -> Vec<FiatCurrency> {
-        self.validation_calls.lock().await.clone()
+    fn validation_call_count(&self) -> usize {
+        self.validation_calls.load(Ordering::SeqCst)
     }
 
     async fn push_create(&self, result: Result<CreatedSellOrder, BullBitcoinError>) {
@@ -439,12 +439,8 @@ impl ScriptedBullBitcoinApi {
 
 #[async_trait]
 impl BullBitcoinApi for ScriptedBullBitcoinApi {
-    async fn validate_sell_to_balance(
-        &self,
-        _key: &ScopedApiKey,
-        currency: FiatCurrency,
-    ) -> Result<(), BullBitcoinError> {
-        self.validation_calls.lock().await.push(currency);
+    async fn validate_sell_to_balance(&self, _key: &ScopedApiKey) -> Result<(), BullBitcoinError> {
+        self.validation_calls.fetch_add(1, Ordering::SeqCst);
         self.validation_results
             .lock()
             .await
@@ -2261,10 +2257,7 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
     .await;
     assert_eq!(pos_status, StatusCode::OK, "{pos_response:?}");
     assert_eq!(pos_response["settings"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        fake.validation_currencies().await,
-        vec![FiatCurrency::CAD, FiatCurrency::CAD, FiatCurrency::EUR]
-    );
+    assert_eq!(fake.validation_call_count(), 3);
 
     let get_timestamp = auth_timestamp();
     let get_signature = sign_la_action_with_timestamp(
@@ -2357,7 +2350,7 @@ async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
         "To activate fiat conversion, your account needs to have the right KYC permissions. Please update your KYC to have unlimited trading."
     );
     assert!(!response.to_string().contains(&api_key));
-    assert_eq!(fake.validation_currencies().await, vec![FiatCurrency::CAD]);
+    assert_eq!(fake.validation_call_count(), 1);
     let persisted = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
              (SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1), \
@@ -2436,10 +2429,7 @@ async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
     .await
     .unwrap();
     assert_eq!(after, before);
-    assert_eq!(
-        fake.validation_currencies().await,
-        vec![FiatCurrency::CAD, FiatCurrency::EUR]
-    );
+    assert_eq!(fake.validation_call_count(), 2);
 
     let disable = signed_fiat_set_body(
         &keypair,
@@ -2453,10 +2443,7 @@ async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", disable).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
     assert!(response["settings"].as_array().unwrap().is_empty());
-    assert_eq!(
-        fake.validation_currencies().await,
-        vec![FiatCurrency::CAD, FiatCurrency::EUR]
-    );
+    assert_eq!(fake.validation_call_count(), 2);
     let remaining = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
              (SELECT COUNT(*) FROM bull_bitcoin_credentials \
@@ -2528,10 +2515,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     .await
     .unwrap();
     assert_eq!(persisted, (0, 0));
-    assert_eq!(
-        fake.validation_currencies().await,
-        vec![FiatCurrency::USD, FiatCurrency::USD]
-    );
+    assert_eq!(fake.validation_call_count(), 2);
 
     cleanup_db(&pool).await;
 }

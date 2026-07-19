@@ -99,15 +99,8 @@ impl HttpBullBitcoinApi {
 
 #[async_trait]
 impl BullBitcoinApi for HttpBullBitcoinApi {
-    async fn validate_sell_to_balance(
-        &self,
-        key: &ScopedApiKey,
-        currency: FiatCurrency,
-    ) -> Result<(), BullBitcoinError> {
-        let body = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{{\"fiatCurrency\":\"{}\"}}}}",
-            currency.as_str(),
-        );
+    async fn validate_sell_to_balance(&self, key: &ScopedApiKey) -> Result<(), BullBitcoinError> {
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{\"version\":1}}".to_owned();
         let result = self
             .post_rpc(key, body, RpcCallKind::EligibilityPreflight)
             .await?;
@@ -580,20 +573,12 @@ mod tests {
     #[tokio::test]
     async fn eligibility_call_is_minimal_and_uses_the_scoped_key() {
         let (client, capture, task) = test_client().await;
-        for currency in FiatCurrency::ALL {
-            client
-                .validate_sell_to_balance(&key(), currency)
-                .await
-                .unwrap();
+        client.validate_sell_to_balance(&key()).await.unwrap();
 
-            let (headers, body) = capture.0.lock().await.take().unwrap();
-            assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
-            assert_eq!(body["method"], "validateSellToBalance");
-            assert_eq!(
-                body["params"],
-                serde_json::json!({"fiatCurrency": currency.as_str()})
-            );
-        }
+        let (headers, body) = capture.0.lock().await.take().unwrap();
+        assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
+        assert_eq!(body["method"], "validateSellToBalance");
+        assert_eq!(body["params"], serde_json::json!({"version": 1}));
         task.abort();
     }
 
@@ -613,9 +598,7 @@ mod tests {
         let (client, task) =
             client_for_app(Router::new().route("/ak/api-orders", post(denied)), 1_000).await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::BenchmarkEligibilityDenied)
         );
         task.abort();
@@ -629,9 +612,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::Authentication)
         );
         task.abort();
@@ -653,9 +634,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::Authentication)
         );
         task.abort();
@@ -669,9 +648,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::Upstream)
         );
         task.abort();
@@ -692,9 +669,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::USD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::MalformedResponse)
         );
         task.abort();
@@ -710,9 +685,7 @@ mod tests {
         let (client, task) =
             client_for_app(Router::new().route("/ak/api-orders", post(slow)), 5).await;
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::USD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::Timeout)
         );
         task.abort();
@@ -728,9 +701,7 @@ mod tests {
         };
         let client = HttpBullBitcoinApi::new(&config).unwrap();
         assert_eq!(
-            client
-                .validate_sell_to_balance(&key(), FiatCurrency::USD)
-                .await,
+            client.validate_sell_to_balance(&key()).await,
             Err(BullBitcoinError::Transport)
         );
     }

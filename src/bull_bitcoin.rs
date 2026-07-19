@@ -446,11 +446,7 @@ pub struct OrderObservation {
 
 #[async_trait]
 pub trait BullBitcoinApi: Send + Sync {
-    async fn validate_sell_to_balance(
-        &self,
-        key: &ScopedApiKey,
-        currency: FiatCurrency,
-    ) -> Result<(), BullBitcoinError>;
+    async fn validate_sell_to_balance(&self, key: &ScopedApiKey) -> Result<(), BullBitcoinError>;
 
     async fn create_sell_to_balance(
         &self,
