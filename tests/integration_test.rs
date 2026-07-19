@@ -15201,6 +15201,75 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .unwrap();
     assert_eq!(chain_row, (Some(quote.id), Some(chain_offer.id)));
 
+    // Reverse delivery dedup commits before the status handler. If that
+    // handler transaction fails, reconciliation must reuse the original
+    // accepted-delivery time instead of turning an on-time fiat payment into
+    // a late payment at the retry time.
+    sqlx::query(
+        "ALTER TABLE swap_records DISABLE TRIGGER \
+         swap_records_stamp_quote_payment_first_observed",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE swap_records \
+            SET status = 'pending', quote_payment_first_observed_at = NULL, \
+                created_at = ( \
+                    SELECT created_at FROM invoice_quote_versions WHERE id = $2 \
+                ) \
+          WHERE boltz_swap_id = $1",
+    )
+    .bind(reverse_provider_id)
+    .bind(quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE swap_records ENABLE TRIGGER \
+         swap_records_stamp_quote_payment_first_observed",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let webhook_event_id = format!("{reverse_provider_id}:transaction.confirmed");
+    sqlx::query(
+        "INSERT INTO processed_webhook_events (event_id, processed_at) \
+         SELECT $1, expires_at - INTERVAL '500 milliseconds' \
+           FROM invoice_quote_versions WHERE id = $2",
+    )
+    .bind(&webhook_event_id)
+    .bind(quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::update_swap_status(
+            &pool,
+            stored_reverse.id,
+            pay_service::db::SwapStatus::LockupConfirmed,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let recovered_receipt: (bool, bool) = sqlx::query_as(
+        "SELECT swap.quote_payment_first_observed_at = event.processed_at, \
+                swap.quote_payment_first_observed_at < quote.expires_at \
+           FROM swap_records AS swap \
+           JOIN processed_webhook_events AS event ON event.event_id = $1 \
+           JOIN invoice_quote_versions AS quote \
+             ON quote.id = swap.invoice_quote_version_id \
+          WHERE swap.id = $2",
+    )
+    .bind(&webhook_event_id)
+    .bind(stored_reverse.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recovered_receipt, (true, true));
+
     cleanup_db(&pool).await;
 }
 
