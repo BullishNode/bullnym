@@ -22,9 +22,10 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, fee_runtime, gc, get_paid_transaction_history, invoice,
-    ip_whitelist, lnurl, lnurl_comment_history, nostr, og_image, pricer, rate_limit, readiness,
-    reconciler, recovery_address_registration, registration, startup_provider_reconciliation,
+    donation_page, donation_render, fee_runtime, fiat_settlement, gc,
+    get_paid_transaction_history, invoice, ip_whitelist, lnurl, lnurl_comment_history, nostr,
+    og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
+    registration, startup_provider_reconciliation,
     swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, wallet_backup, AppState,
@@ -87,11 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     tracing::info!(
-        "features: lightning_address={} invoices={} payment_pages={} nip05={} workers={}",
+        "features: lightning_address={} invoices={} payment_pages={} nip05={} bull_bitcoin_fiat_settlement={} workers={}",
         config.features.lightning_address,
         config.features.invoices,
         config.features.payment_pages,
         config.features.nip05,
+        config.features.bull_bitcoin_fiat_settlement,
         config.workers.enabled,
     );
     if config.features.payment_pages && !config.workers.enabled {
@@ -985,6 +987,25 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/supported-currencies",
             get(pricer::supported_currencies),
+        )
+        .route(
+            "/api/v1/fiat-settlement/options",
+            get(fiat_settlement::options),
+        )
+        .route(
+            "/api/v1/fiat-settlement",
+            get(fiat_settlement::configuration),
+        )
+        .route(
+            "/api/v1/fiat-settlement/:product",
+            put(fiat_settlement::set)
+                .delete(fiat_settlement::delete_product)
+                .layer(DefaultBodyLimit::max(fiat_settlement::BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/v1/bull-bitcoin-credential",
+            axum::routing::delete(fiat_settlement::delete_credential)
+                .layer(DefaultBodyLimit::max(fiat_settlement::BODY_LIMIT_BYTES)),
         )
         .route("/api/v1/rate", get(pricer::rate))
         .route(og_image::FALLBACK_LIVE_PATH, get(og_image::fallback_live))

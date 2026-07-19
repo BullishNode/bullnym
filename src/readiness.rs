@@ -1189,6 +1189,8 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !wallet_backup_storage_invariants_present(pool).await?
         || !private_invoice_storage_contract_present(pool).await?
         || !get_paid_history_contract_present(pool).await?
+        || !bull_bitcoin_fiat_foundation_invariants_present(pool).await?
+        || !checkout_private_memo_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
@@ -1365,6 +1367,115 @@ async fn get_paid_history_contract_present(pool: &sqlx::PgPool) -> Result<bool, 
              current_user, 'public.swap_records', \
              'payment_first_observed_at', 'SELECT' \
          )",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+async fn bull_bitcoin_fiat_foundation_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT \
+            NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('bull_bitcoin_credentials'), \
+                    ('fiat_settlement_settings'), \
+                    ('invoice_fiat_settlement_policies'), \
+                    ('bull_bitcoin_settlements') \
+                ) required(table_name) \
+                 WHERE to_regclass('public.' || required.table_name) IS NULL \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'invoices' \
+                   AND column_name = 'fiat_settlement_status' \
+                   AND is_nullable = 'NO' \
+                   AND column_default = '''none''::text' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('bull_bitcoin_credentials', 'bull_bitcoin_credentials_material_shape_chk'), \
+                    ('bull_bitcoin_credentials', 'bull_bitcoin_credentials_lifecycle_chk'), \
+                    ('fiat_settlement_settings', 'fiat_settlement_settings_credential_owner_fkey'), \
+                    ('invoice_fiat_settlement_policies', 'invoice_fiat_settlement_policies_credential_owner_fkey'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk') \
+                ) required(table_name, constraint_name) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_constraint constraint_info \
+                     WHERE constraint_info.conrelid = \
+                               to_regclass('public.' || required.table_name) \
+                       AND constraint_info.conname = required.constraint_name \
+                       AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_trigger trigger_info \
+                 WHERE trigger_info.tgrelid = \
+                           to_regclass('public.invoice_fiat_settlement_policies') \
+                   AND trigger_info.tgname = \
+                           'invoice_fiat_settlement_policies_reject_update' \
+                   AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled = 'O' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_trigger trigger_info \
+                 WHERE trigger_info.tgrelid = \
+                           to_regclass('public.bull_bitcoin_settlements') \
+                   AND trigger_info.tgname = \
+                           'bull_bitcoin_settlements_validate_update' \
+                   AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled = 'O' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('bull_bitcoin_credentials', TRUE, TRUE, TRUE, FALSE), \
+                    ('fiat_settlement_settings', TRUE, TRUE, TRUE, TRUE), \
+                    ('invoice_fiat_settlement_policies', TRUE, TRUE, FALSE, FALSE), \
+                    ('bull_bitcoin_settlements', TRUE, TRUE, TRUE, FALSE) \
+                ) required(table_name, can_select, can_insert, can_update, can_delete) \
+                 WHERE has_table_privilege( \
+                           current_user, 'public.' || required.table_name, 'SELECT' \
+                       ) IS DISTINCT FROM required.can_select \
+                    OR has_table_privilege( \
+                           current_user, 'public.' || required.table_name, 'INSERT' \
+                       ) IS DISTINCT FROM required.can_insert \
+                    OR has_table_privilege( \
+                           current_user, 'public.' || required.table_name, 'UPDATE' \
+                       ) IS DISTINCT FROM required.can_update \
+                    OR has_table_privilege( \
+                           current_user, 'public.' || required.table_name, 'DELETE' \
+                       ) IS DISTINCT FROM required.can_delete \
+                    OR has_table_privilege( \
+                           current_user, 'public.' || required.table_name, 'TRUNCATE' \
+                       ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('bull_bitcoin_credentials'), \
+                    ('fiat_settlement_settings'), \
+                    ('invoice_fiat_settlement_policies'), \
+                    ('bull_bitcoin_settlements') \
+                ) required(table_name) \
+                 WHERE pg_get_userbyid( \
+                           (SELECT relowner FROM pg_class \
+                             WHERE oid = to_regclass('public.' || required.table_name)) \
+                       ) = current_user \
+                    OR has_table_privilege( \
+                           'public', 'public.' || required.table_name, 'SELECT' \
+                       ) \
+                    OR has_table_privilege( \
+                           'public', 'public.' || required.table_name, 'INSERT' \
+                       ) \
+                    OR has_table_privilege( \
+                           'public', 'public.' || required.table_name, 'UPDATE' \
+                       ) \
+                    OR has_table_privilege( \
+                           'public', 'public.' || required.table_name, 'DELETE' \
+                       ) \
+            )",
     )
     .fetch_one(pool)
     .await

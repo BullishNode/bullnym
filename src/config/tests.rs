@@ -212,10 +212,12 @@ fn production_base_config() -> Config {
         fee_policy: FeePolicyConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
+        bull_bitcoin: BullBitcoinConfig::default(),
         database_url: "postgres://payservice@example/payservice".to_string(),
         swap_mnemonic: "abandon abandon abandon".to_string(),
         boltz_webhook_url_secret: "webhook-secret".to_string(),
         boltz_webhook_url_secret_previous: String::new(),
+        bull_bitcoin_credential_encryption_key: None,
     }
 }
 
@@ -244,6 +246,37 @@ electrum_url = "ssl://liquid-electrum.example.com:50002"
 enable = true
 "#;
     assert!(toml::from_str::<Config>(unknown_nested).is_err());
+}
+
+#[test]
+fn fiat_settlement_is_default_off_and_requires_a_dedicated_key() {
+    let mut config = production_base_config();
+    assert!(!config.features.bull_bitcoin_fiat_settlement);
+    config.features.bull_bitcoin_fiat_settlement = true;
+    let error = config
+        .validate_for_runtime("development", false)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY is required when Bull Bitcoin fiat settlement is enabled"
+    );
+
+    let key = BullBitcoinEncryptionKey::parse_hex(&"01".repeat(32)).unwrap();
+    assert_eq!(format!("{key:?}"), "BullBitcoinEncryptionKey(<redacted>)");
+    config.bull_bitcoin_credential_encryption_key = Some(key);
+    assert!(config.validate_for_runtime("development", false).is_ok());
+}
+
+#[test]
+fn fiat_settlement_encryption_key_rejects_noncanonical_shapes() {
+    for invalid in [
+        "01".repeat(31),
+        "01".repeat(33),
+        "AB".repeat(32),
+        format!("{}g", "01".repeat(31)),
+    ] {
+        assert!(BullBitcoinEncryptionKey::parse_hex(&invalid).is_err());
+    }
 }
 
 #[test]

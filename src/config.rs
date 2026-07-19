@@ -41,6 +41,11 @@ pub struct Config {
     pub workers: WorkersConfig,
     #[serde(default)]
     pub invoice_accounting: InvoiceAccountingConfig,
+    /// Narrow Bull Bitcoin sell-to-fiat-balance integration. The global
+    /// feature flag controls new admission; this section controls transport
+    /// and reconciliation limits.
+    #[serde(default)]
+    pub bull_bitcoin: BullBitcoinConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
@@ -63,6 +68,12 @@ pub struct Config {
     /// swaps register the new URL). Empty = no overlap.
     #[serde(skip)]
     pub boltz_webhook_url_secret_previous: String,
+    /// Dedicated at-rest encryption key for imported scoped Bull Bitcoin API
+    /// keys. This is deliberately separate from the swap seed and database
+    /// credentials and is sourced only from
+    /// `BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY`.
+    #[serde(skip)]
+    pub bull_bitcoin_credential_encryption_key: Option<BullBitcoinEncryptionKey>,
 }
 
 // --- Construction-time fee discovery config ---
@@ -370,6 +381,10 @@ pub struct FeaturesConfig {
     /// the server-auth key from ever doubling as a public NIP-05 identity.
     #[serde(default)]
     pub nip05: bool,
+    /// Admit new fiat-settlement settings and Bull Bitcoin orders. Existing
+    /// obligations continue to reconcile when this is false.
+    #[serde(default)]
+    pub bull_bitcoin_fiat_settlement: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -379,7 +394,115 @@ impl Default for FeaturesConfig {
             invoices: default_feature_enabled(),
             payment_pages: default_feature_enabled(),
             nip05: false,
+            bull_bitcoin_fiat_settlement: false,
         }
+    }
+}
+
+const DEFAULT_BULL_BITCOIN_API_URL: &str = "https://api.bullbitcoin.com/ak/api-orders";
+const DEFAULT_BULL_BITCOIN_CONNECT_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_BULL_BITCOIN_REQUEST_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_BULL_BITCOIN_RECONCILE_INTERVAL_SECS: u64 = 30;
+const DEFAULT_BULL_BITCOIN_RECONCILE_BATCH_SIZE: u32 = 50;
+const DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS: u64 = 900;
+const DEFAULT_BULL_BITCOIN_LATE_PAYMENT_RETENTION_SECS: u64 = 2_592_000;
+
+fn default_bull_bitcoin_api_url() -> String {
+    DEFAULT_BULL_BITCOIN_API_URL.to_owned()
+}
+
+fn default_bull_bitcoin_connect_timeout_ms() -> u64 {
+    DEFAULT_BULL_BITCOIN_CONNECT_TIMEOUT_MS
+}
+
+fn default_bull_bitcoin_request_timeout_ms() -> u64 {
+    DEFAULT_BULL_BITCOIN_REQUEST_TIMEOUT_MS
+}
+
+fn default_bull_bitcoin_reconcile_interval_secs() -> u64 {
+    DEFAULT_BULL_BITCOIN_RECONCILE_INTERVAL_SECS
+}
+
+fn default_bull_bitcoin_reconcile_batch_size() -> u32 {
+    DEFAULT_BULL_BITCOIN_RECONCILE_BATCH_SIZE
+}
+
+fn default_bull_bitcoin_retry_backoff_cap_secs() -> u64 {
+    DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS
+}
+
+fn default_bull_bitcoin_late_payment_retention_secs() -> u64 {
+    DEFAULT_BULL_BITCOIN_LATE_PAYMENT_RETENTION_SECS
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BullBitcoinConfig {
+    #[serde(default = "default_bull_bitcoin_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_bull_bitcoin_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_bull_bitcoin_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_bull_bitcoin_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+    #[serde(default = "default_bull_bitcoin_reconcile_batch_size")]
+    pub reconcile_batch_size: u32,
+    #[serde(default = "default_bull_bitcoin_retry_backoff_cap_secs")]
+    pub retry_backoff_cap_secs: u64,
+    /// Operator-validated window during which a previously exposed order may
+    /// still receive a late payment. This is a retention bound, not a claim
+    /// that an upstream display status is financially final.
+    #[serde(default = "default_bull_bitcoin_late_payment_retention_secs")]
+    pub late_payment_retention_secs: u64,
+}
+
+impl Default for BullBitcoinConfig {
+    fn default() -> Self {
+        Self {
+            api_url: default_bull_bitcoin_api_url(),
+            connect_timeout_ms: default_bull_bitcoin_connect_timeout_ms(),
+            request_timeout_ms: default_bull_bitcoin_request_timeout_ms(),
+            reconcile_interval_secs: default_bull_bitcoin_reconcile_interval_secs(),
+            reconcile_batch_size: default_bull_bitcoin_reconcile_batch_size(),
+            retry_backoff_cap_secs: default_bull_bitcoin_retry_backoff_cap_secs(),
+            late_payment_retention_secs: default_bull_bitcoin_late_payment_retention_secs(),
+        }
+    }
+}
+
+/// Cloneable process capability whose bytes never appear in `Debug` output.
+#[derive(Clone)]
+pub struct BullBitcoinEncryptionKey(std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>);
+
+impl BullBitcoinEncryptionKey {
+    pub fn parse_hex(value: &str) -> Result<Self, &'static str> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY must be exactly 64 lowercase hexadecimal characters",
+            );
+        }
+        let decoded = hex::decode(value).map_err(|_| {
+            "BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY must be valid lowercase hexadecimal"
+        })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+            "BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY must decode to exactly 32 bytes"
+        })?;
+        Ok(Self(std::sync::Arc::new(zeroize::Zeroizing::new(bytes))))
+    }
+
+    pub(crate) fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BullBitcoinEncryptionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BullBitcoinEncryptionKey(<redacted>)")
     }
 }
 
@@ -1598,6 +1721,14 @@ impl Config {
             .map_err(|_| "BOLTZ_WEBHOOK_URL_SECRET environment variable is required")?;
         config.boltz_webhook_url_secret_previous =
             std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
+        config.bull_bitcoin_credential_encryption_key =
+            match std::env::var("BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY") {
+                Ok(value) => Some(BullBitcoinEncryptionKey::parse_hex(&value)?),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err("BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY must be valid UTF-8".into())
+                }
+            };
 
         let runtime_mode =
             std::env::var("BULLNYM_RUNTIME_MODE").unwrap_or_else(|_| "unknown".into());
@@ -1686,6 +1817,39 @@ impl Config {
             return Err("reconciler slow-recovery backoff base must be <= cap".into());
         }
         validate_http_endpoint("pricer.url", &self.pricer.url)?;
+        validate_http_endpoint("bull_bitcoin.api_url", &self.bull_bitcoin.api_url)?;
+        require_positive(
+            "bull_bitcoin.connect_timeout_ms",
+            self.bull_bitcoin.connect_timeout_ms,
+        )?;
+        require_positive(
+            "bull_bitcoin.request_timeout_ms",
+            self.bull_bitcoin.request_timeout_ms,
+        )?;
+        require_positive(
+            "bull_bitcoin.reconcile_interval_secs",
+            self.bull_bitcoin.reconcile_interval_secs,
+        )?;
+        require_positive_u32(
+            "bull_bitcoin.reconcile_batch_size",
+            self.bull_bitcoin.reconcile_batch_size,
+        )?;
+        require_positive(
+            "bull_bitcoin.retry_backoff_cap_secs",
+            self.bull_bitcoin.retry_backoff_cap_secs,
+        )?;
+        require_positive(
+            "bull_bitcoin.late_payment_retention_secs",
+            self.bull_bitcoin.late_payment_retention_secs,
+        )?;
+        if self.features.bull_bitcoin_fiat_settlement
+            && self.bull_bitcoin_credential_encryption_key.is_none()
+        {
+            return Err(
+                "BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY is required when Bull Bitcoin fiat settlement is enabled"
+                    .into(),
+            );
+        }
         require_positive("pricer.cache_ttl_secs", self.pricer.cache_ttl_secs)?;
         require_positive("pricer.max_freshness_secs", self.pricer.max_freshness_secs)?;
         if self.pricer.max_freshness_secs > DEFAULT_PRICER_MAX_FRESHNESS_SECS {

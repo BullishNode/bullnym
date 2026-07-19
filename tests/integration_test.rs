@@ -46,10 +46,10 @@ use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
 };
 use pay_service::config::{
-    BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
-    ElectrumConfig, FeaturesConfig, FeePolicyConfig, InvoiceAccountingConfig, LimitsConfig,
-    LiquidWatcherConfig, PricerConfig, ProofConfig, PwaConfig, RateLimitConfig, ReconcilerConfig,
-    WorkersConfig,
+    BitcoinWatcherConfig, BoltzConfig, BullBitcoinConfig, CertificationConfig, ClaimConfig, Config,
+    DonationConfig, ElectrumConfig, FeaturesConfig, FeePolicyConfig, InvoiceAccountingConfig,
+    LimitsConfig, LiquidWatcherConfig, PricerConfig, ProofConfig, PwaConfig, RateLimitConfig,
+    ReconcilerConfig, WorkersConfig,
 };
 use pay_service::donation_render::PwaShells;
 use pay_service::error::AppError;
@@ -68,8 +68,8 @@ use pay_service::swap_manifest_store::{
 };
 use pay_service::{
     certification, claimer, donation_page, donation_render, get_paid_transaction_history, invoice,
-    lnurl, lnurl_comment_history, nostr, readiness, recovery_address_registration, registration,
-    AppState,
+    fiat_settlement, lnurl, lnurl_comment_history, nostr, readiness,
+    recovery_address_registration, registration, AppState,
 };
 
 use bitcoin::absolute::LockTime;
@@ -296,10 +296,12 @@ fn test_config() -> Config {
         fee_policy: FeePolicyConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
+        bull_bitcoin: BullBitcoinConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
         boltz_webhook_url_secret: TEST_BOLTZ_WEBHOOK_CURRENT_SECRET.to_string(),
         boltz_webhook_url_secret_previous: TEST_BOLTZ_WEBHOOK_PREVIOUS_SECRET.to_string(),
+        bull_bitcoin_credential_encryption_key: None,
     }
 }
 
@@ -402,6 +404,22 @@ fn test_app(state: AppState) -> Router {
             put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
                 recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
             )),
+        )
+        .route(
+            "/api/v1/fiat-settlement/options",
+            get(fiat_settlement::options),
+        )
+        .route(
+            "/api/v1/fiat-settlement",
+            get(fiat_settlement::configuration),
+        )
+        .route(
+            "/api/v1/fiat-settlement/:product",
+            put(fiat_settlement::set).delete(fiat_settlement::delete_product),
+        )
+        .route(
+            "/api/v1/bull-bitcoin-credential",
+            axum::routing::delete(fiat_settlement::delete_credential),
         )
         .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
@@ -861,6 +879,18 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Fiat policies and settlement evidence intentionally use RESTRICT links
+    // and omit runtime DELETE. The disposable schema owner truncates this
+    // feature family solely for per-test isolation.
+    sqlx::query(
+        "TRUNCATE bull_bitcoin_settlements, \
+                  invoice_fiat_settlement_policies, \
+                  fiat_settlement_settings, \
+                  bull_bitcoin_credentials CASCADE",
+    )
+    .execute(pool)
+    .await
+    .ok();
     // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
     // events. The disposable database owner truncates the entire attribution
     // family solely for per-test isolation.
@@ -1724,6 +1754,180 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 }
 
 #[tokio::test]
+async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_key() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-config-merchant", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-config-merchant", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let mut config = test_config();
+    config.features.bull_bitcoin_fiat_settlement = true;
+    config.bull_bitcoin_credential_encryption_key =
+        Some(pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap());
+    let app = test_app(test_state_with_config(pool.clone(), config));
+
+    let timestamp = auth_timestamp();
+    let api_key = format!("bbak-{}", "ab".repeat(32));
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_SET,
+        &npub,
+        "",
+        &[
+            "1",
+            "invoice",
+            "50",
+            "CAD",
+            pay_service::bull_bitcoin::TERMS_VERSION,
+            &api_key,
+        ],
+        timestamp,
+    );
+    let set_body = json!({
+        "version": 1,
+        "npub": npub,
+        "fiat_percentage": 50,
+        "fiat_currency": "CAD",
+        "terms_version": pay_service::bull_bitcoin::TERMS_VERSION,
+        "api_key": api_key,
+        "timestamp": timestamp,
+        "signature": signature,
+    });
+
+    let (set_status, set_response) =
+        put_json(&app, "/api/v1/fiat-settlement/invoice", set_body.clone()).await;
+    assert_eq!(set_status, StatusCode::OK, "{set_response:?}");
+    let serialized = set_response.to_string();
+    assert!(!serialized.contains("bbak-"));
+    assert_eq!(set_response["credential_status"], "active");
+    assert_eq!(set_response["settings"][0]["fiat_percentage"], 50);
+
+    // Exact signed retry is idempotent and must not create another key
+    // generation after a lost response.
+    let (retry_status, retry_response) =
+        put_json(&app, "/api/v1/fiat-settlement/invoice", set_body).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_response:?}");
+    let credential_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(credential_count, 1);
+    let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+        "SELECT ciphertext, nonce FROM bull_bitcoin_credentials \
+          WHERE owner_npub = $1 AND admitted_for_new_orders",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ciphertext.len(), 85);
+    assert_eq!(nonce.len(), 24);
+    assert!(!ciphertext
+        .windows(api_key.len())
+        .any(|window| window == api_key.as_bytes()));
+
+    // A second product reuses the admitted credential without accepting or
+    // returning another plaintext key.
+    let pos_timestamp = auth_timestamp();
+    let pos_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_SET,
+        &npub,
+        "",
+        &[
+            "1",
+            "pos",
+            "100",
+            "EUR",
+            pay_service::bull_bitcoin::TERMS_VERSION,
+            "",
+        ],
+        pos_timestamp,
+    );
+    let (pos_status, pos_response) = put_json(
+        &app,
+        "/api/v1/fiat-settlement/pos",
+        json!({
+            "version": 1,
+            "npub": npub,
+            "fiat_percentage": 100,
+            "fiat_currency": "EUR",
+            "terms_version": pay_service::bull_bitcoin::TERMS_VERSION,
+            "timestamp": pos_timestamp,
+            "signature": pos_signature,
+        }),
+    )
+    .await;
+    assert_eq!(pos_status, StatusCode::OK, "{pos_response:?}");
+    assert_eq!(pos_response["settings"].as_array().unwrap().len(), 2);
+
+    let get_timestamp = auth_timestamp();
+    let get_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_GET,
+        &npub,
+        "",
+        &["1"],
+        get_timestamp,
+    );
+    let (get_status, get_headers, get_response) = get_json_with_headers(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlement?version=1&npub={npub}&timestamp={get_timestamp}&signature={get_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK, "{get_response:?}");
+    assert_eq!(
+        get_headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert!(!get_response.to_string().contains("bbak-"));
+    assert!(!get_response.to_string().contains("instruction"));
+
+    let delete_timestamp = auth_timestamp();
+    let delete_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_DELETE_CREDENTIAL,
+        &npub,
+        "",
+        &["1"],
+        delete_timestamp,
+    );
+    let (delete_status, delete_response) = delete_json_path(
+        &app,
+        "/api/v1/bull-bitcoin-credential",
+        json!({
+            "version": 1,
+            "npub": npub,
+            "timestamp": delete_timestamp,
+            "signature": delete_signature,
+        }),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK, "{delete_response:?}");
+    assert_eq!(delete_response["credential_status"], "absent");
+    assert!(delete_response["settings"].as_array().unwrap().is_empty());
+    let erased = sqlx::query_as::<_, (Option<Vec<u8>>, Option<Vec<u8>>, bool)>(
+        "SELECT ciphertext, nonce, erased_at IS NOT NULL \
+           FROM bull_bitcoin_credentials WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(erased, (None, None, true));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn retired_liquid_offer_route_is_absent_while_status_remains_current() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -1779,7 +1983,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "066_get_paid_transaction_history"
+        "067_bull_bitcoin_fiat_settlement"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -2020,7 +2224,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "066_get_paid_transaction_history"
+        "067_bull_bitcoin_fiat_settlement"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
