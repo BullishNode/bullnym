@@ -217,6 +217,26 @@ pub async fn request_bull_bitcoin_credential_deletion(
         .execute(&mut *transaction)
         .await?;
 
+        // A bound mixed order is not a funding obligation until its exact
+        // Liquid output is journaled. Credential deletion therefore routes
+        // only that still-unfunded state to the user's Bitcoin wallet. Orders
+        // already committed into claim bytes retain the encrypted key until
+        // reconciliation drains, exactly like fiat-only orders.
+        sqlx::query(
+            "UPDATE bull_bitcoin_settlements \
+                SET funding_route = 'bitcoin_fallback', \
+                    fallback_category = 'conversion_unavailable', \
+                    instruction_kind = NULL, payer_instruction = NULL, \
+                    instruction_expires_at = NULL, next_attempt_at = NULL, \
+                    updated_at = now() \
+              WHERE credential_id = $1 AND purpose = 'mixed' \
+                AND provider_state = 'bound' AND funding_route IS NULL \
+                AND funding_committed_at IS NULL AND settlement_status = 'none'",
+        )
+        .bind(credential_id)
+        .execute(&mut *transaction)
+        .await?;
+
         let retain = credential_has_live_dependencies(&mut transaction, credential_id).await?;
         sqlx::query(
             "UPDATE bull_bitcoin_credentials \
@@ -306,7 +326,10 @@ async fn credential_has_live_dependencies(
              SELECT 1 FROM bull_bitcoin_settlements \
               WHERE credential_id = $1 \
                 AND NOT provider_final \
-                AND provider_state IN ('dispatch_started', 'bound') \
+                AND (provider_state = 'dispatch_started' \
+                     OR (provider_state = 'bound' \
+                         AND funding_route = 'bull_bitcoin' \
+                         AND funding_committed_at IS NOT NULL)) \
          )",
     )
     .bind(credential_id)

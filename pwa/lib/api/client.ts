@@ -33,16 +33,20 @@ export interface FiatFixedCreateInvoiceResponse {
 export interface SatFixedCreateInvoiceResponse {
   pricing_mode: 'sat_fixed'
   invoice_id: string
-  lightning_pr: string
+  /** Policy-bearing sat invoices deliberately return no destination at
+   * creation; the payer must explicitly select a rail. */
+  payer_demand_required?: boolean
+  amount_sat?: number
+  lightning_pr?: string
   /** Exact BOLT11 principal paired with lightning_pr. */
-  lightning_amount_sat: number | null
-  liquid_address: string
+  lightning_amount_sat?: number | null
+  liquid_address?: string
   /** Exact direct-Liquid amount paired with liquid_address. */
-  liquid_amount_sat: number | null
-  bitcoin_chain_address: string | null
-  bitcoin_chain_bip21: string | null
+  liquid_amount_sat?: number | null
+  bitcoin_chain_address?: string | null
+  bitcoin_chain_bip21?: string | null
   /** Exact payer-side Bitcoin lock amount for the chain-swap offer. */
-  bitcoin_chain_amount_sat: number | null
+  bitcoin_chain_amount_sat?: number | null
   expires_at_unix: number
 }
 
@@ -102,8 +106,9 @@ export interface InvoiceStatus {
   accept_btc: boolean
   accept_ln: boolean
   accept_liquid: boolean
-  /** Pure GET projection. Required for fiat-fixed invoices and null for
-   * sat-fixed invoices; it never creates a quote or provider obligation. */
+  /** Pure GET projection. Present for every selected-rail payer-demand
+   * invoice (fiat-fixed or policy-bearing sat-fixed) and null for the legacy
+   * sat flow; it never creates a quote or provider obligation. */
   quote_rail_availability: PayerQuoteRailAvailability | null
 }
 
@@ -139,6 +144,16 @@ export type VersionedPayerInstruction =
       payer_amount_sat: number
     }
   | {
+      kind: 'lightning_direct'
+      pr: string
+      payer_amount_sat: number
+    }
+  | {
+      kind: 'lightning_current'
+      pr: string
+      payer_amount_sat: number
+    }
+  | {
       kind: 'liquid_direct'
       address: string
       payer_amount_sat: number
@@ -156,14 +171,35 @@ export type VersionedPayerInstruction =
       bip21: string
       payer_amount_sat: number
     }
+  | {
+      kind: 'bitcoin_boltz_chain_current'
+      address: string
+      bip21: string
+      payer_amount_sat: number
+    }
 
-export interface PayerDemandQuoteResponse {
+export interface FiatFixedPayerDemandQuoteResponse {
   pricing_mode: 'fiat_fixed'
   invoice_id: string
   selected_rail: PayerQuoteRail
   quote: FiatQuoteView
   instruction: VersionedPayerInstruction
+  instruction_expires_at_unix: number | null
 }
+
+export interface SatFixedPayerDemandQuoteResponse {
+  pricing_mode: 'sat_fixed'
+  invoice_id: string
+  selected_rail: PayerQuoteRail
+  amount_sat: number
+  expires_at_unix: number
+  instruction: VersionedPayerInstruction
+  instruction_expires_at_unix: number | null
+}
+
+export type PayerDemandQuoteResponse =
+  | FiatFixedPayerDemandQuoteResponse
+  | SatFixedPayerDemandQuoteResponse
 
 export interface CurrencyView {
   code: string

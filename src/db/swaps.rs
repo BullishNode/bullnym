@@ -227,14 +227,14 @@ pub async fn record_swap_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     swap: &NewSwapRecord<'_>,
 ) -> Result<(), sqlx::Error> {
-    insert_swap_in_tx(tx, swap, None, None).await
+    insert_swap_in_tx(tx, swap, None, None).await.map(|_| ())
 }
 
 pub async fn record_swap_in_tx_with_lineage(
     tx: &mut Transaction<'_, Postgres>,
     swap: &NewSwapRecord<'_>,
     lineage: &ReverseSwapLineage<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
     insert_swap_in_tx(tx, swap, Some(lineage), None).await
 }
 
@@ -245,7 +245,7 @@ pub async fn record_swap_in_tx_with_lineage_and_quote_attribution(
     swap: &NewSwapRecord<'_>,
     lineage: &ReverseSwapLineage<'_>,
     attribution: InvoiceQuoteAttribution,
-) -> Result<(), sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
     insert_swap_in_tx(tx, swap, Some(lineage), Some(attribution)).await
 }
 
@@ -257,7 +257,9 @@ pub async fn record_swap_in_tx_with_quote_attribution(
     swap: &NewSwapRecord<'_>,
     attribution: InvoiceQuoteAttribution,
 ) -> Result<(), sqlx::Error> {
-    insert_swap_in_tx(tx, swap, None, Some(attribution)).await
+    insert_swap_in_tx(tx, swap, None, Some(attribution))
+        .await
+        .map(|_| ())
 }
 
 async fn insert_swap_in_tx(
@@ -265,7 +267,7 @@ async fn insert_swap_in_tx(
     swap: &NewSwapRecord<'_>,
     lineage: Option<&ReverseSwapLineage<'_>>,
     attribution: Option<InvoiceQuoteAttribution>,
-) -> Result<(), sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
     if let Some(attribution) = attribution {
         let invoice_id = swap.invoice_id.ok_or_else(|| {
             sqlx::Error::Protocol(
@@ -283,7 +285,7 @@ async fn insert_swap_in_tx(
         )
         .await?;
     }
-    sqlx::query(
+    let id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
           preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id, \
@@ -291,7 +293,8 @@ async fn insert_swap_in_tx(
           derivation_scheme_version, claim_public_key_hex, preimage_hash_hex, \
           invoice_quote_version_id, invoice_quote_offer_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12, \
-                 $13, $14, $15, $16, $17, $18, $19)",
+                 $13, $14, $15, $16, $17, $18, $19) \
+         RETURNING id",
     )
     .bind(swap.nym)
     .bind(swap.boltz_swap_id)
@@ -312,12 +315,12 @@ async fn insert_swap_in_tx(
     .bind(lineage.map(|lineage| lineage.preimage_hash_hex))
     .bind(attribution.map(|attribution| attribution.quote_version_id))
     .bind(attribution.map(|attribution| attribution.quote_offer_id))
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
     if let Some(nym) = swap.nym {
         mark_user_used(&mut **tx, nym).await?;
     }
-    Ok(())
+    Ok(id)
 }
 
 /// Fill in the claim destination on a swap_records row whose `address` was
@@ -852,18 +855,48 @@ pub(crate) const REVERSE_SETTLEMENT_REPAIR_SCAN_SQL: &str = "WITH scan AS ( \
        AND s.invoice_id IS NOT NULL \
        AND s.claim_txid IS NOT NULL \
        AND s.updated_at <= scan.epoch \
-       AND s.updated_at > scan.epoch - ($1 || ' seconds')::interval \
        AND ($3::uuid IS NULL OR s.id > $3) \
-       AND NOT EXISTS ( \
-             SELECT 1 FROM invoice_payment_events e \
-              WHERE e.invoice_id = s.invoice_id \
-                AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
+       AND ( \
+            ( \
+                s.updated_at > scan.epoch - ($1 || ' seconds')::interval \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events e \
+                     WHERE e.invoice_id = s.invoice_id \
+                       AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
+                ) \
+            ) OR ( \
+                EXISTS ( \
+                    SELECT 1 FROM bull_bitcoin_settlements settlement \
+                     WHERE settlement.reverse_swap_id = s.id \
+                       AND settlement.purpose = 'mixed' \
+                       AND settlement.provider_state = 'bound' \
+                       AND settlement.funding_route = 'bull_bitcoin' \
+                       AND settlement.funding_committed_at IS NOT NULL \
+                ) AND ( \
+                    NOT EXISTS ( \
+                        SELECT 1 FROM invoice_payment_events e \
+                         WHERE e.invoice_id = s.invoice_id \
+                           AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
+                    ) OR NOT EXISTS ( \
+                        SELECT 1 FROM bull_bitcoin_settlements settlement \
+                        JOIN invoice_payment_events e \
+                          ON e.bull_bitcoin_settlement_id = settlement.id \
+                         AND e.event_key = 'bull_bitcoin_mixed_output:' || settlement.id::TEXT \
+                         AND e.accounting_state = 'active' \
+                         WHERE settlement.reverse_swap_id = s.id \
+                           AND settlement.purpose = 'mixed' \
+                           AND settlement.funding_route = 'bull_bitcoin' \
+                           AND settlement.funding_committed_at IS NOT NULL \
+                    ) \
+                ) \
+            ) \
          ) \
      ORDER BY s.id ASC \
      LIMIT $4";
 
-/// Bounded by `max_age_secs` (only recently-claimed rows), the process-local
-/// immutable UUID cursor, and `limit`.
+/// Ordinary rows are bounded by `max_age_secs`; funded mixed rows remain
+/// repairable regardless of age until both exact output events exist. Every
+/// scan is still bounded by the process-local UUID cursor and `limit`.
 pub async fn list_claimed_swaps_missing_lightning_event(
     pool: &PgPool,
     max_age_secs: u64,

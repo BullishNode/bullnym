@@ -8,7 +8,7 @@
 - Prerequisites: the scoped Bull Bitcoin API-key stack and SatoshiPortal `boltz-rust` PR #162
 - Written against: Bullnym `d9f6443`, `boltz-rust` PR #162 head `d3b8520`,
   BullishNode covenant commit `c20511854bbd996a74f914fa0327d4601b5d4f62`,
-  and reviewed 0.3 backport `6b4d4d9bfaf2c18b03cbf406c4d212fa179e3477`
+  and reviewed 0.3 backport `bbf3ee8048b638a80c23e1bcecff77ee3dc89ec3`
 - Last updated: 2026-07-18
 
 ## 1. Objective
@@ -55,9 +55,9 @@ These are implementation requirements, not open questions.
 - The merchant's Bitcoin output is the primary/remainder claim output. The Bull
   Bitcoin L-BTC output is one fixed additional output.
 - Split percentages apply to the net amount available to settle after the
-  claim fee. Mixed payer instructions use the existing Bullnym gross-up
-  authority with the size of exactly two confidential payment outputs; the
-  Bitcoin-only one-output quote path is unchanged.
+  exact current two-confidential-output claim fee. Payer quotes and the
+  Bitcoin-only one-output path remain unchanged: Bullnym does not pre-create a
+  Bull Bitcoin order merely to predict a future claim fee.
 - Integer rounding favors the Bitcoin output:
   `fiat_sat = floor(net_settlement_sat * fiat_percent / 100)` and the primary
   Bitcoin output receives the remainder.
@@ -243,10 +243,11 @@ active credentials is deferred.
 
 ### 5.3 Persistence
 
-Migrations 065 and 066 add the following feature-owned state. Migration 065 is
-the adapter/settings/order foundation; migration 066 is the narrow mixed-output
-evidence extension. Splitting them keeps each reviewable without weakening the
-final constraints.
+Migrations 067 through 069 add the following feature-owned state. Migration 067
+is the adapter/settings/order foundation, migration 068 adds crash-recoverable
+invoice accounting and funding commitment, and migration 069 adds the narrow
+mixed-output evidence extension. Splitting them keeps each reviewable without
+weakening the final constraints.
 
 `bull_bitcoin_credentials`
 
@@ -332,13 +333,12 @@ existing composed `settlement_status` becomes the conservative composition of
 all three components. This prevents a mixed merchant output from marking the
 invoice settled while a funded fiat credit is pending.
 
-`invoice_payment_events` accepts one new source, `bull_bitcoin_fiat`. It records
-the Bitcoin value attributable to the fiat component so received/remaining/
-overpaid accounting continues to sum Bitcoin value, while the Bull Bitcoin
-settlement row owns the separate fiat projection. It does not put fiat values
-into a Bitcoin accounting column. Its evidence can bind either an exact Bull
-Bitcoin order observation (fiat-only) or the verified `bull_bitcoin` claim
-output (mixed).
+`invoice_payment_events` accepts two narrow sources. `bull_bitcoin_fiat` binds
+the provider-final actual Bitcoin received for a fiat-only order;
+`bull_bitcoin_mixed_output` binds the verified vout=1 amount sent to Bull
+Bitcoin by a mixed claim. Together they keep received/remaining/overpaid
+accounting in Bitcoin while the settlement row owns the separate fiat
+projection. Neither source puts fiat value into a Bitcoin accounting column.
 
 The mixed accounting invariant is strict: after the claim is verified there
 are exactly two active Bitcoin-value events, one for the merchant output and one
@@ -727,7 +727,7 @@ change.
    contract with API-Orders tests.
 2. **Dependency compatibility:** produce and pin the immutable `boltz-rust`
    fork commit; no Bullnym behavior change.
-3. **Contract foundation:** add migration 065, exact money types, encrypted
+3. **Contract foundation:** add migration 067, exact money types, encrypted
    credential capability, terms/settings signed API, feature flag, readiness,
    and adapter trait with a fake implementation. No payment route calls Bull
    Bitcoin yet.
@@ -737,7 +737,7 @@ change.
 5. **Fiat-only vertical slice:** route lazy payer instructions through Bull
    Bitcoin for all three source networks while preserving each product's
    existing fallback and abuse gates.
-6. **Mixed vertical slice:** add migration 066, reserve one leg per exposed
+6. **Mixed vertical slice:** add migration 069, reserve one leg per exposed
    swap, prepare the L-BTC order before claim construction, add the one fixed
    output, prove both output roles, replace the legacy full-value accounting on
    this path, and compose Bitcoin plus fiat settlement status.
@@ -776,7 +776,7 @@ without pretending to own Bull Bitcoin's blinding key.
 
 ### 13.2 Bullnym PostgreSQL integration tests
 
-- migrations 065/066 constraints, runtime grants, readiness marker, and
+- migrations 065/066/067 constraints, runtime grants, readiness marker, and
   additive upgrade from schema 064;
 - concurrent create requests commit one usable order;
 - crash-boundary simulations before dispatch, after dispatch, after provider
@@ -802,8 +802,8 @@ without pretending to own Bull Bitcoin's blinding key.
   Bitcoin outputs and assert destination, asset, and exact amount;
 - without that recipient key, prove production replay still rejects a changed
   script, vout, commitment, proof, role, order binding, or authorized amount;
-- prove the mixed gross-up uses a two-payment-output fee budget while the
-  Bitcoin-only quote remains unchanged;
+- prove mixed order sizing uses the exact two-payment-output fee while the
+  existing payer quote and Bitcoin-only claim path remain unchanged;
 - assert primary remainder plus fixed output plus fee equals the verified
   input;
 - replacement preserves both role bindings, destinations, assets, and amounts;
@@ -843,9 +843,9 @@ After local review and all deterministic tests pass:
    `bullnym-tests` VM remains a harness/report host and, per the repository
    runbook, does not run Bullnym or reuse production secrets. If no separate
    staging application host exists, provisioning it is a hard deployment gate;
-2. back up PostgreSQL, install schemas 065 and 066 with a distinct privileged
-   owner, install a fresh staging-only encryption secret, and keep new fiat
-   admission disabled;
+2. back up PostgreSQL, install schemas 066 through 068 with a distinct
+   privileged owner, install a fresh staging-only encryption secret, and keep
+   new fiat admission disabled;
 3. verify `/health`, `/ready`, `/version`, worker startup, binary digest, schema
    marker, and unchanged Bitcoin-only smoke tests;
 4. enable the feature for a test npub and use a real scoped key;
@@ -898,9 +898,9 @@ orders, while the order worker continues for existing rows. Enable only test
 npubs first through their explicit signed settings; there is no global
 automatic backfill of Bullnym settings or credentials.
 
-Migrations 065 and 066 are additive but advance Bullnym's exact schema marker.
-The safe rollback is therefore a feature-off schema-066 binary. Rolling back to
-a schema-064 binary requires stopping writers and restoring the paired
-schema-064 database backup, binary, PWA, and release record. Never drop
+Migrations 067 through 069 are additive but advance Bullnym's exact schema
+marker. The safe rollback is therefore a feature-off schema-069 binary. Rolling
+back to a schema-066 binary requires stopping writers and restoring the paired
+schema-066 database backup, binary, PWA, and release record. Never drop
 settlement rows to force an old readiness marker and never disable
 reconciliation while a known order is nonterminal.

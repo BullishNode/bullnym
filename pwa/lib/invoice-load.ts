@@ -41,7 +41,15 @@ export async function reconstructInvoice(id: string): Promise<ReconstructResult>
           invoice_id: id,
           expires_at_unix: status.expires_at_unix,
         }
-      : {
+      : status.quote_rail_availability !== null
+        ? {
+            pricing_mode: 'sat_fixed',
+            invoice_id: id,
+            amount_sat: status.amount_sat,
+            payer_demand_required: true,
+            expires_at_unix: status.expires_at_unix,
+          }
+        : {
           pricing_mode: 'sat_fixed',
           invoice_id: id,
           lightning_pr: status.lightning_pr ?? '',

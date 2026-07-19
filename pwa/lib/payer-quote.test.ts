@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type {
   PayerDemandQuoteResponse,
+  FiatFixedPayerDemandQuoteResponse,
   PayerQuoteRail,
   VersionedPayerInstruction,
 } from './api/client'
@@ -54,7 +55,7 @@ function responseFor(
   createdAt = CREATED_AT,
   merchantAmountSat = 10_000,
   payerAmountSat = rail === 'liquid' ? merchantAmountSat : merchantAmountSat + 100,
-): PayerDemandQuoteResponse {
+): FiatFixedPayerDemandQuoteResponse {
   return {
     pricing_mode: 'fiat_fixed',
     invoice_id: INVOICE_ID,
@@ -75,6 +76,7 @@ function responseFor(
       expires_at_unix: createdAt + 300,
     },
     instruction: instructionFor(rail, suffix, payerAmountSat),
+    instruction_expires_at_unix: null,
   }
 }
 
@@ -82,7 +84,7 @@ function directBitcoinResponseFor(
   version: number,
   merchantAmountSat: number,
   createdAt = CREATED_AT,
-): PayerDemandQuoteResponse {
+): FiatFixedPayerDemandQuoteResponse {
   const response = responseFor(
     'bitcoin',
     version,

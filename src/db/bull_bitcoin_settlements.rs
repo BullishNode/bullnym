@@ -1,4 +1,4 @@
-use sqlx::{Connection, FromRow, PgConnection, PgPool};
+use sqlx::{Connection, FromRow, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::bull_bitcoin::{EncryptedCredential, OrderObservation};
@@ -24,6 +24,8 @@ impl From<sqlx::Error> for BullBitcoinSettlementStoreError {
 pub struct NewBullBitcoinSettlement<'a> {
     pub owner_npub: &'a str,
     pub invoice_id: Option<Uuid>,
+    pub reverse_swap_id: Option<Uuid>,
+    pub chain_swap_id: Option<Uuid>,
     pub credential_id: Uuid,
     pub product: &'a str,
     pub purpose: &'a str,
@@ -40,6 +42,8 @@ pub struct StoredBullBitcoinSettlement {
     pub id: Uuid,
     pub owner_npub: String,
     pub invoice_id: Option<Uuid>,
+    pub reverse_swap_id: Option<Uuid>,
+    pub chain_swap_id: Option<Uuid>,
     pub credential_id: Uuid,
     pub product: String,
     pub purpose: String,
@@ -57,8 +61,12 @@ pub struct StoredBullBitcoinSettlement {
     pub instruction_kind: Option<String>,
     pub payer_instruction: Option<String>,
     pub instruction_expires_at_unix: Option<i64>,
+    pub funding_committed_at_unix: Option<i64>,
     pub retention_until_unix: Option<i64>,
     pub reconcile_attempts: i32,
+    pub actual_received_sat: Option<i64>,
+    pub credited_fiat_minor: Option<i64>,
+    pub provider_final: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,13 +76,382 @@ pub struct StoredEncryptedCredential {
     pub encrypted: EncryptedCredential,
 }
 
-const SETTLEMENT_PROJECTION: &str =
-    "id, owner_npub, invoice_id, credential_id, product, purpose, payer_rail, \
+#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+pub struct SwapFiatSettlementPolicy {
+    pub reverse_swap_id: Option<Uuid>,
+    pub chain_swap_id: Option<Uuid>,
+    pub invoice_id: Option<Uuid>,
+    pub owner_npub: String,
+    pub credential_id: Uuid,
+    pub product: String,
+    pub fiat_percentage: i16,
+    pub fiat_currency: String,
+    pub terms_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+pub struct ActiveFiatSettlementSetting {
+    pub owner_npub: String,
+    pub credential_id: Uuid,
+    pub fiat_percentage: i16,
+    pub fiat_currency: String,
+    pub terms_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewBullBitcoinClaimOutput<'a> {
+    pub role: &'a str,
+    pub txid: &'a str,
+    pub vout: i16,
+    pub script_pubkey_hex: &'a str,
+    pub authorized_amount_sat: i64,
+    pub asset_commitment_sha256: &'a str,
+    pub value_commitment_sha256: &'a str,
+    pub nonce_commitment_sha256: &'a str,
+    pub surjection_proof_sha256: &'a str,
+    pub rangeproof_sha256: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+pub struct StoredBullBitcoinClaimOutput {
+    pub settlement_id: Uuid,
+    pub role: String,
+    pub txid: String,
+    pub vout: i16,
+    pub script_pubkey_hex: String,
+    pub authorized_amount_sat: i64,
+    pub asset_commitment_sha256: String,
+    pub value_commitment_sha256: String,
+    pub nonce_commitment_sha256: String,
+    pub surjection_proof_sha256: String,
+    pub rangeproof_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseMixedSettlementAccounting {
+    pub settlement_id: Uuid,
+    pub invoice_id: Option<Uuid>,
+    pub claim_txid: String,
+    pub merchant_amount_sat: i64,
+    pub bull_bitcoin_amount_sat: i64,
+}
+
+#[derive(FromRow)]
+struct ReverseMixedSettlementAccountingRow {
+    settlement_id: Uuid,
+    invoice_id: Option<Uuid>,
+    provider_state: String,
+    funding_route: Option<String>,
+    funding_committed: bool,
+    merchant_txid: Option<String>,
+    merchant_amount_sat: Option<i64>,
+    bull_bitcoin_txid: Option<String>,
+    bull_bitcoin_amount_sat: Option<i64>,
+}
+
+/// Privacy-minimal, local-only projection for the signed merchant invoice
+/// list. It deliberately excludes payer instructions, transaction identifiers,
+/// account identity, rates, and raw provider state. The one Bitcoin amount is
+/// the exact merchant output needed to explain a mixed settlement.
+#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+pub struct InvoiceBullBitcoinSettlementProjection {
+    pub invoice_id: Uuid,
+    pub purpose: String,
+    pub bull_bitcoin_order_id: Option<Uuid>,
+    pub fiat_currency: String,
+    pub settlement_status: String,
+    pub credited_fiat_minor: Option<i64>,
+    pub funding_route: Option<String>,
+    pub fallback_category: Option<String>,
+    pub merchant_bitcoin_sat: Option<i64>,
+    pub merchant_bitcoin_settled: bool,
+}
+
+const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
+     credential_id, product, purpose, payer_rail, \
      request_key, fiat_percentage, fiat_currency, terms_version, provider_state, \
      funding_route, fallback_category, settlement_status, requested_bitcoin_sat, \
      bull_bitcoin_order_id, instruction_kind, payer_instruction, \
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
-     extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts";
+     extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
+     extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
+     actual_received_sat, credited_fiat_minor, provider_final";
+
+/// Copy an invoice's immutable mixed policy onto the reverse swap in the same
+/// transaction that makes the Boltz obligation durable. A 0%/100% policy does
+/// not create a mixed-swap row.
+pub async fn capture_invoice_reverse_mixed_policy(
+    tx: &mut Transaction<'_, Postgres>,
+    reverse_swap_id: Uuid,
+    invoice_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO swap_fiat_settlement_policies ( \
+             reverse_swap_id, owner_npub, credential_id, product, \
+             fiat_percentage, fiat_currency, terms_version \
+         ) \
+         SELECT $1, policy.owner_npub, policy.credential_id, policy.product, \
+                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+           FROM invoice_fiat_settlement_policies policy \
+          WHERE policy.invoice_id = $2 \
+            AND policy.fiat_percentage BETWEEN 1 AND 99",
+    )
+    .bind(reverse_swap_id)
+    .bind(invoice_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Chain-swap counterpart to [`capture_invoice_reverse_mixed_policy`].
+pub async fn capture_invoice_chain_mixed_policy(
+    tx: &mut Transaction<'_, Postgres>,
+    chain_swap_id: Uuid,
+    invoice_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO swap_fiat_settlement_policies ( \
+             chain_swap_id, owner_npub, credential_id, product, \
+             fiat_percentage, fiat_currency, terms_version \
+         ) \
+         SELECT $1, policy.owner_npub, policy.credential_id, policy.product, \
+                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+           FROM invoice_fiat_settlement_policies policy \
+          WHERE policy.invoice_id = $2 \
+            AND policy.fiat_percentage BETWEEN 1 AND 99",
+    )
+    .bind(chain_swap_id)
+    .bind(invoice_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Capture the current Lightning Address mixed policy after a Boltz response
+/// and before its BOLT11 is exposed. The owner lock serializes this snapshot
+/// with mobile setting changes and credential deletion.
+pub async fn active_lightning_address_fiat_setting(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Option<ActiveFiatSettlementSetting>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT setting.owner_npub, setting.credential_id, \
+                setting.fiat_percentage, setting.fiat_currency, setting.terms_version \
+           FROM users account \
+           JOIN fiat_settlement_settings setting \
+             ON setting.owner_npub = account.npub \
+            AND setting.product = 'lightning_address' \
+           JOIN bull_bitcoin_credentials credential \
+             ON credential.id = setting.credential_id \
+            AND credential.owner_npub = setting.owner_npub \
+          WHERE account.nym = $1 AND account.is_active \
+            AND credential.admitted_for_new_orders \
+            AND credential.ciphertext IS NOT NULL \
+            AND credential.nonce IS NOT NULL",
+    )
+    .bind(nym)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Revalidate the exact setting observed before Boltz I/O and, for a mixed
+/// setting, capture it onto the newly inserted swap. `None` means the callback
+/// observed no fiat policy and requires that to remain true at commit.
+pub async fn validate_and_capture_lightning_address_policy(
+    tx: &mut Transaction<'_, Postgres>,
+    reverse_swap_id: Uuid,
+    nym: &str,
+    expected: Option<&ActiveFiatSettlementSetting>,
+) -> Result<bool, sqlx::Error> {
+    let owner_npub = match expected {
+        Some(setting) => setting.owner_npub.clone(),
+        None => {
+            sqlx::query_scalar::<_, String>("SELECT npub FROM users WHERE nym = $1 AND is_active")
+                .bind(nym)
+                .fetch_one(&mut **tx)
+                .await?
+        }
+    };
+    lock_owner(tx, &owner_npub).await?;
+    if expected.is_none() {
+        let still_absent: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS ( \
+                 SELECT 1 FROM fiat_settlement_settings setting \
+                  WHERE setting.owner_npub = $1 \
+                    AND setting.product = 'lightning_address' \
+             ) AND EXISTS ( \
+                 SELECT 1 FROM users \
+                  WHERE nym = $2 AND npub = $1 AND is_active \
+             )",
+        )
+        .bind(&owner_npub)
+        .bind(nym)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !still_absent {
+            return Err(sqlx::Error::Protocol(
+                "Lightning Address fiat setting changed during offer creation".into(),
+            ));
+        }
+        return Ok(false);
+    }
+    let expected = expected.ok_or_else(|| {
+        sqlx::Error::Protocol("Lightning Address fiat policy disappeared during validation".into())
+    })?;
+    if expected.fiat_percentage == 100 {
+        let exact: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM fiat_settlement_settings setting \
+                 JOIN bull_bitcoin_credentials credential \
+                   ON credential.id = setting.credential_id \
+                  AND credential.owner_npub = setting.owner_npub \
+                 JOIN users account ON account.npub = setting.owner_npub \
+                  AND account.nym = $2 AND account.is_active \
+                  WHERE setting.owner_npub = $1 \
+                    AND setting.product = 'lightning_address' \
+                    AND setting.credential_id = $3 \
+                    AND setting.fiat_percentage = 100 \
+                    AND setting.fiat_currency = $4 \
+                    AND setting.terms_version = $5 \
+                    AND credential.admitted_for_new_orders \
+                    AND credential.ciphertext IS NOT NULL \
+                    AND credential.nonce IS NOT NULL \
+             )",
+        )
+        .bind(&owner_npub)
+        .bind(nym)
+        .bind(expected.credential_id)
+        .bind(&expected.fiat_currency)
+        .bind(&expected.terms_version)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exact {
+            return Err(sqlx::Error::Protocol(
+                "Lightning Address fiat setting changed during offer creation".into(),
+            ));
+        }
+        return Ok(false);
+    }
+    if !(1..=99).contains(&expected.fiat_percentage) {
+        return Err(sqlx::Error::Protocol(
+            "only a mixed Lightning Address policy can bind a Boltz swap".into(),
+        ));
+    }
+    let result = sqlx::query(
+        "INSERT INTO swap_fiat_settlement_policies ( \
+             reverse_swap_id, owner_npub, credential_id, product, \
+             fiat_percentage, fiat_currency, terms_version \
+         ) \
+         SELECT $1, setting.owner_npub, setting.credential_id, setting.product, \
+                setting.fiat_percentage, setting.fiat_currency, setting.terms_version \
+           FROM fiat_settlement_settings setting \
+           JOIN bull_bitcoin_credentials credential \
+             ON credential.id = setting.credential_id \
+            AND credential.owner_npub = setting.owner_npub \
+           JOIN users account \
+             ON account.npub = setting.owner_npub \
+            AND account.nym = $3 AND account.is_active \
+          WHERE setting.owner_npub = $2 \
+            AND setting.product = 'lightning_address' \
+            AND setting.credential_id = $4 \
+            AND setting.fiat_percentage = $5 \
+            AND setting.fiat_currency = $6 \
+            AND setting.terms_version = $7 \
+            AND credential.admitted_for_new_orders \
+            AND credential.ciphertext IS NOT NULL \
+            AND credential.nonce IS NOT NULL",
+    )
+    .bind(reverse_swap_id)
+    .bind(&owner_npub)
+    .bind(nym)
+    .bind(expected.credential_id)
+    .bind(expected.fiat_percentage)
+    .bind(&expected.fiat_currency)
+    .bind(&expected.terms_version)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn reverse_swap_fiat_settlement_policy(
+    connection: &mut PgConnection,
+    reverse_swap_id: Uuid,
+) -> Result<Option<SwapFiatSettlementPolicy>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT policy.reverse_swap_id, policy.chain_swap_id, swap.invoice_id, \
+                policy.owner_npub, policy.credential_id, policy.product, \
+                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+           FROM swap_fiat_settlement_policies policy \
+           JOIN swap_records swap ON swap.id = policy.reverse_swap_id \
+          WHERE policy.reverse_swap_id = $1",
+    )
+    .bind(reverse_swap_id)
+    .fetch_optional(connection)
+    .await
+}
+
+pub async fn chain_swap_fiat_settlement_policy(
+    connection: &mut PgConnection,
+    chain_swap_id: Uuid,
+) -> Result<Option<SwapFiatSettlementPolicy>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT policy.reverse_swap_id, policy.chain_swap_id, swap.invoice_id, \
+                policy.owner_npub, policy.credential_id, policy.product, \
+                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+           FROM swap_fiat_settlement_policies policy \
+           JOIN chain_swap_records swap ON swap.id = policy.chain_swap_id \
+          WHERE policy.chain_swap_id = $1",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(connection)
+    .await
+}
+
+pub async fn invoice_bull_bitcoin_settlement_projections<'e, E>(
+    executor: E,
+    owner_npub: &str,
+    invoice_ids: &[Uuid],
+) -> Result<Vec<InvoiceBullBitcoinSettlementProjection>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if invoice_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT settlement.invoice_id, settlement.purpose, \
+                settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
+                settlement.settlement_status, settlement.credited_fiat_minor, \
+                settlement.funding_route, settlement.fallback_category, \
+                merchant.authorized_amount_sat AS merchant_bitcoin_sat, \
+                EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events event \
+                     WHERE event.invoice_id = settlement.invoice_id \
+                       AND event.txid = merchant.txid \
+                       AND event.amount_sat = merchant.authorized_amount_sat \
+                       AND event.source IN ( \
+                           'lightning_boltz_reverse', 'bitcoin_boltz_chain' \
+                       ) \
+                       AND event.accounting_state = 'active' \
+                ) AS merchant_bitcoin_settled \
+           FROM bull_bitcoin_settlements settlement \
+           LEFT JOIN bull_bitcoin_claim_outputs merchant \
+             ON merchant.settlement_id = settlement.id \
+            AND merchant.role = 'merchant' \
+          WHERE settlement.owner_npub = $1 AND settlement.invoice_id = ANY($2) \
+            AND ( \
+                (settlement.provider_state = 'bound' \
+                 AND settlement.funding_route = 'bull_bitcoin' \
+                 AND settlement.funding_committed_at IS NOT NULL) \
+                OR settlement.funding_route = 'bitcoin_fallback' \
+            ) \
+          ORDER BY settlement.created_at, settlement.id",
+    )
+    .bind(owner_npub)
+    .bind(invoice_ids)
+    .fetch_all(executor)
+    .await
+}
 
 pub async fn reserve_bull_bitcoin_settlement(
     connection: &mut PgConnection,
@@ -125,17 +502,44 @@ pub async fn reserve_bull_bitcoin_settlement(
         return Err(BullBitcoinSettlementStoreError::CredentialUnavailable);
     }
 
+    // Lightning Address callbacks do not have an invoice policy to authorize
+    // the reservation. Revalidate the exact mobile-selected setting while the
+    // owner mutation lock is held, so a concurrent disable/currency change
+    // either wins before this intent or happens after its durable reservation.
+    if settlement.product == "lightning_address" && settlement.purpose == "fiat_only" {
+        let setting_matches = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM fiat_settlement_settings \
+                  WHERE owner_npub = $1 AND product = 'lightning_address' \
+                    AND credential_id = $2 AND fiat_percentage = 100 \
+                    AND fiat_currency = $3 AND terms_version = $4 \
+             )",
+        )
+        .bind(settlement.owner_npub)
+        .bind(settlement.credential_id)
+        .bind(settlement.fiat_currency)
+        .bind(settlement.terms_version)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !setting_matches {
+            return Err(BullBitcoinSettlementStoreError::CredentialUnavailable);
+        }
+    }
+
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO bull_bitcoin_settlements ( \
-             id, owner_npub, invoice_id, credential_id, product, purpose, \
+             id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
+             credential_id, product, purpose, \
              payer_rail, request_key, fiat_percentage, fiat_currency, \
              terms_version, requested_bitcoin_sat \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(settlement.owner_npub)
     .bind(settlement.invoice_id)
+    .bind(settlement.reverse_swap_id)
+    .bind(settlement.chain_swap_id)
     .bind(settlement.credential_id)
     .bind(settlement.product)
     .bind(settlement.purpose)
@@ -186,6 +590,21 @@ pub async fn load_bull_bitcoin_settlement(
     .await
 }
 
+pub async fn load_bull_bitcoin_settlement_by_request_key(
+    connection: &mut PgConnection,
+    owner_npub: &str,
+    request_key: &str,
+) -> Result<Option<StoredBullBitcoinSettlement>, sqlx::Error> {
+    sqlx::query_as::<_, StoredBullBitcoinSettlement>(&format!(
+        "SELECT {SETTLEMENT_PROJECTION} FROM bull_bitcoin_settlements \
+          WHERE owner_npub = $1 AND request_key = $2"
+    ))
+    .bind(owner_npub)
+    .bind(request_key)
+    .fetch_optional(connection)
+    .await
+}
+
 pub async fn load_bull_bitcoin_credential(
     connection: &mut PgConnection,
     credential_id: Uuid,
@@ -227,8 +646,12 @@ pub async fn bind_bull_bitcoin_order(
     let result = sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET provider_state = 'bound', \
-                funding_route = 'bull_bitcoin', \
-                settlement_status = 'pending', \
+                funding_route = CASE WHEN purpose = 'fiat_only' \
+                    THEN 'bull_bitcoin' ELSE NULL END, \
+                settlement_status = CASE WHEN purpose = 'fiat_only' \
+                    THEN 'pending' ELSE 'none' END, \
+                funding_committed_at = CASE WHEN purpose = 'fiat_only' \
+                    THEN now() ELSE NULL END, \
                 bull_bitcoin_order_id = $2, \
                 instruction_kind = $3, payer_instruction = $4, \
                 instruction_expires_at = CASE WHEN $5::BIGINT IS NULL \
@@ -268,6 +691,182 @@ pub async fn abandon_bull_bitcoin_dispatch(
     Ok(())
 }
 
+/// A mixed order may be bound but not yet referenced by claim bytes. In that
+/// narrow state no payer-facing Bull Bitcoin destination has been funded, so
+/// a minimum/policy/credential failure can still route the whole claim to the
+/// merchant wallet without revoking the upstream key or order.
+pub async fn route_unfunded_mixed_settlement_to_fallback(
+    connection: &mut PgConnection,
+    settlement_id: Uuid,
+    fallback_category: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET funding_route = 'bitcoin_fallback', fallback_category = $2, \
+                instruction_kind = NULL, payer_instruction = NULL, \
+                instruction_expires_at = NULL, next_attempt_at = NULL, \
+                updated_at = now() \
+          WHERE id = $1 AND purpose = 'mixed' \
+            AND provider_state = 'bound' AND funding_route IS NULL \
+            AND funding_committed_at IS NULL AND settlement_status = 'none'",
+    )
+    .bind(settlement_id)
+    .bind(fallback_category)
+    .execute(connection)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Persist both verified claim outputs and make the upstream order eligible
+/// for reconciliation in one transaction. The migration trigger independently
+/// checks that the Bull Bitcoin amount equals the order's exact requested sats.
+pub async fn commit_mixed_bull_bitcoin_funding(
+    tx: &mut Transaction<'_, Postgres>,
+    settlement_id: Uuid,
+    merchant: &NewBullBitcoinClaimOutput<'_>,
+    bull_bitcoin: &NewBullBitcoinClaimOutput<'_>,
+) -> Result<(), sqlx::Error> {
+    for output in [merchant, bull_bitcoin] {
+        sqlx::query(
+            "INSERT INTO bull_bitcoin_claim_outputs ( \
+                 settlement_id, role, txid, vout, script_pubkey_hex, \
+                 authorized_amount_sat, asset_commitment_sha256, \
+                 value_commitment_sha256, nonce_commitment_sha256, \
+                 surjection_proof_sha256, rangeproof_sha256 \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(settlement_id)
+        .bind(output.role)
+        .bind(output.txid)
+        .bind(output.vout)
+        .bind(output.script_pubkey_hex)
+        .bind(output.authorized_amount_sat)
+        .bind(output.asset_commitment_sha256)
+        .bind(output.value_commitment_sha256)
+        .bind(output.nonce_commitment_sha256)
+        .bind(output.surjection_proof_sha256)
+        .bind(output.rangeproof_sha256)
+        .execute(&mut **tx)
+        .await?;
+    }
+    let updated = sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET funding_route = 'bull_bitcoin', funding_committed_at = now(), \
+                settlement_status = 'pending', instruction_kind = NULL, \
+                payer_instruction = NULL, instruction_expires_at = NULL, \
+                next_attempt_at = now(), updated_at = now() \
+          WHERE id = $1 AND purpose = 'mixed' \
+            AND provider_state = 'bound' AND funding_route IS NULL \
+            AND funding_committed_at IS NULL AND settlement_status = 'none'",
+    )
+    .bind(settlement_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "mixed Bull Bitcoin funding transition lost its exact row".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn load_bull_bitcoin_claim_outputs<'e, E>(
+    executor: E,
+    settlement_id: Uuid,
+) -> Result<Vec<StoredBullBitcoinClaimOutput>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT settlement_id, role, txid, vout, script_pubkey_hex, \
+                authorized_amount_sat, asset_commitment_sha256, \
+                value_commitment_sha256, nonce_commitment_sha256, \
+                surjection_proof_sha256, rangeproof_sha256 \
+           FROM bull_bitcoin_claim_outputs \
+          WHERE settlement_id = $1 ORDER BY vout",
+    )
+    .bind(settlement_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// Resolve the exact two-output accounting authority for a claimed reverse
+/// swap. A mixed policy that routed to Bitcoin is intentionally projected as
+/// `None`; a funded mixed order with incomplete or inconsistent output evidence
+/// is an integrity error and must never fall through to the historical gross
+/// swap amount.
+pub async fn reverse_mixed_settlement_accounting(
+    pool: &PgPool,
+    reverse_swap_id: Uuid,
+) -> Result<Option<ReverseMixedSettlementAccounting>, sqlx::Error> {
+    let row = sqlx::query_as::<_, ReverseMixedSettlementAccountingRow>(
+        "SELECT settlement.id AS settlement_id, settlement.invoice_id, \
+                settlement.provider_state, settlement.funding_route, \
+                settlement.funding_committed_at IS NOT NULL AS funding_committed, \
+                merchant.txid AS merchant_txid, \
+                merchant.authorized_amount_sat AS merchant_amount_sat, \
+                bull_bitcoin.txid AS bull_bitcoin_txid, \
+                bull_bitcoin.authorized_amount_sat AS bull_bitcoin_amount_sat \
+           FROM bull_bitcoin_settlements settlement \
+           LEFT JOIN bull_bitcoin_claim_outputs merchant \
+             ON merchant.settlement_id = settlement.id AND merchant.role = 'merchant' \
+           LEFT JOIN bull_bitcoin_claim_outputs bull_bitcoin \
+             ON bull_bitcoin.settlement_id = settlement.id \
+            AND bull_bitcoin.role = 'bull_bitcoin' \
+          WHERE settlement.reverse_swap_id = $1 AND settlement.purpose = 'mixed'",
+    )
+    .bind(reverse_swap_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.funding_route.as_deref() == Some("bitcoin_fallback") {
+        if row.funding_committed || row.merchant_txid.is_some() || row.bull_bitcoin_txid.is_some() {
+            return Err(sqlx::Error::Protocol(
+                "mixed Bitcoin fallback unexpectedly carries funding evidence".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if row.provider_state != "bound"
+        || row.funding_route.as_deref() != Some("bull_bitcoin")
+        || !row.funding_committed
+    {
+        return Err(sqlx::Error::Protocol(
+            "claimed mixed reverse swap has no committed funding authority".into(),
+        ));
+    }
+    let merchant_txid = row.merchant_txid.ok_or_else(|| {
+        sqlx::Error::Protocol("mixed reverse settlement lacks merchant output evidence".into())
+    })?;
+    let bull_bitcoin_txid = row.bull_bitcoin_txid.ok_or_else(|| {
+        sqlx::Error::Protocol("mixed reverse settlement lacks Bull Bitcoin output evidence".into())
+    })?;
+    let merchant_amount_sat = row
+        .merchant_amount_sat
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| sqlx::Error::Protocol("mixed reverse merchant amount is invalid".into()))?;
+    let bull_bitcoin_amount_sat = row
+        .bull_bitcoin_amount_sat
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| {
+            sqlx::Error::Protocol("mixed reverse Bull Bitcoin amount is invalid".into())
+        })?;
+    if merchant_txid != bull_bitcoin_txid {
+        return Err(sqlx::Error::Protocol(
+            "mixed reverse outputs reference different claim transactions".into(),
+        ));
+    }
+    Ok(Some(ReverseMixedSettlementAccounting {
+        settlement_id: row.settlement_id,
+        invoice_id: row.invoice_id,
+        claim_txid: merchant_txid,
+        merchant_amount_sat,
+        bull_bitcoin_amount_sat,
+    }))
+}
+
 pub async fn recover_stale_bull_bitcoin_dispatches(
     pool: &PgPool,
     stale_after_secs: i64,
@@ -296,9 +895,19 @@ pub async fn claim_bull_bitcoin_reconciliation_batch(
              SELECT id FROM bull_bitcoin_settlements \
               WHERE provider_state = 'bound' \
                 AND funding_route = 'bull_bitcoin' \
-                AND settlement_status = 'pending' \
+                AND funding_committed_at IS NOT NULL \
                 AND bull_bitcoin_order_id IS NOT NULL \
-                AND (next_attempt_at IS NULL OR next_attempt_at <= now()) \
+                AND ( \
+                    (settlement_status = 'pending' \
+                     AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
+                    OR (settlement_status = 'settled' AND purpose = 'fiat_only' \
+                        AND invoice_id IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM invoice_payment_events event \
+                             WHERE event.bull_bitcoin_settlement_id = \
+                                   bull_bitcoin_settlements.id \
+                        )) \
+                ) \
               ORDER BY COALESCE(next_attempt_at, created_at), id \
               FOR UPDATE SKIP LOCKED LIMIT $1 \
          ) \
@@ -436,6 +1045,20 @@ pub async fn invalidate_bull_bitcoin_credential_on_connection(
         .await?;
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
+            SET funding_route = 'bitcoin_fallback', \
+                fallback_category = 'conversion_unavailable', \
+                instruction_kind = NULL, payer_instruction = NULL, \
+                instruction_expires_at = NULL, next_attempt_at = NULL, \
+                updated_at = now() \
+          WHERE credential_id = $1 AND purpose = 'mixed' \
+            AND provider_state = 'bound' AND funding_route IS NULL \
+            AND funding_committed_at IS NULL AND settlement_status = 'none'",
+    )
+    .bind(credential_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
             SET settlement_status = 'unavailable', payer_instruction = NULL, \
                 instruction_kind = NULL, next_attempt_at = NULL, \
                 last_checked_at = now(), updated_at = now() \
@@ -497,6 +1120,8 @@ fn validate_reservation_identity(
 ) -> Result<(), BullBitcoinSettlementStoreError> {
     if stored.owner_npub != requested.owner_npub
         || stored.invoice_id != requested.invoice_id
+        || stored.reverse_swap_id != requested.reverse_swap_id
+        || stored.chain_swap_id != requested.chain_swap_id
         || stored.credential_id != requested.credential_id
         || stored.product != requested.product
         || stored.purpose != requested.purpose

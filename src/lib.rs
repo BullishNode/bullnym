@@ -9,6 +9,7 @@ pub mod boltz_restore_fetch;
 pub mod boltz_transport;
 pub mod builder_fee;
 pub mod bull_bitcoin;
+pub mod bull_bitcoin_claim;
 pub mod bull_bitcoin_settlement;
 pub(crate) mod canonical_json;
 pub mod certification;

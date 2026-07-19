@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
+
+use crate::bull_bitcoin::Product;
 
 // =====================================================================
 // Invoices
@@ -54,6 +56,7 @@ pub struct Invoice {
     pub presentation_status: Option<String>,
     pub direct_settlement_status: String,
     pub swap_settlement_status: String,
+    pub fiat_settlement_status: String,
     pub direct_payment_projection_version: i64,
     pub liquid_blinding_key_hex: Option<String>,
     /// Unix epoch seconds. See section comment above for the timestamp
@@ -76,7 +79,7 @@ const INVOICE_COLUMNS: &str =
      rate_minor_per_btc, memo, bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
      pricing_mode, settlement_status, presentation_status, \
-     direct_settlement_status, swap_settlement_status, \
+     direct_settlement_status, swap_settlement_status, fiat_settlement_status, \
      direct_payment_projection_version, liquid_blinding_key_hex, \
      FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT     AS created_at_unix, \
      FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT     AS expires_at_unix, \
@@ -147,6 +150,18 @@ pub enum WalletInvoiceCreateResolution {
     Created(Invoice),
     Reused(Invoice),
     Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct InvoiceFiatSettlementPolicy {
+    pub invoice_id: Uuid,
+    pub owner_npub: String,
+    pub credential_id: Uuid,
+    pub product: String,
+    pub fiat_percentage: i16,
+    pub fiat_currency: String,
+    pub terms_version: String,
+    pub allowed_rail_mask: i16,
 }
 
 /// Immutable five-minute fiat conversion snapshot.  Provider instructions are
@@ -483,13 +498,42 @@ pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
 ) -> Result<Invoice, sqlx::Error> {
+    insert_invoice_inner(pool, invoice, None).await
+}
+
+/// Insert an invoice and, when the owner currently has an admitted setting
+/// for `product`, snapshot that policy in the same transaction. The owner
+/// advisory lock serializes this capture with setting changes and credential
+/// deletion; absence remains the ordinary Bitcoin-only behavior.
+pub async fn insert_invoice_with_fiat_policy(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+    product: Product,
+    allowed_rail_mask: i16,
+) -> Result<Invoice, sqlx::Error> {
+    insert_invoice_inner(pool, invoice, Some((product, allowed_rail_mask))).await
+}
+
+async fn insert_invoice_inner(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+    fiat_policy: Option<(Product, i16)>,
+) -> Result<Invoice, sqlx::Error> {
     if invoice.origin != "checkout" {
         return Err(sqlx::Error::Protocol(
             "wallet invoices require insert_or_reuse_wallet_invoice".to_string(),
         ));
     }
     let mut tx = pool.begin().await?;
+    if fiat_policy.is_some() {
+        super::fiat_settlement::lock_owner(&mut tx, invoice.npub_owner).await?;
+    }
+
     let inserted = insert_invoice_row(&mut tx, invoice, None).await?;
+    if let Some((product, allowed_rail_mask)) = fiat_policy {
+        capture_invoice_fiat_policy(&mut tx, &inserted, invoice, product, allowed_rail_mask)
+            .await?;
+    }
     insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
     tx.commit().await?;
     Ok(inserted)
@@ -539,6 +583,44 @@ async fn insert_invoice_row(
     .bind(private.map(|value| value.presentation_envelope))
     .fetch_one(&mut **tx)
     .await
+}
+
+async fn capture_invoice_fiat_policy(
+    tx: &mut Transaction<'_, Postgres>,
+    inserted: &Invoice,
+    invoice: &NewInvoice<'_>,
+    product: Product,
+    allowed_rail_mask: i16,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO invoice_fiat_settlement_policies ( \
+                 invoice_id, owner_npub, credential_id, product, \
+                 fiat_percentage, fiat_currency, terms_version, \
+                 allowed_rail_mask \
+             ) \
+             SELECT $1, setting.owner_npub, setting.credential_id, \
+                    setting.product, setting.fiat_percentage, \
+                    setting.fiat_currency, setting.terms_version, \
+                    CASE WHEN setting.fiat_percentage = 100 THEN $4::SMALLINT \
+                         ELSE ($4::SMALLINT & 3::SMALLINT) END \
+               FROM fiat_settlement_settings setting \
+               JOIN bull_bitcoin_credentials credential \
+                 ON credential.id = setting.credential_id \
+                AND credential.owner_npub = setting.owner_npub \
+              WHERE setting.owner_npub = $2 AND setting.product = $3 \
+                AND credential.admitted_for_new_orders \
+                AND credential.ciphertext IS NOT NULL \
+                AND credential.nonce IS NOT NULL \
+                AND (setting.fiat_percentage = 100 \
+                     OR ($4::SMALLINT & 3::SMALLINT) <> 0)",
+    )
+    .bind(inserted.id)
+    .bind(invoice.npub_owner)
+    .bind(product.as_str())
+    .bind(allowed_rail_mask)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn insert_invoice_payment_addresses(
@@ -619,6 +701,30 @@ pub async fn insert_or_reuse_wallet_invoice(
     invoice: &NewInvoice<'_>,
     private: &PrivateInvoiceCreate<'_>,
 ) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
+    insert_or_reuse_wallet_invoice_inner(pool, invoice, private, None).await
+}
+
+/// Create an idempotent private wallet invoice and atomically snapshot its
+/// admitted fiat-settlement policy. The opaque presentation contract remains
+/// mandatory; enabling fiat never reintroduces merchant metadata into the
+/// ordinary invoice projection.
+pub async fn insert_or_reuse_wallet_invoice_with_fiat_policy(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+    private: &PrivateInvoiceCreate<'_>,
+    product: Product,
+    allowed_rail_mask: i16,
+) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
+    insert_or_reuse_wallet_invoice_inner(pool, invoice, private, Some((product, allowed_rail_mask)))
+        .await
+}
+
+async fn insert_or_reuse_wallet_invoice_inner(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+    private: &PrivateInvoiceCreate<'_>,
+    fiat_policy: Option<(Product, i16)>,
+) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
     if invoice.origin != "wallet" {
         return Err(sqlx::Error::Protocol(
             "private invoice create requires origin=wallet".to_string(),
@@ -626,6 +732,9 @@ pub async fn insert_or_reuse_wallet_invoice(
     }
 
     let mut tx = pool.begin().await?;
+    if fiat_policy.is_some() {
+        super::fiat_settlement::lock_owner(&mut tx, invoice.npub_owner).await?;
+    }
     let lock_key = format!(
         "private-invoice-create:{}:{}",
         invoice.npub_owner, private.client_request_id
@@ -651,6 +760,10 @@ pub async fn insert_or_reuse_wallet_invoice(
     }
 
     let inserted = insert_invoice_row(&mut tx, invoice, Some(private)).await?;
+    if let Some((product, allowed_rail_mask)) = fiat_policy {
+        capture_invoice_fiat_policy(&mut tx, &inserted, invoice, product, allowed_rail_mask)
+            .await?;
+    }
     insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
 
     tx.commit().await?;
@@ -670,6 +783,23 @@ pub async fn get_private_invoice_presentation(
     )
     .bind(invoice_id)
     .fetch_optional(pool)
+    .await
+}
+
+pub async fn invoice_fiat_settlement_policy<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<Option<InvoiceFiatSettlementPolicy>, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query_as::<_, InvoiceFiatSettlementPolicy>(
+        "SELECT invoice_id, owner_npub, credential_id, product, \
+                fiat_percentage, fiat_currency, terms_version, allowed_rail_mask \
+           FROM invoice_fiat_settlement_policies WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(executor)
     .await
 }
 
@@ -1339,17 +1469,32 @@ where
                         presentation_eligible_sat > merchant_amount_sat \
                     ), FALSE) AS presentation_overpaid \
                FROM per_quote \
+         ), bull_bitcoin AS ( \
+             SELECT COALESCE(SUM(e.fiat_credited_minor) FILTER (WHERE \
+                        e.accounting_state IN ('active', 'legacy_unverified') \
+                    ), 0)::BIGINT AS active_credit_minor, \
+                    COALESCE(SUM(e.fiat_credited_minor) FILTER (WHERE \
+                        e.accounting_state <> 'superseded' \
+                    ), 0)::BIGINT AS presentation_credit_minor \
+               FROM invoice_payment_events e \
+              WHERE e.invoice_id = $1 AND e.source = 'bull_bitcoin_fiat' \
          ) \
          SELECT i.fiat_amount_minor::BIGINT AS face_minor, \
-                projected.active_credit_minor, projected.presentation_credit_minor, \
+                projected.active_credit_minor + bull_bitcoin.active_credit_minor \
+                    AS active_credit_minor, \
+                projected.presentation_credit_minor + bull_bitcoin.presentation_credit_minor \
+                    AS presentation_credit_minor, \
                 (projected.active_overpaid \
-                 OR projected.active_credit_minor > i.fiat_amount_minor) AS active_overpaid, \
+                 OR projected.active_credit_minor + bull_bitcoin.active_credit_minor \
+                    > i.fiat_amount_minor) AS active_overpaid, \
                 (projected.presentation_overpaid \
-                 OR projected.presentation_credit_minor > i.fiat_amount_minor) \
+                 OR projected.presentation_credit_minor + bull_bitcoin.presentation_credit_minor \
+                    > i.fiat_amount_minor) \
                     AS presentation_overpaid, \
                 EXISTS ( \
                     SELECT 1 FROM invoice_payment_events e \
                      WHERE e.invoice_id = i.id \
+                       AND e.source <> 'bull_bitcoin_fiat' \
                        AND (e.quote_first_observed_at IS NULL \
                             OR e.fiat_credited_minor IS NULL \
                             OR e.fiat_credit_policy IS NULL \
@@ -1358,7 +1503,7 @@ where
                                 AND (e.invoice_quote_version_id IS NULL \
                                      OR e.invoice_quote_offer_id IS NULL))) \
                 ) AS unresolved_evidence \
-           FROM invoices i CROSS JOIN projected \
+           FROM invoices i CROSS JOIN projected CROSS JOIN bull_bitcoin \
           WHERE i.id = $1 AND i.pricing_mode = 'fiat_fixed' \
             AND i.fiat_amount_minor IS NOT NULL",
     )
@@ -2077,6 +2222,13 @@ pub struct InvoicePaymentEvidence<'a> {
     pub vout: Option<i32>,
     pub boltz_swap_id: Option<&'a str>,
     pub address: Option<&'a str>,
+    /// Present only for a provider-final Bull Bitcoin balance settlement.
+    /// The referenced local row, rather than a generic order response, is the
+    /// durable authority for this event.
+    pub bull_bitcoin_settlement_id: Option<Uuid>,
+    /// Exact balance credit reported by Bull Bitcoin, in the selected
+    /// currency's minor units. Never derived from Bullnym's quote rate.
+    pub bull_bitcoin_credited_fiat_minor: Option<i64>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2284,6 +2436,8 @@ impl InvoicePaymentEvidence<'_> {
                     || self.vout.is_some_and(|v| v < 0)
                     || self.address.is_none()
                     || self.boltz_swap_id.is_some()
+                    || self.bull_bitcoin_settlement_id.is_some()
+                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "bitcoin_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
@@ -2296,6 +2450,8 @@ impl InvoicePaymentEvidence<'_> {
                     || self.vout.is_some_and(|v| v < 0)
                     || self.address.is_none()
                     || self.boltz_swap_id.is_some()
+                    || self.bull_bitcoin_settlement_id.is_some()
+                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "liquid_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
@@ -2303,16 +2459,66 @@ impl InvoicePaymentEvidence<'_> {
                 }
             }
             "lightning_boltz_reverse" if self.rail == "lightning" => {
-                if self.txid.is_none() || self.boltz_swap_id.is_none() || self.vout.is_some() {
+                if self.txid.is_none()
+                    || self.boltz_swap_id.is_none()
+                    || self.vout.is_some()
+                    || self.bull_bitcoin_settlement_id.is_some()
+                    || self.bull_bitcoin_credited_fiat_minor.is_some()
+                {
                     return Err(sqlx::Error::Protocol(
                         "lightning_boltz_reverse evidence requires txid, boltz_swap_id, and no vout".into(),
                     ));
                 }
             }
             "bitcoin_boltz_chain" if self.rail == "bitcoin" => {
-                if self.txid.is_none() || self.boltz_swap_id.is_none() || self.vout.is_some() {
+                if self.txid.is_none()
+                    || self.boltz_swap_id.is_none()
+                    || self.vout.is_some()
+                    || self.bull_bitcoin_settlement_id.is_some()
+                    || self.bull_bitcoin_credited_fiat_minor.is_some()
+                {
                     return Err(sqlx::Error::Protocol(
                         "bitcoin_boltz_chain evidence requires txid, boltz_swap_id, and no vout"
+                            .into(),
+                    ));
+                }
+            }
+            "bull_bitcoin_fiat" => {
+                let Some(settlement_id) = self.bull_bitcoin_settlement_id else {
+                    return Err(sqlx::Error::Protocol(
+                        "bull_bitcoin_fiat evidence requires its local settlement id".into(),
+                    ));
+                };
+                if self.txid.is_some()
+                    || self.vout.is_some()
+                    || self.boltz_swap_id.is_some()
+                    || self.address.is_some()
+                    || self
+                        .bull_bitcoin_credited_fiat_minor
+                        .is_none_or(|amount| amount <= 0)
+                    || self.event_key != format!("bull_bitcoin_fiat:{settlement_id}")
+                {
+                    return Err(sqlx::Error::Protocol(
+                        "bull_bitcoin_fiat evidence must contain only exact local settlement authority"
+                            .into(),
+                    ));
+                }
+            }
+            "bull_bitcoin_mixed_output" if self.rail == "liquid" => {
+                let Some(settlement_id) = self.bull_bitcoin_settlement_id else {
+                    return Err(sqlx::Error::Protocol(
+                        "mixed Bull Bitcoin evidence requires its local settlement id".into(),
+                    ));
+                };
+                if self.txid.is_none()
+                    || self.vout != Some(1)
+                    || self.boltz_swap_id.is_some()
+                    || self.address.is_some()
+                    || self.bull_bitcoin_credited_fiat_minor.is_some()
+                    || self.event_key != format!("bull_bitcoin_mixed_output:{settlement_id}")
+                {
+                    return Err(sqlx::Error::Protocol(
+                        "mixed Bull Bitcoin evidence must contain only its exact Liquid output"
                             .into(),
                     ));
                 }
@@ -2404,18 +2610,18 @@ fn resolve_invoice_presentation_status(
     }
 }
 
-fn compose_invoice_settlement_status(direct: &str, swap: &str) -> &'static str {
+fn compose_invoice_settlement_status(direct: &str, swap: &str, fiat: &str) -> &'static str {
     if swap == "claim_stuck" {
         "claim_stuck"
     } else if swap == "failed" {
         "failed"
     } else if swap == "refunded" {
         "refunded"
-    } else if direct == "resolution_pending" {
+    } else if direct == "resolution_pending" || matches!(fiat, "unavailable" | "integrity_error") {
         "resolution_pending"
-    } else if direct == "pending" || swap == "pending" {
+    } else if direct == "pending" || swap == "pending" || fiat == "pending" {
         "pending"
-    } else if direct == "settled" || swap == "settled" {
+    } else if direct == "settled" || swap == "settled" || fiat == "settled" {
         "settled"
     } else {
         "none"
@@ -2632,6 +2838,7 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         evidence.source,
         "lightning_boltz_reverse" | "bitcoin_boltz_chain"
     );
+    let is_bull_bitcoin_settlement = evidence.source == "bull_bitcoin_fiat";
 
     if is_direct_liquid_payment {
         let (boltz_settlement_exists,): (bool,) = sqlx::query_as(
@@ -2662,10 +2869,15 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         "INSERT INTO invoice_payment_events \
             (invoice_id, rail, source, event_key, amount_sat, txid, vout, \
              boltz_swap_id, address, accounting_state, verification_state, \
-             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at) \
+             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at, \
+             bull_bitcoin_settlement_id, fiat_credited_minor, fiat_credit_policy, \
+             fiat_valued_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
                  CASE WHEN $12::UUID IS NULL THEN NULL \
-                      ELSE to_timestamp($14::NUMERIC / 1000000) END) \
+                      ELSE to_timestamp($14::NUMERIC / 1000000) END, \
+                 $15, $16, CASE WHEN $16::BIGINT IS NULL THEN NULL \
+                                ELSE 'bull_bitcoin_actual_v1' END, \
+                 CASE WHEN $16::BIGINT IS NULL THEN NULL ELSE clock_timestamp() END) \
          ON CONFLICT (event_key) DO NOTHING \
          RETURNING id",
     )
@@ -2683,6 +2895,8 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(attribution.map(|(attribution, _)| attribution.quote_version_id))
     .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
     .bind(attribution.map(|(_, first_observed_at_unix_micros)| first_observed_at_unix_micros))
+    .bind(evidence.bull_bitcoin_settlement_id)
+    .bind(evidence.bull_bitcoin_credited_fiat_minor)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -2699,7 +2913,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
                AND boltz_swap_id IS NOT DISTINCT FROM $8::TEXT \
                AND address IS NOT DISTINCT FROM $9::TEXT \
                AND invoice_quote_version_id IS NOT DISTINCT FROM $10::UUID \
-               AND invoice_quote_offer_id IS NOT DISTINCT FROM $11::UUID",
+               AND invoice_quote_offer_id IS NOT DISTINCT FROM $11::UUID \
+               AND bull_bitcoin_settlement_id IS NOT DISTINCT FROM $12::UUID \
+               AND fiat_credited_minor IS NOT DISTINCT FROM $13::BIGINT",
         )
         .bind(id)
         .bind(evidence.event_key)
@@ -2712,6 +2928,8 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         .bind(evidence.address)
         .bind(attribution.map(|(attribution, _)| attribution.quote_version_id))
         .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
+        .bind(evidence.bull_bitcoin_settlement_id)
+        .bind(evidence.bull_bitcoin_credited_fiat_minor)
         .fetch_optional(&mut *tx)
         .await?;
         existing.ok_or_else(|| {
@@ -2904,8 +3122,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
-    let direct_settlement_status = if matches!(evidence.source, "bitcoin_direct" | "liquid_direct")
-    {
+    let direct_settlement_status = if is_bull_bitcoin_settlement {
+        inv.direct_settlement_status.as_str()
+    } else if matches!(evidence.source, "bitcoin_direct" | "liquid_direct") {
         payment_settlement_status
     } else if is_boltz_settlement && !direct_evidence_remains {
         "none"
@@ -2920,8 +3139,16 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     } else {
         inv.swap_settlement_status.as_str()
     };
-    let settlement_status =
-        compose_invoice_settlement_status(direct_settlement_status, swap_settlement_status);
+    let fiat_settlement_status = if is_bull_bitcoin_settlement {
+        "settled"
+    } else {
+        inv.fiat_settlement_status.as_str()
+    };
+    let settlement_status = compose_invoice_settlement_status(
+        direct_settlement_status,
+        swap_settlement_status,
+        fiat_settlement_status,
+    );
 
     sqlx::query(
         "UPDATE invoices SET \
@@ -2931,7 +3158,7 @@ async fn record_invoice_payment_with_optional_quote_attribution(
             paid_amount_sat = $5, \
             settlement_status = $6, \
             direct_settlement_status = $7, \
-            swap_settlement_status = $8, \
+            swap_settlement_status = $8, fiat_settlement_status = $10, \
             direct_payment_projection_version = direct_payment_projection_version + \
                 CASE WHEN $9 OR direct_settlement_status IS DISTINCT FROM $7 THEN 1 ELSE 0 END, \
             paid_at = CASE \
@@ -2951,6 +3178,7 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(direct_settlement_status)
     .bind(swap_settlement_status)
     .bind(superseded_direct_rows > 0)
+    .bind(fiat_settlement_status)
     .execute(&mut *tx)
     .await?;
 

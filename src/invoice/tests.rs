@@ -60,6 +60,50 @@ fn list_payload_field_order() {
 }
 
 #[test]
+fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
+    let invoice_id = Uuid::new_v4();
+    let order_id = Uuid::new_v4();
+    let rows = vec![
+        db::InvoiceBullBitcoinSettlementProjection {
+            invoice_id,
+            purpose: "fiat_only".into(),
+            bull_bitcoin_order_id: Some(order_id),
+            fiat_currency: "CAD".into(),
+            settlement_status: "pending".into(),
+            credited_fiat_minor: None,
+            funding_route: Some("bull_bitcoin".into()),
+            fallback_category: None,
+            merchant_bitcoin_sat: None,
+            merchant_bitcoin_settled: false,
+        },
+        db::InvoiceBullBitcoinSettlementProjection {
+            invoice_id,
+            purpose: "fiat_only".into(),
+            bull_bitcoin_order_id: None,
+            fiat_currency: "CAD".into(),
+            settlement_status: "none".into(),
+            credited_fiat_minor: None,
+            funding_route: Some("bitcoin_fallback".into()),
+            fallback_category: Some("ambiguous_create".into()),
+            merchant_bitcoin_sat: None,
+            merchant_bitcoin_settled: false,
+        },
+    ];
+    let mut projections = merchant_invoice_settlement_projections(rows);
+    let projection = projections.remove(&invoice_id).unwrap();
+    assert_eq!(
+        projection.fiat_only,
+        vec![MerchantFiatSettlementEntry {
+            amount_minor: None,
+            currency: "CAD".into(),
+            order_id,
+            status: "pending".into(),
+        }]
+    );
+    assert_eq!(projection.fallback_reasons, vec!["conversion_unavailable"]);
+}
+
+#[test]
 fn recovery_list_payload_field_order() {
     let f = recovery_list_payload_fields();
     assert_eq!(
@@ -185,7 +229,7 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
     wallet.accept_btc = true;
     wallet.bitcoin_address = Some("bc1qstable".to_string());
     assert_eq!(
-        payer_quote_rail_availability(&wallet).map(|rails| rails.bitcoin),
+        payer_quote_rail_availability(&wallet, None).map(|rails| rails.bitcoin),
         Some(true)
     );
 
@@ -200,7 +244,7 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
     checkout.bitcoin_address = None;
     checkout.liquid_address = Some("lq1merchant".to_string());
     assert_eq!(
-        payer_quote_rail_availability(&checkout).map(|rails| rails.bitcoin),
+        payer_quote_rail_availability(&checkout, None).map(|rails| rails.bitcoin),
         Some(true)
     );
 }
@@ -256,6 +300,7 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 2_500,
         fiat_display: None,
@@ -312,6 +357,7 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -386,6 +432,7 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -439,6 +486,7 @@ fn template_liquid_uri_pins_lbtc_asset() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -479,6 +527,7 @@ fn invoice_template_escapes_payment_js_literals() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -518,6 +567,7 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
         presentation_known: true,
         settlement_status: "none",
         rails_payable: true,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -743,6 +793,7 @@ fn payment_template_fixture(
         presentation_known: true,
         settlement_status,
         rails_payable,
+        payer_demand_required: false,
         amount_sat: 10_000,
         remaining_amount_sat: 2_500,
         fiat_display: None,
@@ -937,6 +988,7 @@ fn invoice_fixture() -> db::Invoice {
         presentation_status: Some("unpaid".to_string()),
         direct_settlement_status: "none".to_string(),
         swap_settlement_status: "none".to_string(),
+        fiat_settlement_status: "none".to_string(),
         direct_payment_projection_version: 0,
         liquid_blinding_key_hex: None,
         created_at_unix: 0,

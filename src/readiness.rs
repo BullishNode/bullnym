@@ -1190,7 +1190,6 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !private_invoice_storage_contract_present(pool).await?
         || !get_paid_history_contract_present(pool).await?
         || !bull_bitcoin_fiat_foundation_invariants_present(pool).await?
-        || !checkout_private_memo_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
@@ -1382,7 +1381,9 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_credentials'), \
                     ('fiat_settlement_settings'), \
                     ('invoice_fiat_settlement_policies'), \
-                    ('bull_bitcoin_settlements') \
+                    ('bull_bitcoin_settlements'), \
+                    ('swap_fiat_settlement_policies'), \
+                    ('bull_bitcoin_claim_outputs') \
                 ) required(table_name) \
                  WHERE to_regclass('public.' || required.table_name) IS NULL \
             ) \
@@ -1394,15 +1395,40 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND is_nullable = 'NO' \
                    AND column_default = '''none''::text' \
             ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'funding_committed_at' \
+                   AND data_type = 'timestamp with time zone' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'invoice_payment_events' \
+                   AND column_name = 'bull_bitcoin_settlement_id' \
+                   AND data_type = 'uuid' \
+            ) \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
                     ('bull_bitcoin_credentials', 'bull_bitcoin_credentials_material_shape_chk'), \
                     ('bull_bitcoin_credentials', 'bull_bitcoin_credentials_lifecycle_chk'), \
                     ('fiat_settlement_settings', 'fiat_settlement_settings_credential_owner_fkey'), \
                     ('invoice_fiat_settlement_policies', 'invoice_fiat_settlement_policies_credential_owner_fkey'), \
+                    ('invoice_fiat_settlement_policies', 'invoice_fiat_settlement_policies_invoice_owner_fkey'), \
+                    ('invoices', 'invoices_id_npub_owner_key'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk'), \
-                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_status_chk') \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_status_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_swap_binding_chk'), \
+                    ('swap_fiat_settlement_policies', 'swap_fiat_settlement_policies_source_chk'), \
+                    ('swap_fiat_settlement_policies', 'swap_fiat_settlement_policies_credential_owner_fkey'), \
+                    ('bull_bitcoin_claim_outputs', 'bull_bitcoin_claim_outputs_settlement_fkey'), \
+                    ('bull_bitcoin_claim_outputs', 'bull_bitcoin_claim_outputs_role_vout_chk'), \
+                    ('invoice_payment_events', 'invoice_payment_events_bull_bitcoin_shape_chk'), \
+                    ('invoice_payment_events', 'invoice_payment_events_bull_bitcoin_fkey') \
                 ) required(table_name, constraint_name) \
                  WHERE NOT EXISTS ( \
                     SELECT 1 FROM pg_constraint constraint_info \
@@ -1432,10 +1458,43 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             ) \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
+                    ('bull_bitcoin_settlements', \
+                     'bull_bitcoin_settlements_guard_funding_commitment'), \
+                    ('bull_bitcoin_settlements', \
+                     'bull_bitcoin_settlements_sync_invoice_status'), \
+                    ('bull_bitcoin_settlements', \
+                     'bull_bitcoin_settlements_guard_swap_binding'), \
+                    ('swap_fiat_settlement_policies', \
+                     'swap_fiat_settlement_policies_guard_insert'), \
+                    ('swap_fiat_settlement_policies', \
+                     'swap_fiat_settlement_policies_reject_mutation'), \
+                    ('bull_bitcoin_claim_outputs', \
+                     'bull_bitcoin_claim_outputs_guard_insert'), \
+                    ('bull_bitcoin_claim_outputs', \
+                     'bull_bitcoin_claim_outputs_reject_mutation'), \
+                    ('invoice_payment_events', \
+                     'invoice_payment_events_guard_bull_bitcoin'), \
+                    ('invoice_payment_events', \
+                     'invoice_payment_events_guard_mixed_reverse'), \
+                    ('invoices', 'zz_invoices_compose_settlement_components') \
+                ) required(table_name, trigger_name) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_trigger trigger_info \
+                     WHERE trigger_info.tgrelid = \
+                               to_regclass('public.' || required.table_name) \
+                       AND trigger_info.tgname = required.trigger_name \
+                       AND NOT trigger_info.tgisinternal \
+                       AND trigger_info.tgenabled = 'O' \
+                 ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
                     ('bull_bitcoin_credentials', TRUE, TRUE, TRUE, FALSE), \
                     ('fiat_settlement_settings', TRUE, TRUE, TRUE, TRUE), \
                     ('invoice_fiat_settlement_policies', TRUE, TRUE, FALSE, FALSE), \
-                    ('bull_bitcoin_settlements', TRUE, TRUE, TRUE, FALSE) \
+                    ('bull_bitcoin_settlements', TRUE, TRUE, TRUE, FALSE), \
+                    ('swap_fiat_settlement_policies', TRUE, TRUE, FALSE, FALSE), \
+                    ('bull_bitcoin_claim_outputs', TRUE, TRUE, FALSE, FALSE) \
                 ) required(table_name, can_select, can_insert, can_update, can_delete) \
                  WHERE has_table_privilege( \
                            current_user, 'public.' || required.table_name, 'SELECT' \
@@ -1458,7 +1517,9 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_credentials'), \
                     ('fiat_settlement_settings'), \
                     ('invoice_fiat_settlement_policies'), \
-                    ('bull_bitcoin_settlements') \
+                    ('bull_bitcoin_settlements'), \
+                    ('swap_fiat_settlement_policies'), \
+                    ('bull_bitcoin_claim_outputs') \
                 ) required(table_name) \
                  WHERE pg_get_userbyid( \
                            (SELECT relowner FROM pg_class \

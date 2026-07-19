@@ -476,6 +476,7 @@
             const ACCEPT_BTC = {{ accept_btc }};
             const ACCEPT_LN = {{ accept_ln }};
             const ACCEPT_LIQUID = {{ accept_liquid }};
+            const PAYER_DEMAND_REQUIRED = {{ payer_demand_required }};
             const INITIAL_LIGHTNING_PR = {{ lightning_pr_js|safe }};
             const INITIAL_LIGHTNING_AMOUNT_SAT = {% match lightning_amount_sat %}{% when Some with (amount) %}{{ amount }}{% when None %}null{% endmatch %};
             const INITIAL_BITCOIN_ADDRESS = {{ bitcoin_address_js|safe }};
@@ -561,6 +562,9 @@
                 ? INITIAL_LIQUID_ADDRESS
                 : null;
             let currentRailsPayable = {{ rails_payable }};
+            let currentPayerDemandAmountSat = null;
+            const payerDemandPending = new Set();
+            const payerInstructionExpiryByRail = new Map();
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
             let currentExpiresAtUnix = 0;
@@ -705,20 +709,43 @@
                 if (railBtc) railBtc.classList.toggle('active', rail === 'bitcoin');
                 if (railLiquid) railLiquid.classList.toggle('active', rail === 'liquid');
 
+                const instructionExpiry = payerInstructionExpiryByRail.get(rail);
+                if (
+                    PAYER_DEMAND_REQUIRED &&
+                    Number.isSafeInteger(instructionExpiry) &&
+                    instructionExpiry <= Math.floor(Date.now() / 1000)
+                ) {
+                    clearRailAmountInstruction();
+                    clearQr(`${railLabels(rail)} instruction expired`);
+                    return;
+                }
+
                 if (rail === 'lightning') {
                     if (currentLightningPr && renderLightningAmountInstruction()) {
                         setQrPayload(currentLightningPr);
                     } else if (currentRailsPayable) {
                         clearQr('Loading Lightning offer…');
-                        fetchLightning();
+                        if (PAYER_DEMAND_REQUIRED) {
+                            fetchPayerInstruction('lightning');
+                        } else {
+                            fetchLightning();
+                        }
                     } else {
                         clearQr('Payment in progress…');
                     }
                 } else if (rail === 'bitcoin') {
-                    renderBitcoinPayload();
+                    if (PAYER_DEMAND_REQUIRED && !activeBitcoinAddress() && currentRailsPayable) {
+                        clearQr('Loading Bitcoin instruction…');
+                        fetchPayerInstruction('bitcoin');
+                    } else {
+                        renderBitcoinPayload();
+                    }
                 } else {
                     if (currentLiquidAddress && renderLiquidAmountInstruction()) {
                         setQrPayload(liquidUri(currentLiquidAddress, currentLiquidAmountSat));
+                    } else if (PAYER_DEMAND_REQUIRED && currentRailsPayable) {
+                        clearQr('Loading Liquid instruction…');
+                        fetchPayerInstruction('liquid');
                     } else {
                         clearQr('Liquid address unavailable');
                     }
@@ -742,6 +769,25 @@
                 // Replace the complete nullable snapshot before any status
                 // branch can return. In particular, partial+pending must not
                 // retain a full-amount Lightning or Bitcoin chain offer.
+                if (PAYER_DEMAND_REQUIRED) {
+                    if (
+                        currentPayerDemandAmountSat !== null &&
+                        currentPayerDemandAmountSat !== currentAmountSat
+                    ) {
+                        currentLightningPr = null;
+                        currentLightningAmountSat = null;
+                        currentLiquidAddress = null;
+                        currentLiquidAmountSat = null;
+                        currentBitcoinDirectAddress = null;
+                        currentBitcoinChainAddress = null;
+                        currentBitcoinChainBip21 = null;
+                        currentBitcoinChainAmountSat = null;
+                        currentPayerDemandAmountSat = null;
+                        payerInstructionExpiryByRail.clear();
+                    }
+                    if (currentRailsPayable) setRail(currentRail);
+                    return;
+                }
                 const nextLightningAmountSat = Number.isSafeInteger(data.lightning_amount_sat) && data.lightning_amount_sat > 0
                     ? data.lightning_amount_sat
                     : null;
@@ -816,6 +862,95 @@
                 }
             }
 
+            function adoptPayerInstruction(rail, instruction, expiresAtUnix) {
+                const amountSat = Number.isSafeInteger(instruction?.payer_amount_sat) && instruction.payer_amount_sat > 0
+                    ? instruction.payer_amount_sat
+                    : null;
+                if (amountSat === null) throw new Error('invalid payer amount');
+                if (
+                    expiresAtUnix !== null &&
+                    (!Number.isSafeInteger(expiresAtUnix) || expiresAtUnix <= Math.floor(Date.now() / 1000))
+                ) {
+                    throw new Error('payer instruction expired');
+                }
+                if (rail === 'lightning') {
+                    if (!['lightning_direct', 'lightning_current', 'lightning_boltz_reverse'].includes(instruction.kind) || !instruction.pr) {
+                        throw new Error('invalid Lightning instruction');
+                    }
+                    currentLightningPr = instruction.pr;
+                    currentLightningAmountSat = amountSat;
+                } else if (rail === 'liquid') {
+                    if (instruction.kind !== 'liquid_direct' || !instruction.address) {
+                        throw new Error('invalid Liquid instruction');
+                    }
+                    currentLiquidAddress = instruction.address;
+                    currentLiquidAmountSat = amountSat;
+                } else {
+                    if (
+                        !['bitcoin_direct', 'bitcoin_boltz_chain', 'bitcoin_boltz_chain_current'].includes(instruction.kind) ||
+                        !instruction.address ||
+                        !instruction.bip21
+                    ) {
+                        throw new Error('invalid Bitcoin instruction');
+                    }
+                    if (instruction.kind === 'bitcoin_direct') {
+                        currentBitcoinDirectAddress = instruction.address;
+                        currentBitcoinChainAddress = null;
+                        currentBitcoinChainBip21 = null;
+                        currentBitcoinChainAmountSat = null;
+                    } else {
+                        currentBitcoinDirectAddress = null;
+                        currentBitcoinChainAddress = instruction.address;
+                        currentBitcoinChainBip21 = instruction.bip21;
+                        currentBitcoinChainAmountSat = amountSat;
+                    }
+                }
+                currentPayerDemandAmountSat = currentAmountSat;
+                if (expiresAtUnix !== null) {
+                    payerInstructionExpiryByRail.set(rail, expiresAtUnix);
+                } else {
+                    payerInstructionExpiryByRail.delete(rail);
+                }
+            }
+
+            async function fetchPayerInstruction(rail) {
+                if (!PAYER_DEMAND_REQUIRED || !currentRailsPayable || payerDemandPending.has(rail)) return;
+                payerDemandPending.add(rail);
+                try {
+                    const res = await fetch(`/api/v1/invoices/${INVOICE_ID}/quote`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ rail })
+                    });
+                    const data = await res.json();
+                    if (
+                        !res.ok ||
+                        data.status === 'ERROR' ||
+                        data.invoice_id !== INVOICE_ID ||
+                        data.selected_rail !== rail ||
+                        !data.instruction
+                    ) {
+                        throw new Error('payer instruction unavailable');
+                    }
+                    adoptPayerInstruction(
+                        rail,
+                        data.instruction,
+                        data.instruction_expires_at_unix ?? null
+                    );
+                    if (currentRail === rail) setRail(rail);
+                } catch (_) {
+                    if (currentRail === rail) clearQr(`${railLabels(rail)} instruction unavailable`);
+                } finally {
+                    payerDemandPending.delete(rail);
+                }
+            }
+
+            function railLabels(rail) {
+                if (rail === 'lightning') return 'Lightning';
+                if (rail === 'liquid') return 'Liquid';
+                return 'Bitcoin';
+            }
+
             if (railLightning) railLightning.addEventListener('click', () => setRail('lightning'));
             if (railLiquid) railLiquid.addEventListener('click', () => setRail('liquid'));
             if (railBtc) railBtc.addEventListener('click', () => setRail('bitcoin'));
@@ -853,10 +988,21 @@
             function refreshCountdown() {
                 if (TERMINAL_STATUSES.has(root.dataset.status)) return;
                 if (countdown && currentExpiresAtUnix > 0) {
+                    const instructionExpiry = payerInstructionExpiryByRail.get(currentRail);
+                    const displayExpiry = Number.isSafeInteger(instructionExpiry)
+                        ? Math.min(currentExpiresAtUnix, instructionExpiry)
+                        : currentExpiresAtUnix;
                     countdown.textContent = formatCountdown(
-                        currentExpiresAtUnix,
+                        displayExpiry,
                         'expires'
                     );
+                    if (
+                        PAYER_DEMAND_REQUIRED &&
+                        Number.isSafeInteger(instructionExpiry) &&
+                        instructionExpiry <= Math.floor(Date.now() / 1000)
+                    ) {
+                        setRail(currentRail);
+                    }
                 }
             }
 

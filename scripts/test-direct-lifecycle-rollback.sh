@@ -92,7 +92,7 @@ expect_allowed \
   068_future_bull_bitcoin_schema \
   0
 expect_refused \
-  065_private_invoice_presentations \
+  066_get_paid_transaction_history \
   067_bull_bitcoin_fiat_settlement \
   0
 expect_refused \

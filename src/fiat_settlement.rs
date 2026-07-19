@@ -175,7 +175,7 @@ pub async fn set(
                 })?;
             let id = Uuid::new_v4();
             let encrypted = CredentialCipher::new(key)
-                .encrypt(id, verified.npub(), &api_key)
+                .encrypt(id, verified.npub(), api_key)
                 .map_err(|_| {
                     AppError::DbError("Bull Bitcoin credential encryption failed".into())
                 })?;

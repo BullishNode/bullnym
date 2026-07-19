@@ -1265,8 +1265,9 @@ async fn run_settlement_repair_tick(
                 invoice_id = %invoice_id,
                 "re-recording missing invoice payment event for a claimed Lightning swap"
             );
-            let write_succeeded = crate::invoice::flip_invoice_on_lightning_settlement(
+            let write_succeeded = crate::invoice::record_reverse_claim_settlement(
                 &state.db,
+                swap.id,
                 Some(invoice_id),
                 swap.amount_sat,
                 &swap.boltz_swap_id,

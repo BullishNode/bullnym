@@ -35,6 +35,8 @@ fn signed_list_item_exposes_memo() {
         paid_via: None,
         paid_at_unix: None,
         paid_amount_sat: None,
+        settlement_details: None,
+        fiat_conversion: None,
     };
     let json = serde_json::to_value(&item).unwrap();
     let obj = json.as_object().unwrap();

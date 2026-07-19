@@ -6,13 +6,15 @@
 
 use sqlx::postgres::PgAdvisoryLock;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bull_bitcoin::{
-    BitcoinAmountSat, BitcoinNetwork, BullBitcoinError, CreateSellRequest, CredentialCipher,
-    FiatCurrency, PayerInstruction, Product, TERMS_VERSION,
+    BitcoinAmountSat, BitcoinNetwork, BullBitcoinError, CreateSellRequest, CreatedSellOrder,
+    CredentialCipher, FiatCurrency, PayerInstruction, Product, TERMS_VERSION,
 };
 use crate::config::BullBitcoinEncryptionKey;
 use crate::db::{
@@ -76,6 +78,64 @@ pub enum FiatOnlyInstructionOutcome {
     },
 }
 
+/// Claim-time decision for a captured 1-99% policy. The Bull Bitcoin address
+/// is deliberately available only while the claim is still unjournaled; once
+/// output evidence commits, retries use the immutable transaction and hashes.
+pub enum MixedSettlementPreparation {
+    BitcoinFallback {
+        settlement_id: Uuid,
+        category: FallbackCategory,
+    },
+    BullBitcoinOutput {
+        settlement_id: Uuid,
+        confidential_address: String,
+        bull_bitcoin_amount_sat: i64,
+        fiat_percentage: i16,
+    },
+    Journaled {
+        settlement_id: Uuid,
+        bull_bitcoin_amount_sat: i64,
+        fiat_percentage: i16,
+    },
+}
+
+/// Exact fee basis established from the same Liquid claim shape that will be
+/// constructed. The additional-output script length binds the estimate to the
+/// destination shape returned by Bull Bitcoin before an order can be funded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixedClaimBasis {
+    pub net_settlement_sat: i64,
+    pub additional_output_script_len: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MixedSwapSource {
+    Reverse(Uuid),
+    Chain(Uuid),
+}
+
+impl MixedSwapSource {
+    fn id(self) -> Uuid {
+        match self {
+            Self::Reverse(id) | Self::Chain(id) => id,
+        }
+    }
+
+    fn payer_rail(self) -> &'static str {
+        match self {
+            Self::Reverse(_) => "lightning",
+            Self::Chain(_) => "bitcoin",
+        }
+    }
+
+    fn request_key(self) -> String {
+        match self {
+            Self::Reverse(id) => format!("mixed-reverse:{id}"),
+            Self::Chain(id) => format!("mixed-chain:{id}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettlementServiceError {
     SourceIdentityUnavailable,
@@ -131,6 +191,77 @@ pub async fn create_fiat_only_instruction(
     result
 }
 
+/// Replay a previously reserved Lightning Address fiat-only intent without
+/// consulting the merchant's current setting. Settings govern new callbacks;
+/// once a payer-facing destination (or a durable all-Bitcoin fallback) exists,
+/// an exact callback retry must return that same decision and must never create
+/// a second payable instruction on a different rail.
+pub async fn replay_fiat_only_instruction(
+    state: &AppState,
+    owner_npub: &str,
+    request_key: &str,
+    product: Product,
+    network: BitcoinNetwork,
+    bitcoin_amount: BitcoinAmountSat,
+) -> Result<Option<FiatOnlyInstructionOutcome>, SettlementServiceError> {
+    let lock = PgAdvisoryLock::new(format!("bullnym-bull-bitcoin:{owner_npub}:{request_key}"));
+    let connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let mut guard = lock
+        .acquire(connection)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let existing =
+        db::load_bull_bitcoin_settlement_by_request_key(&mut guard, owner_npub, request_key)
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+    let result = if let Some(existing) = existing {
+        if existing.owner_npub != owner_npub
+            || existing.invoice_id.is_some()
+            || existing.reverse_swap_id.is_some()
+            || existing.chain_swap_id.is_some()
+            || existing.product != product.as_str()
+            || existing.purpose != "fiat_only"
+            || existing.payer_rail != network.as_str()
+            || existing.request_key != request_key
+            || existing.fiat_percentage != 100
+            || existing.requested_bitcoin_sat != bitcoin_amount.as_sat()
+        {
+            Err(SettlementServiceError::RequestKeyConflict)
+        } else {
+            match FiatCurrency::from_str(&existing.fiat_currency) {
+                Ok(currency) => {
+                    let persisted_request = FiatOnlyInstructionRequest {
+                        owner_npub,
+                        invoice_id: None,
+                        product,
+                        credential_id: existing.credential_id,
+                        request_key,
+                        fiat_currency: currency,
+                        network,
+                        bitcoin_amount,
+                        use_payjoin: false,
+                    };
+                    create_fiat_only_instruction_locked(state, &persisted_request, &mut guard)
+                        .await
+                        .map(Some)
+                }
+                Err(_) => Err(SettlementServiceError::StoredState),
+            }
+        }
+    } else {
+        Ok(None)
+    };
+    guard
+        .release_now()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    result
+}
+
 async fn create_fiat_only_instruction_locked(
     state: &AppState,
     request: &FiatOnlyInstructionRequest<'_>,
@@ -139,6 +270,8 @@ async fn create_fiat_only_instruction_locked(
     let reservation = NewBullBitcoinSettlement {
         owner_npub: request.owner_npub,
         invoice_id: request.invoice_id,
+        reverse_swap_id: None,
+        chain_swap_id: None,
         credential_id: request.credential_id,
         product: request.product.as_str(),
         purpose: "fiat_only",
@@ -299,6 +432,558 @@ async fn create_fiat_only_instruction_locked(
             })
         }
     }
+}
+
+pub async fn prepare_reverse_mixed_settlement(
+    state: &AppState,
+    reverse_swap_id: Uuid,
+    basis: MixedClaimBasis,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    prepare_mixed_settlement(
+        state,
+        MixedSwapSource::Reverse(reverse_swap_id),
+        Some(basis),
+    )
+    .await
+}
+
+pub async fn prepare_chain_mixed_settlement(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    basis: MixedClaimBasis,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    prepare_mixed_settlement(state, MixedSwapSource::Chain(chain_swap_id), Some(basis)).await
+}
+
+pub(crate) async fn prepare_reverse_mixed_settlement_on_locked_connection(
+    state: &AppState,
+    reverse_swap_id: Uuid,
+    basis: Option<MixedClaimBasis>,
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    prepare_mixed_settlement_locked(
+        state,
+        MixedSwapSource::Reverse(reverse_swap_id),
+        basis,
+        connection,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_chain_mixed_settlement_on_locked_connection(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    basis: Option<MixedClaimBasis>,
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    prepare_mixed_settlement_locked(
+        state,
+        MixedSwapSource::Chain(chain_swap_id),
+        basis,
+        connection,
+    )
+    .await
+}
+
+async fn prepare_mixed_settlement(
+    state: &AppState,
+    source: MixedSwapSource,
+    basis: Option<MixedClaimBasis>,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    // Interoperate with the existing `pg_try_advisory_xact_lock(hashtext())`
+    // claim guard. While provider I/O owns this session lock, webhook/sweep
+    // claim attempts skip rather than racing a second order reservation.
+    let lock_key = match source {
+        MixedSwapSource::Reverse(id) => format!("claim:{id}"),
+        MixedSwapSource::Chain(id) => format!("chain-claim:{id}"),
+    };
+    let mut connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let mut guard = MixedClaimSessionLock::new(connection, lock_key);
+    let result = prepare_mixed_settlement_locked(state, source, basis, &mut guard).await;
+    guard.unlock().await?;
+    result
+}
+
+/// Own the backend session carrying a `hashtext()` claim lock. Cancellation or
+/// an early error closes that session instead of returning a still-locked
+/// connection to the pool.
+struct MixedClaimSessionLock {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_key: String,
+    locked: bool,
+}
+
+impl MixedClaimSessionLock {
+    fn new(connection: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_key: String) -> Self {
+        Self {
+            connection,
+            lock_key,
+            locked: true,
+        }
+    }
+
+    async fn unlock(&mut self) -> Result<(), SettlementServiceError> {
+        let lock_key = self.lock_key.clone();
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+            .bind(lock_key)
+            .fetch_one(&mut **self)
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+        if !released {
+            return Err(SettlementServiceError::Database);
+        }
+        self.locked = false;
+        Ok(())
+    }
+}
+
+impl Deref for MixedClaimSessionLock {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for MixedClaimSessionLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for MixedClaimSessionLock {
+    fn drop(&mut self) {
+        if self.locked {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn prepare_mixed_settlement_locked(
+    state: &AppState,
+    source: MixedSwapSource,
+    basis: Option<MixedClaimBasis>,
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<MixedSettlementPreparation>, SettlementServiceError> {
+    let policy = match source {
+        MixedSwapSource::Reverse(id) => {
+            db::reverse_swap_fiat_settlement_policy(connection, id).await
+        }
+        MixedSwapSource::Chain(id) => db::chain_swap_fiat_settlement_policy(connection, id).await,
+    }
+    .map_err(|_| SettlementServiceError::Database)?;
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.reverse_swap_id
+        != matches!(source, MixedSwapSource::Reverse(_)).then_some(source.id())
+        || policy.chain_swap_id
+            != matches!(source, MixedSwapSource::Chain(_)).then_some(source.id())
+        || !(1..=99).contains(&policy.fiat_percentage)
+    {
+        return Err(SettlementServiceError::StoredState);
+    }
+
+    let request_key = source.request_key();
+    let product =
+        Product::from_str(&policy.product).map_err(|_| SettlementServiceError::StoredState)?;
+    let currency = FiatCurrency::from_str(&policy.fiat_currency)
+        .map_err(|_| SettlementServiceError::StoredState)?;
+    let existing = db::load_bull_bitcoin_settlement_by_request_key(
+        connection,
+        &policy.owner_npub,
+        &request_key,
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)?;
+    if let Some(stored) = existing.as_ref() {
+        if !mixed_reservation_matches_policy(stored, &policy, source, &request_key) {
+            return Err(SettlementServiceError::StoredState);
+        }
+        match (
+            stored.provider_state.as_str(),
+            stored.funding_route.as_deref(),
+            stored.funding_committed_at_unix,
+        ) {
+            ("bound", Some("bull_bitcoin"), Some(_))
+            | ("bound", Some("bitcoin_fallback"), None)
+            | ("abandoned", Some("bitcoin_fallback"), None) => {
+                return mixed_stored_outcome(stored).map(Some);
+            }
+            ("dispatch_started", None, None) => {
+                db::abandon_bull_bitcoin_dispatch(
+                    connection,
+                    stored.id,
+                    FallbackCategory::AmbiguousCreate.as_str(),
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+                let stored = db::load_bull_bitcoin_settlement(connection, stored.id)
+                    .await
+                    .map_err(|_| SettlementServiceError::Database)?;
+                return mixed_stored_outcome(&stored).map(Some);
+            }
+            _ => {}
+        }
+    }
+
+    let basis = basis.ok_or(SettlementServiceError::StoredState)?;
+    if basis.net_settlement_sat <= 0
+        || basis.additional_output_script_len == 0
+        || basis.additional_output_script_len > 10_000
+    {
+        return Err(SettlementServiceError::StoredState);
+    }
+    let numerator = basis
+        .net_settlement_sat
+        .checked_mul(i64::from(policy.fiat_percentage))
+        .ok_or(SettlementServiceError::StoredState)?;
+    // A positive one-satoshi target lets Bull Bitcoin's authoritative minimum
+    // policy produce the ordinary all-Bitcoin fallback for tiny splits.
+    let rounded_bull_bitcoin_amount_sat = numerator / 100;
+    let split_rounds_to_zero = rounded_bull_bitcoin_amount_sat == 0;
+    let bull_bitcoin_amount_sat = rounded_bull_bitcoin_amount_sat.max(1);
+    let merchant_amount_sat = basis
+        .net_settlement_sat
+        .checked_sub(bull_bitcoin_amount_sat)
+        .ok_or(SettlementServiceError::StoredState)?;
+    let amount = BitcoinAmountSat::new(bull_bitcoin_amount_sat)
+        .map_err(|_| SettlementServiceError::StoredState)?;
+    let reservation = NewBullBitcoinSettlement {
+        owner_npub: &policy.owner_npub,
+        invoice_id: policy.invoice_id,
+        reverse_swap_id: policy.reverse_swap_id,
+        chain_swap_id: policy.chain_swap_id,
+        credential_id: policy.credential_id,
+        product: product.as_str(),
+        purpose: "mixed",
+        payer_rail: source.payer_rail(),
+        request_key: &request_key,
+        fiat_percentage: policy.fiat_percentage,
+        fiat_currency: currency.as_str(),
+        terms_version: &policy.terms_version,
+        requested_bitcoin_sat: bull_bitcoin_amount_sat,
+    };
+    let mut stored = if let Some(existing) = existing {
+        let address_shape_changed = existing.provider_state == "bound"
+            && existing.funding_route.is_none()
+            && existing
+                .payer_instruction
+                .as_deref()
+                .and_then(liquid_script_pubkey_len)
+                != Some(basis.additional_output_script_len);
+        if existing.requested_bitcoin_sat != bull_bitcoin_amount_sat || address_shape_changed {
+            route_unfunded_mixed_to_invalid_split(connection, &existing).await?;
+            let stored = db::load_bull_bitcoin_settlement(connection, existing.id)
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            return mixed_stored_outcome(&stored).map(Some);
+        }
+        existing
+    } else {
+        db::reserve_bull_bitcoin_settlement(connection, &reservation)
+            .await
+            .map_err(map_store_error)?
+    };
+
+    if merchant_amount_sat <= 0 || split_rounds_to_zero {
+        match stored.provider_state.as_str() {
+            "reserved" | "dispatch_started" => {
+                db::abandon_bull_bitcoin_dispatch(
+                    connection,
+                    stored.id,
+                    FallbackCategory::InvalidSplit.as_str(),
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            }
+            "bound" if stored.funding_route.is_none() => {
+                db::route_unfunded_mixed_settlement_to_fallback(
+                    connection,
+                    stored.id,
+                    FallbackCategory::InvalidSplit.as_str(),
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            }
+            _ => {}
+        }
+        return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+            settlement_id: stored.id,
+            category: FallbackCategory::InvalidSplit,
+        }));
+    }
+
+    match stored.provider_state.as_str() {
+        "bound" | "abandoned" => return mixed_stored_outcome(&stored).map(Some),
+        "dispatch_started" => return Err(SettlementServiceError::StoredState),
+        "reserved" => {}
+        _ => return Err(SettlementServiceError::StoredState),
+    }
+
+    if !db::begin_bull_bitcoin_dispatch(connection, stored.id)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?
+    {
+        stored = db::load_bull_bitcoin_settlement(connection, stored.id)
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+        return mixed_stored_outcome(&stored).map(Some);
+    }
+
+    let credential = db::load_bull_bitcoin_credential(connection, stored.credential_id)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let Some(credential) = credential else {
+        db::abandon_bull_bitcoin_dispatch(
+            connection,
+            stored.id,
+            FallbackCategory::ConversionUnavailable.as_str(),
+        )
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+        return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+            settlement_id: stored.id,
+            category: FallbackCategory::ConversionUnavailable,
+        }));
+    };
+    if credential.owner_npub != policy.owner_npub {
+        return Err(SettlementServiceError::StoredState);
+    }
+    let Some(encryption_key) = state.config.bull_bitcoin_credential_encryption_key.clone() else {
+        db::abandon_bull_bitcoin_dispatch(
+            connection,
+            stored.id,
+            FallbackCategory::ConversionUnavailable.as_str(),
+        )
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+        return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+            settlement_id: stored.id,
+            category: FallbackCategory::ConversionUnavailable,
+        }));
+    };
+    let scoped_key = match decrypt_credential(encryption_key, &credential) {
+        Ok(key) => key,
+        Err(_) => {
+            db::abandon_bull_bitcoin_dispatch(
+                connection,
+                stored.id,
+                FallbackCategory::ConversionUnavailable.as_str(),
+            )
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+            return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+                settlement_id: stored.id,
+                category: FallbackCategory::ConversionUnavailable,
+            }));
+        }
+    };
+    let provider_result = state
+        .bull_bitcoin
+        .create_sell_to_balance(
+            &scoped_key,
+            &CreateSellRequest {
+                currency,
+                network: BitcoinNetwork::Liquid,
+                bitcoin_amount: amount,
+                use_payjoin: false,
+            },
+        )
+        .await;
+    drop(scoped_key);
+
+    match provider_result {
+        Ok(CreatedSellOrder {
+            order_id,
+            currency: order_currency,
+            network: BitcoinNetwork::Liquid,
+            requested_bitcoin,
+            instruction:
+                PayerInstruction::Liquid {
+                    confidential_address,
+                },
+            expires_at_unix,
+        }) if order_currency == currency && requested_bitcoin == amount => {
+            if liquid_script_pubkey_len(&confidential_address)
+                != Some(basis.additional_output_script_len)
+            {
+                db::abandon_bull_bitcoin_dispatch(
+                    connection,
+                    stored.id,
+                    FallbackCategory::InvalidSplit.as_str(),
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+                return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+                    settlement_id: stored.id,
+                    category: FallbackCategory::InvalidSplit,
+                }));
+            }
+            let retention_secs =
+                i64::try_from(state.config.bull_bitcoin.late_payment_retention_secs)
+                    .map_err(|_| SettlementServiceError::StoredState)?;
+            let bound = db::bind_bull_bitcoin_order(
+                connection,
+                stored.id,
+                order_id,
+                "liquid",
+                &confidential_address,
+                expires_at_unix,
+                retention_secs,
+            )
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+            if !bound {
+                return Err(SettlementServiceError::StoredState);
+            }
+            Ok(Some(MixedSettlementPreparation::BullBitcoinOutput {
+                settlement_id: stored.id,
+                confidential_address,
+                bull_bitcoin_amount_sat,
+                fiat_percentage: policy.fiat_percentage,
+            }))
+        }
+        Ok(_) => {
+            db::abandon_bull_bitcoin_dispatch(
+                connection,
+                stored.id,
+                FallbackCategory::AmbiguousCreate.as_str(),
+            )
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+            Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+                settlement_id: stored.id,
+                category: FallbackCategory::AmbiguousCreate,
+            }))
+        }
+        Err(error) => {
+            let category = fallback_for_create_error(error);
+            db::abandon_bull_bitcoin_dispatch(connection, stored.id, category.as_str())
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            if error == BullBitcoinError::Authentication {
+                db::invalidate_bull_bitcoin_credential_on_connection(
+                    connection,
+                    stored.credential_id,
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            }
+            Ok(Some(MixedSettlementPreparation::BitcoinFallback {
+                settlement_id: stored.id,
+                category,
+            }))
+        }
+    }
+}
+
+fn mixed_stored_outcome(
+    stored: &StoredBullBitcoinSettlement,
+) -> Result<MixedSettlementPreparation, SettlementServiceError> {
+    match (
+        stored.provider_state.as_str(),
+        stored.funding_route.as_deref(),
+        stored.funding_committed_at_unix,
+    ) {
+        ("bound", None, None) => {
+            let address = stored
+                .payer_instruction
+                .as_ref()
+                .filter(|_| stored.instruction_kind.as_deref() == Some("liquid"))
+                .ok_or(SettlementServiceError::StoredState)?;
+            Ok(MixedSettlementPreparation::BullBitcoinOutput {
+                settlement_id: stored.id,
+                confidential_address: address.clone(),
+                bull_bitcoin_amount_sat: stored.requested_bitcoin_sat,
+                fiat_percentage: stored.fiat_percentage,
+            })
+        }
+        ("bound", Some("bull_bitcoin"), Some(_)) => Ok(MixedSettlementPreparation::Journaled {
+            settlement_id: stored.id,
+            bull_bitcoin_amount_sat: stored.requested_bitcoin_sat,
+            fiat_percentage: stored.fiat_percentage,
+        }),
+        ("abandoned", Some("bitcoin_fallback"), None)
+        | ("bound", Some("bitcoin_fallback"), None) => {
+            Ok(MixedSettlementPreparation::BitcoinFallback {
+                settlement_id: stored.id,
+                category: FallbackCategory::parse(
+                    stored
+                        .fallback_category
+                        .as_deref()
+                        .ok_or(SettlementServiceError::StoredState)?,
+                )?,
+            })
+        }
+        _ => Err(SettlementServiceError::StoredState),
+    }
+}
+
+fn mixed_reservation_matches_policy(
+    stored: &StoredBullBitcoinSettlement,
+    policy: &db::SwapFiatSettlementPolicy,
+    source: MixedSwapSource,
+    request_key: &str,
+) -> bool {
+    stored.owner_npub == policy.owner_npub
+        && stored.invoice_id == policy.invoice_id
+        && stored.reverse_swap_id == policy.reverse_swap_id
+        && stored.chain_swap_id == policy.chain_swap_id
+        && stored.credential_id == policy.credential_id
+        && stored.product == policy.product
+        && stored.purpose == "mixed"
+        && stored.payer_rail == source.payer_rail()
+        && stored.request_key == request_key
+        && stored.fiat_percentage == policy.fiat_percentage
+        && stored.fiat_currency == policy.fiat_currency
+        && stored.terms_version == policy.terms_version
+}
+
+async fn route_unfunded_mixed_to_invalid_split(
+    connection: &mut sqlx::PgConnection,
+    stored: &StoredBullBitcoinSettlement,
+) -> Result<(), SettlementServiceError> {
+    match stored.provider_state.as_str() {
+        "reserved" | "dispatch_started" => db::abandon_bull_bitcoin_dispatch(
+            connection,
+            stored.id,
+            FallbackCategory::InvalidSplit.as_str(),
+        )
+        .await
+        .map_err(|_| SettlementServiceError::Database),
+        "bound" if stored.funding_route.is_none() && stored.funding_committed_at_unix.is_none() => {
+            let routed = db::route_unfunded_mixed_settlement_to_fallback(
+                connection,
+                stored.id,
+                FallbackCategory::InvalidSplit.as_str(),
+            )
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+            if routed {
+                Ok(())
+            } else {
+                Err(SettlementServiceError::StoredState)
+            }
+        }
+        _ => Err(SettlementServiceError::StoredState),
+    }
+}
+
+fn liquid_script_pubkey_len(address: &str) -> Option<usize> {
+    let address = boltz_client::elements::Address::from_str(address).ok()?;
+    (address.params == &boltz_client::elements::AddressParams::LIQUID
+        && address.blinding_pubkey.is_some())
+    .then(|| address.script_pubkey().len())
 }
 
 async fn abandon_and_return(
@@ -466,8 +1151,20 @@ async fn reconcile_once(
             .await
             .map_err(|_| SettlementServiceError::Database)?;
     let selected = settlements.len();
+    let mut first_row_error = None;
     for settlement in settlements {
-        reconcile_settlement(state, settlement).await?;
+        let settlement_id = settlement.id;
+        if let Err(error) = reconcile_settlement(state, settlement).await {
+            if error == SettlementServiceError::Database {
+                return Err(error);
+            }
+            tracing::error!(
+                %settlement_id,
+                error = %error,
+                "Bull Bitcoin settlement reconciliation row failed closed"
+            );
+            first_row_error.get_or_insert(error);
+        }
     }
     let erased = db::finalize_drained_bull_bitcoin_credentials(&state.db)
         .await
@@ -481,7 +1178,7 @@ async fn reconcile_once(
             "Bull Bitcoin settlement reconciliation progress"
         );
     }
-    Ok(())
+    first_row_error.map_or(Ok(()), Err)
 }
 
 /// Run one bounded maintenance pass. The server normally uses
@@ -502,6 +1199,12 @@ async fn reconcile_settlement(
     state: &AppState,
     settlement: StoredBullBitcoinSettlement,
 ) -> Result<(), SettlementServiceError> {
+    // A crash may commit provider finality before the idempotent invoice event.
+    // The reconciliation selector includes exactly those rows, so repair uses
+    // the already-normalized local values without another provider read.
+    if settlement.settlement_status == "settled" {
+        return record_final_invoice_payment(state, &settlement).await;
+    }
     let order_id = settlement
         .bull_bitcoin_order_id
         .ok_or(SettlementServiceError::StoredState)?;
@@ -573,6 +1276,19 @@ async fn reconcile_settlement(
                 )
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
+                if observation.provider_final {
+                    let mut connection = state
+                        .db
+                        .acquire()
+                        .await
+                        .map_err(|_| SettlementServiceError::Database)?;
+                    let finalized =
+                        db::load_bull_bitcoin_settlement(&mut connection, settlement.id)
+                            .await
+                            .map_err(|_| SettlementServiceError::Database)?;
+                    drop(connection);
+                    record_final_invoice_payment(state, &finalized).await?;
+                }
             }
         }
         Err(BullBitcoinError::Authentication) => {
@@ -605,6 +1321,58 @@ async fn reconcile_settlement(
                 .map_err(|_| SettlementServiceError::Database)?;
         }
     }
+    Ok(())
+}
+
+async fn record_final_invoice_payment(
+    state: &AppState,
+    settlement: &StoredBullBitcoinSettlement,
+) -> Result<(), SettlementServiceError> {
+    if !settlement.provider_final
+        || settlement.settlement_status != "settled"
+        || settlement.funding_route.as_deref() != Some("bull_bitcoin")
+        || settlement.funding_committed_at_unix.is_none()
+    {
+        return Err(SettlementServiceError::StoredState);
+    }
+    let Some(invoice_id) = settlement.invoice_id else {
+        // Lightning Address settlement accounting has no invoice projection.
+        return Ok(());
+    };
+    if settlement.purpose == "mixed" {
+        // The Bitcoin amount was already recorded from immutable vout=1 claim
+        // evidence. Provider finality supplies only the exact fiat projection;
+        // inserting another satoshi event here would double-count the payment.
+        return Ok(());
+    }
+    let amount_sat = settlement
+        .actual_received_sat
+        .filter(|amount| *amount > 0)
+        .ok_or(SettlementServiceError::StoredState)?;
+    let credited_fiat_minor = settlement
+        .credited_fiat_minor
+        .filter(|amount| *amount > 0)
+        .ok_or(SettlementServiceError::StoredState)?;
+    let event_key = format!("bull_bitcoin_fiat:{}", settlement.id);
+    db::record_invoice_payment(
+        &state.db,
+        invoice_id,
+        db::InvoicePaymentEvidence {
+            rail: &settlement.payer_rail,
+            source: "bull_bitcoin_fiat",
+            event_key: &event_key,
+            amount_sat,
+            txid: None,
+            vout: None,
+            boltz_swap_id: None,
+            address: None,
+            bull_bitcoin_settlement_id: Some(settlement.id),
+            bull_bitcoin_credited_fiat_minor: Some(credited_fiat_minor),
+        },
+        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)?;
     Ok(())
 }
 

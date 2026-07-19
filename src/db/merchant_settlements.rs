@@ -1112,6 +1112,7 @@ pub async fn persist_merchant_settlement_outcome(
     }
     let checkpoint_version = next_checkpoint_version(expected_checkpoint_version)?;
     apply_commands(&mut tx, snapshot, outcome).await?;
+    sync_mixed_bull_bitcoin_event(&mut tx, snapshot).await?;
     persist_retained(&mut tx, snapshot).await?;
     let rows = match checkpoint_write {
         CheckpointWriteKind::InsertInitial => sqlx::query(
@@ -1176,6 +1177,122 @@ pub async fn persist_merchant_settlement_outcome(
         parent_transition,
         journal_rebroadcast_required,
     })
+}
+
+/// Mirror the exact Bull Bitcoin output into invoice accounting only while the
+/// corresponding chain-claim merchant output is authoritative. The provider
+/// fiat amount remains exclusively on the private settlement projection.
+async fn sync_mixed_bull_bitcoin_event(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &MerchantSettlementAdoptionSnapshot,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    if snapshot.context.path() != MerchantSettlementPath::LiquidClaim {
+        return Ok(());
+    }
+    let row: Option<(Uuid, Uuid, String, i16, i64)> = sqlx::query_as(
+        "SELECT settlement.id, settlement.invoice_id, output.txid, output.vout, \
+                output.authorized_amount_sat \
+           FROM bull_bitcoin_settlements settlement \
+           JOIN bull_bitcoin_claim_outputs output \
+             ON output.settlement_id = settlement.id \
+            AND output.role = 'bull_bitcoin' \
+          WHERE settlement.chain_swap_id = $1 \
+            AND settlement.purpose = 'mixed' \
+            AND settlement.provider_state = 'bound' \
+            AND settlement.funding_route = 'bull_bitcoin' \
+            AND settlement.funding_committed_at IS NOT NULL",
+    )
+    .bind(snapshot.context.chain_swap_id())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((settlement_id, invoice_id, txid, vout, amount_sat)) = row else {
+        return Ok(());
+    };
+    if invoice_id != snapshot.context.invoice_id()
+        || txid != snapshot.lifecycle.active_txid.as_str()
+        || vout != 1
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+
+    let should_be_active = matches!(
+        snapshot.lifecycle.accounting,
+        SettlementAccountingState::Confirmed | SettlementAccountingState::Finalized
+    );
+    let event_key = format!("bull_bitcoin_mixed_output:{settlement_id}");
+    if should_be_active {
+        sqlx::query(
+            "INSERT INTO invoice_payment_events ( \
+                 invoice_id, rail, source, event_key, amount_sat, txid, vout, \
+                 boltz_swap_id, address, accounting_state, verification_state, \
+                 bull_bitcoin_settlement_id, last_activated_at \
+             ) VALUES ($1,'liquid','bull_bitcoin_mixed_output',$2,$3,$4,$5, \
+                       NULL,NULL,'active','not_applicable',$6,NOW()) \
+             ON CONFLICT (event_key) DO NOTHING",
+        )
+        .bind(invoice_id)
+        .bind(&event_key)
+        .bind(amount_sat)
+        .bind(&txid)
+        .bind(i32::from(vout))
+        .bind(settlement_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let current_state: Option<String> = sqlx::query_scalar(
+        "SELECT accounting_state FROM invoice_payment_events \
+          WHERE event_key = $1 AND invoice_id = $2 \
+            AND rail = 'liquid' AND source = 'bull_bitcoin_mixed_output' \
+            AND amount_sat = $3 AND txid = $4 AND vout = $5 \
+            AND boltz_swap_id IS NULL AND address IS NULL \
+            AND bull_bitcoin_settlement_id = $6 \
+            AND fiat_credited_minor IS NULL \
+          FOR UPDATE",
+    )
+    .bind(&event_key)
+    .bind(invoice_id)
+    .bind(amount_sat)
+    .bind(&txid)
+    .bind(i32::from(vout))
+    .bind(settlement_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(current_state) = current_state else {
+        if should_be_active {
+            return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+        }
+        return Ok(());
+    };
+    let desired_state = if should_be_active {
+        "active"
+    } else {
+        "inactive"
+    };
+    if current_state == desired_state {
+        return Ok(());
+    }
+    if !matches!(current_state.as_str(), "active" | "inactive") {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    let rows = sqlx::query(
+        "UPDATE invoice_payment_events SET accounting_state = $2, \
+             last_activated_at = CASE WHEN $2 = 'active' THEN NOW() ELSE last_activated_at END, \
+             deactivated_at = CASE WHEN $2 = 'inactive' THEN NOW() ELSE NULL END, \
+             deactivation_reason = CASE WHEN $2 = 'inactive' THEN 'reorged' ELSE NULL END, \
+             state_version = state_version + 1 \
+          WHERE event_key = $1 AND accounting_state = $3",
+    )
+    .bind(&event_key)
+    .bind(desired_state)
+    .bind(&current_state)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
 }
 
 async fn transition_attempt_locked(
