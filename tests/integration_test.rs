@@ -24377,12 +24377,13 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
         let object = body.as_object().expect("registration lookup object");
         assert_eq!(
             object.len(),
-            5,
+            6,
             "unexpected registration lookup fields: {body}"
         );
         for field in [
             "nym",
             "lightning_address_online",
+            "lightning_address",
             "alias",
             "public_name_policy",
             "quota",
@@ -24406,6 +24407,10 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
     assert_eq!(online_status, StatusCode::OK);
     assert_lookup_shape(&online_without_alias);
     assert_eq!(online_without_alias["nym"], "lookup-contract");
+    assert_eq!(
+        online_without_alias["lightning_address"],
+        "lookup-contract@test.example.com"
+    );
     assert_eq!(online_without_alias["lightning_address_online"], true);
     assert_eq!(online_without_alias["alias"], Value::Null);
     assert_eq!(
@@ -24430,6 +24435,10 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
     assert_eq!(aliased_status, StatusCode::OK);
     assert_lookup_shape(&online_with_alias);
     assert_eq!(online_with_alias["nym"], "lookup-contract");
+    assert_eq!(
+        online_with_alias["lightning_address"],
+        "lookup-contract@test.example.com"
+    );
     assert_eq!(online_with_alias["alias"], "lookup-shop");
     assert_eq!(online_with_alias["lightning_address_online"], true);
     assert_eq!(
@@ -24446,6 +24455,10 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
     assert_eq!(offline_status, StatusCode::OK);
     assert_lookup_shape(&offline_with_alias);
     assert_eq!(offline_with_alias["nym"], "lookup-contract");
+    assert_eq!(
+        offline_with_alias["lightning_address"],
+        "lookup-contract@test.example.com"
+    );
     assert_eq!(offline_with_alias["alias"], "lookup-shop");
     assert_eq!(offline_with_alias["lightning_address_online"], false);
     assert_eq!(
