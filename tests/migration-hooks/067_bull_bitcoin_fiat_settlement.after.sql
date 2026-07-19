@@ -90,7 +90,7 @@ BEGIN
         requested_bitcoin_sat
     ) VALUES (
         settlement_id, owner_npub, credential_id, 'lightning_address',
-        'fiat_only', 'bitcoin', 'migration-066-fixture', 100, 'CAD',
+        'fiat_only', 'bitcoin', 'migration-067-fixture', 100, 'CAD',
         'bull-bitcoin-fiat-settlement-v1', 10000
     );
     UPDATE bull_bitcoin_settlements

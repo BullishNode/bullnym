@@ -76,8 +76,8 @@ use pay_service::swap_manifest_store::{
     S3ManifestStoreConfig,
 };
 use pay_service::{
-    certification, claimer, donation_page, donation_render, get_paid_transaction_history, invoice,
-    fiat_settlement, lnurl, lnurl_comment_history, nostr, readiness,
+    certification, claimer, donation_page, donation_render, fiat_settlement,
+    get_paid_transaction_history, invoice, lnurl, lnurl_comment_history, nostr, readiness,
     recovery_address_registration, registration, AppState,
 };
 

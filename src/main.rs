@@ -25,8 +25,7 @@ use pay_service::{
     derivation_guard, donation_page, donation_render, fee_runtime, fiat_settlement, gc,
     get_paid_transaction_history, invoice, ip_whitelist, lnurl, lnurl_comment_history, nostr,
     og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
-    registration, startup_provider_reconciliation,
-    swap_manifest_runtime,
+    registration, startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, wallet_backup, AppState,
 };

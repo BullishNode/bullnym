@@ -776,8 +776,8 @@ without pretending to own Bull Bitcoin's blinding key.
 
 ### 13.2 Bullnym PostgreSQL integration tests
 
-- migrations 065/066/067 constraints, runtime grants, readiness marker, and
-  additive upgrade from schema 064;
+- migrations 067/068/069 constraints, runtime grants, readiness marker, and
+  additive upgrade from schema 066;
 - concurrent create requests commit one usable order;
 - crash-boundary simulations before dispatch, after dispatch, after provider
   response, after binding, and after claim-journal commit;
@@ -843,7 +843,7 @@ After local review and all deterministic tests pass:
    `bullnym-tests` VM remains a harness/report host and, per the repository
    runbook, does not run Bullnym or reuse production secrets. If no separate
    staging application host exists, provisioning it is a hard deployment gate;
-2. back up PostgreSQL, install schemas 066 through 068 with a distinct
+2. back up PostgreSQL, install schemas 067 through 069 with a distinct
    privileged owner, install a fresh staging-only encryption secret, and keep
    new fiat admission disabled;
 3. verify `/health`, `/ready`, `/version`, worker startup, binary digest, schema

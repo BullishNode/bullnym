@@ -105,7 +105,7 @@ BEGIN
         derivation_scheme_version, claim_public_key_hex, preimage_hash_hex
     ) VALUES (
         '67000000-0000-4000-8000-000000000001', NULL,
-        'migration-068-mixed-reverse', 10000, 'lnbc-migration-068',
+        'migration-069-mixed-reverse', 10000, 'lnbc-migration-069',
         repeat('69', 32), repeat('6a', 32), '{}',
         '66000000-0000-4000-8000-000000000005',
         670000, repeat('67', 8), allocation_id, 1, 1,
@@ -139,7 +139,7 @@ BEGIN
         '66000000-0000-4000-8000-000000000005',
         '67000000-0000-4000-8000-000000000001',
         '66000000-0000-4000-8000-000000000001',
-        'invoice', 'mixed', 'lightning', 'migration-068-mixed-order',
+        'invoice', 'mixed', 'lightning', 'migration-069-mixed-order',
         40, 'CAD', 'bull-bitcoin-fiat-settlement-v1', 4000
     );
     UPDATE bull_bitcoin_settlements
@@ -257,8 +257,8 @@ BEGIN
         ) VALUES (
             '66000000-0000-4000-8000-000000000005', 'lightning',
             'lightning_boltz_reverse',
-            'lightning_boltz_reverse:migration-068-mixed-reverse',
-            10000, claim_txid, 'migration-068-mixed-reverse',
+            'lightning_boltz_reverse:migration-069-mixed-reverse',
+            10000, claim_txid, 'migration-069-mixed-reverse',
             'active', 'not_applicable'
         );
         RAISE EXCEPTION 'migration 069 accepted gross mixed merchant accounting';
@@ -276,8 +276,8 @@ INSERT INTO invoice_payment_events (
 ) VALUES (
     '66000000-0000-4000-8000-000000000005', 'lightning',
     'lightning_boltz_reverse',
-    'lightning_boltz_reverse:migration-068-mixed-reverse',
-    6000, repeat('68', 32), 'migration-068-mixed-reverse',
+    'lightning_boltz_reverse:migration-069-mixed-reverse',
+    6000, repeat('68', 32), 'migration-069-mixed-reverse',
     'active', 'not_applicable'
 );
 INSERT INTO invoice_payment_events (
@@ -296,12 +296,12 @@ DO $$
 BEGIN
     IF (SELECT COUNT(*) FROM invoice_payment_events
          WHERE event_key IN (
-             'lightning_boltz_reverse:migration-068-mixed-reverse',
+             'lightning_boltz_reverse:migration-069-mixed-reverse',
              'bull_bitcoin_mixed_output:67000000-0000-4000-8000-000000000003'
          )) <> 2
        OR (SELECT SUM(amount_sat) FROM invoice_payment_events
             WHERE event_key IN (
-                'lightning_boltz_reverse:migration-068-mixed-reverse',
+                'lightning_boltz_reverse:migration-069-mixed-reverse',
                 'bull_bitcoin_mixed_output:67000000-0000-4000-8000-000000000003'
             )) <> 10000 THEN
         RAISE EXCEPTION 'migration 069 rejected its exact two-leg runtime accounting path';

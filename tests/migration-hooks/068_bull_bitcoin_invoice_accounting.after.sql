@@ -81,13 +81,17 @@ BEGIN
         id, nym_owner, npub_owner, origin, amount_sat,
         rate_locks_until, bitcoin_address,
         accept_btc, accept_ln, accept_liquid,
-        status, pricing_mode, presentation_status, settlement_status, expires_at
+        status, pricing_mode, presentation_status, settlement_status, expires_at,
+        client_request_id, client_request_digest, presentation_envelope
     ) VALUES (
         '66000000-0000-4000-8000-000000000005', NULL, repeat('6', 64),
         'wallet', 10000, TIMESTAMPTZ '2030-01-01 00:00:00+00',
-        'bc1q066invoicefixture00000000000000000000000000',
+        'bc1q068invoicefixture00000000000000000000000000',
         TRUE, FALSE, FALSE, 'unpaid', 'sat_fixed', 'unpaid', 'none',
-        TIMESTAMPTZ '2030-01-01 00:00:00+00'
+        TIMESTAMPTZ '2030-01-01 00:00:00+00',
+        '66000000-0000-4000-8000-000000000006',
+        decode(repeat('66', 32), 'hex'),
+        decode('01' || repeat('66', 4124), 'hex')
     );
 
     INSERT INTO bull_bitcoin_credentials (
@@ -111,7 +115,7 @@ BEGIN
         ) VALUES (
             repeat('7', 64), '66000000-0000-4000-8000-000000000005',
             other_credential_id, 'invoice', 'fiat_only', 'bitcoin',
-            'migration-067-cross-owner', 100, 'CAD',
+            'migration-068-cross-owner', 100, 'CAD',
             'bull-bitcoin-fiat-settlement-v1', 10000
         );
         RAISE EXCEPTION 'migration 068 accepted a cross-owner invoice settlement';
@@ -126,7 +130,7 @@ BEGIN
     ) VALUES (
         settlement_id, repeat('6', 64),
         '66000000-0000-4000-8000-000000000005', credential_id,
-        'invoice', 'fiat_only', 'bitcoin', 'migration-067-accounting',
+        'invoice', 'fiat_only', 'bitcoin', 'migration-068-accounting',
         100, 'CAD', 'bull-bitcoin-fiat-settlement-v1', 10000
     );
     UPDATE bull_bitcoin_settlements
@@ -136,7 +140,7 @@ BEGIN
        SET provider_state = 'bound', funding_route = 'bull_bitcoin',
            funding_committed_at = now(), settlement_status = 'pending',
            bull_bitcoin_order_id = '66000000-0000-4000-8000-000000000004',
-           instruction_kind = 'bitcoin', payer_instruction = 'bc1q066fixture',
+           instruction_kind = 'bitcoin', payer_instruction = 'bc1q068fixture',
            updated_at = now()
      WHERE id = settlement_id;
     UPDATE bull_bitcoin_settlements

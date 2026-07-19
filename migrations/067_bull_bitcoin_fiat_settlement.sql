@@ -1,5 +1,5 @@
 -- ============================================================================
--- 066: privacy-minimal Bull Bitcoin fiat-settlement foundation
+-- 067: privacy-minimal Bull Bitcoin fiat-settlement foundation
 -- ============================================================================
 
 BEGIN;
