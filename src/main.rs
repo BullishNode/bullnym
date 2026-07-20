@@ -1334,9 +1334,7 @@ async fn private_invoice_response_headers(req: Request<Body>, next: Next) -> Res
         .extensions()
         .get::<MatchedPath>()
         .map(|route| route.as_str().to_owned());
-    let is_private = route
-        .as_deref()
-        .is_some_and(is_private_invoice_route);
+    let is_private = route.as_deref().is_some_and(is_private_invoice_route);
     let mut response = next.run(req).await;
     if is_private {
         apply_private_response_headers(&mut response);

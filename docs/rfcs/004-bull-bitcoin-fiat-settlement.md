@@ -564,12 +564,13 @@ of existing obligations. Disabling rollout must not abandon a funded order.
 
 ## 8. Merchant visibility and payer privacy
 
-Invoice-backed Bull Bitcoin settlement details extend the existing
-Schnorr-authenticated `GET /api/v1/invoices?npub=...` list projection; the MVP
-does not invent a separate signed invoice-detail route. Lightning Address legs
-use the signed local settlement list from section 5.4. Details are excluded
-from public invoice status, persisted payer PWA state, HTML metadata, URLs,
-logs, and analytics. The selected-rail payer `POST` response necessarily
+Bull Bitcoin settlement details are returned with their payment through the
+Schnorr-authenticated `GET /api/v1/get-paid/transactions` projection. The MVP
+does not invent a separate signed invoice-detail route. The history projection
+normalizes Lightning Address, invoice, Payment Page, and Point of Sale receipts
+to the contract in `docs/api/get-paid-transaction-history.md`. Details are
+excluded from public invoice status, persisted payer PWA state, HTML metadata,
+URLs, logs, and analytics. The selected-rail payer `POST` response necessarily
 contains its one payment address/BOLT11/BIP21, but no later public read repeats
 that provider instruction.
 
@@ -600,11 +601,13 @@ Mixed merchant projection:
 ```json
 {
   "kind": "mixed",
-  "bitcoin": {
-    "amount_sat": 75000,
-    "network": "liquid",
-    "status": "pending|settled|problem"
-  },
+  "bitcoin": [
+    {
+      "amount_sat": 75000,
+      "network": "liquid",
+      "status": "pending|settled|problem"
+    }
+  ],
   "fiat": [
     {
       "amount_minor": 1234,
