@@ -2497,7 +2497,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
-    assert_eq!(response["code"], "BULL_BITCOIN_CREDENTIAL_INVALID");
+    assert_eq!(response["code"], "FIAT_CREDENTIAL_INVALID");
     assert!(response["reason"].as_str().unwrap().contains("Reconnect"));
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
@@ -2557,7 +2557,7 @@ async fn fiat_settlement_missing_credential_has_a_stable_client_code() {
 
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
-    assert_eq!(response["code"], "BULL_BITCOIN_CREDENTIAL_REQUIRED");
+    assert_eq!(response["code"], "FIAT_CREDENTIAL_REQUIRED");
 
     cleanup_db(&pool).await;
 }

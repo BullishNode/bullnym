@@ -384,6 +384,13 @@ privacy headers as existing signed invoice reads. Existing per-npub admission
 limits are extended to settings mutations, credential import/delete, signed
 configuration reads, and signed settlement-list reads.
 
+The client-actionable activation errors are part of the version-one wire
+contract. A missing key uses `FIAT_CREDENTIAL_REQUIRED`, a rejected key uses
+`FIAT_CREDENTIAL_INVALID`, and an ineligible account uses
+`FIAT_CONVERSION_KYC_REQUIRED`. The canonical HTTP envelopes are pinned in
+[`../api/fixtures/fiat-settlement-errors-v1.json`](../api/fixtures/fiat-settlement-errors-v1.json).
+Clients must branch on `code`, not parse the human-readable `reason`.
+
 ### 5.5 Credential deletion
 
 Immediate ciphertext deletion and complete settlement supervision cannot both
