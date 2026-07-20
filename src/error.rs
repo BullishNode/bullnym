@@ -234,8 +234,8 @@ impl AppError {
 
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::FiatConversionKycRequired => "FIAT_CONVERSION_KYC_REQUIRED",
-            Self::BullBitcoinCredentialRequired => "BULL_BITCOIN_CREDENTIAL_REQUIRED",
-            Self::BullBitcoinCredentialInvalid => "BULL_BITCOIN_CREDENTIAL_INVALID",
+            Self::BullBitcoinCredentialRequired => "FIAT_CREDENTIAL_REQUIRED",
+            Self::BullBitcoinCredentialInvalid => "FIAT_CREDENTIAL_INVALID",
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
@@ -543,6 +543,19 @@ impl From<sqlx::Error> for AppError {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct FiatSettlementErrorFixture {
+        errors: Vec<FiatSettlementErrorCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct FiatSettlementErrorCase {
+        name: String,
+        http_status: u16,
+        response: Value,
+    }
 
     async fn response_json(error: AppError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -552,6 +565,26 @@ mod tests {
             .expect("read error response body");
         let value = serde_json::from_slice(&body).expect("parse error response JSON");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn fiat_settlement_error_fixture_matches_wire_responses() {
+        let fixture: FiatSettlementErrorFixture = serde_json::from_str(include_str!(
+            "../docs/api/fixtures/fiat-settlement-errors-v1.json"
+        ))
+        .expect("parse fiat-settlement error fixture");
+
+        for case in fixture.errors {
+            let error = match case.name.as_str() {
+                "credential_required" => AppError::BullBitcoinCredentialRequired,
+                "credential_invalid" => AppError::BullBitcoinCredentialInvalid,
+                "kyc_required" => AppError::FiatConversionKycRequired,
+                unknown => panic!("unknown fiat-settlement error fixture case: {unknown}"),
+            };
+            let (status, body) = response_json(error).await;
+            assert_eq!(status.as_u16(), case.http_status, "{} status", case.name);
+            assert_eq!(body, case.response, "{} response", case.name);
+        }
     }
 
     #[tokio::test]
