@@ -1185,9 +1185,6 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// HTTP readiness endpoint reuses the same predicate so deploy and runtime
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-    if std::env::var("BULLNYM_STAGING_BYPASS_SCHEMA_READINESS").as_deref() == Ok("true") {
-        return Ok(true);
-    }
     if !schema_marker_present(pool).await?
         || !wallet_backup_storage_invariants_present(pool).await?
         || !private_invoice_storage_contract_present(pool).await?
