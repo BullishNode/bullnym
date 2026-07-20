@@ -1330,13 +1330,32 @@ fn apply_private_response_headers(response: &mut Response) {
 }
 
 async fn private_invoice_response_headers(req: Request<Body>, next: Next) -> Response {
-    let is_private = req
+    let route = req
         .extensions()
         .get::<MatchedPath>()
-        .is_some_and(|route| is_private_invoice_route(route.as_str()));
+        .map(|route| route.as_str().to_owned());
+    let is_private = route
+        .as_deref()
+        .is_some_and(is_private_invoice_route);
     let mut response = next.run(req).await;
     if is_private {
         apply_private_response_headers(&mut response);
+    }
+    if route
+        .as_deref()
+        .is_some_and(|route| route.starts_with("/api/v1/fiat-settlement"))
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store, max-age=0"),
+        );
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        response.headers_mut().insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
     }
     response
 }
