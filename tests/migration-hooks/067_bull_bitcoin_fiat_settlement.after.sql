@@ -74,10 +74,9 @@ BEGIN
     BEGIN
         INSERT INTO fiat_settlement_settings (
             owner_npub, product, credential_id, fiat_percentage,
-            fiat_currency, terms_version, terms_accepted_at
+            fiat_currency, request_signed_at
         ) VALUES (
-            owner_npub, 'invoice', credential_id, 0, 'CAD',
-            'bull-bitcoin-fiat-settlement-v1', now()
+            owner_npub, 'invoice', credential_id, 0, 'CAD', now()
         );
         RAISE EXCEPTION 'migration 067 persisted percentage zero instead of row absence';
     EXCEPTION WHEN check_violation THEN
@@ -86,12 +85,12 @@ BEGIN
 
     INSERT INTO bull_bitcoin_settlements (
         id, owner_npub, credential_id, product, purpose, payer_rail,
-        request_key, fiat_percentage, fiat_currency, terms_version,
+        request_key, fiat_percentage, fiat_currency,
         requested_bitcoin_sat
     ) VALUES (
         settlement_id, owner_npub, credential_id, 'lightning_address',
         'fiat_only', 'bitcoin', 'migration-067-fixture', 100, 'CAD',
-        'bull-bitcoin-fiat-settlement-v1', 10000
+        10000
     );
     UPDATE bull_bitcoin_settlements
        SET provider_state = 'dispatch_started', updated_at = now()

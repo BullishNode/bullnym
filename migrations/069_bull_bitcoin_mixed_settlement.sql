@@ -19,7 +19,6 @@ CREATE TABLE swap_fiat_settlement_policies (
     product          TEXT        NOT NULL,
     fiat_percentage  SMALLINT    NOT NULL,
     fiat_currency    TEXT        NOT NULL,
-    terms_version    TEXT        NOT NULL,
     captured_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT swap_fiat_settlement_policies_source_chk CHECK (
         (reverse_swap_id IS NOT NULL)::INTEGER
@@ -47,9 +46,6 @@ CREATE TABLE swap_fiat_settlement_policies (
     ),
     CONSTRAINT swap_fiat_settlement_policies_currency_chk CHECK (
         fiat_currency IN ('ARS', 'CAD', 'COP', 'CRC', 'EUR', 'MXN', 'USD')
-    ),
-    CONSTRAINT swap_fiat_settlement_policies_terms_chk CHECK (
-        terms_version = 'bull-bitcoin-fiat-settlement-v1'
     )
 );
 
@@ -185,7 +181,7 @@ BEGIN
     END IF;
 
     SELECT policy.owner_npub, policy.credential_id, policy.product,
-           policy.fiat_percentage, policy.fiat_currency, policy.terms_version,
+           policy.fiat_percentage, policy.fiat_currency,
            COALESCE(reverse_swap.invoice_id, chain_swap.invoice_id)
                AS expected_invoice_id
       INTO policy_row
@@ -200,10 +196,10 @@ BEGIN
        OR ROW(
             policy_row.owner_npub, policy_row.credential_id,
             policy_row.product, policy_row.fiat_percentage,
-            policy_row.fiat_currency, policy_row.terms_version
+            policy_row.fiat_currency
           ) IS DISTINCT FROM ROW(
             NEW.owner_npub, NEW.credential_id, NEW.product,
-            NEW.fiat_percentage, NEW.fiat_currency, NEW.terms_version
+            NEW.fiat_percentage, NEW.fiat_currency
           ) THEN
         RAISE EXCEPTION 'Bull Bitcoin mixed settlement lacks its exact swap policy'
             USING ERRCODE = '23514',

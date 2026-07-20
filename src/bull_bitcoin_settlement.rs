@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::bull_bitcoin::{
     BitcoinAmountSat, BitcoinNetwork, BullBitcoinError, CreateSellRequest, CreatedSellOrder,
-    CredentialCipher, FiatCurrency, PayerInstruction, Product, TERMS_VERSION,
+    CredentialCipher, FiatCurrency, PayerInstruction, Product,
 };
 use crate::config::BullBitcoinEncryptionKey;
 use crate::db::{
@@ -279,7 +279,6 @@ async fn create_fiat_only_instruction_locked(
         request_key: request.request_key,
         fiat_percentage: 100,
         fiat_currency: request.fiat_currency.as_str(),
-        terms_version: TERMS_VERSION,
         requested_bitcoin_sat: request.bitcoin_amount.as_sat(),
     };
     let mut stored = db::reserve_bull_bitcoin_settlement(connection, &reservation)
@@ -670,7 +669,6 @@ async fn prepare_mixed_settlement_locked(
         request_key: &request_key,
         fiat_percentage: policy.fiat_percentage,
         fiat_currency: currency.as_str(),
-        terms_version: &policy.terms_version,
         requested_bitcoin_sat: bull_bitcoin_amount_sat,
     };
     let mut stored = if let Some(existing) = existing {
@@ -946,7 +944,6 @@ fn mixed_reservation_matches_policy(
         && stored.request_key == request_key
         && stored.fiat_percentage == policy.fiat_percentage
         && stored.fiat_currency == policy.fiat_currency
-        && stored.terms_version == policy.terms_version
 }
 
 async fn route_unfunded_mixed_to_invalid_split(

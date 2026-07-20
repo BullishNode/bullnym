@@ -15,10 +15,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::auth;
-use crate::bull_bitcoin::{
-    CredentialCipher, FiatCurrency, Product, ScopedApiKey, COMMON_DISCLOSURE, TERMS_REFERENCE,
-    TERMS_VERSION,
-};
+use crate::bull_bitcoin::{CredentialCipher, FiatCurrency, Product, ScopedApiKey};
 use crate::db::{
     self, CredentialLifecycle, FiatSettlementCredential, FiatSettlementStoreError,
     NewEncryptedCredential,
@@ -41,35 +38,21 @@ const LIST_LIMIT_MAX: i64 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CurrencyDisclosure {
-    pub currency: FiatCurrency,
-    pub disclosure: &'static str,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct FiatSettlementOptionsResponse {
     pub version: u16,
-    pub terms_version: &'static str,
-    pub terms_reference: &'static str,
-    pub common_disclosure: &'static str,
-    pub currencies: Vec<CurrencyDisclosure>,
+    pub accepting_new_settings: bool,
+    pub currencies: Vec<FiatCurrency>,
 }
 
-pub async fn options() -> Json<FiatSettlementOptionsResponse> {
-    Json(FiatSettlementOptionsResponse {
-        version: CONTRACT_VERSION,
-        terms_version: TERMS_VERSION,
-        terms_reference: TERMS_REFERENCE,
-        common_disclosure: COMMON_DISCLOSURE,
-        currencies: FiatCurrency::ALL
-            .into_iter()
-            .map(|currency| CurrencyDisclosure {
-                currency,
-                disclosure: currency.disclosure(),
-            })
-            .collect(),
-    })
+pub async fn options(State(state): State<AppState>) -> Response {
+    private_no_store(
+        Json(FiatSettlementOptionsResponse {
+            version: CONTRACT_VERSION,
+            accepting_new_settings: state.config.features.bull_bitcoin_fiat_settlement,
+            currencies: FiatCurrency::ALL.into(),
+        })
+        .into_response(),
+    )
 }
 
 /// Intentionally has no `Debug`: `api_key` is a bearer secret.
@@ -80,7 +63,6 @@ pub struct SetRequest {
     pub npub: String,
     pub fiat_percentage: u8,
     pub fiat_currency: Option<FiatCurrency>,
-    pub terms_version: Option<String>,
     pub api_key: Option<String>,
     pub timestamp: u64,
     pub signature: String,
@@ -131,8 +113,6 @@ pub struct SettingResponse {
     pub product: Product,
     pub fiat_percentage: u8,
     pub fiat_currency: FiatCurrency,
-    pub terms_version: String,
-    pub terms_accepted_at_unix: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -460,28 +440,24 @@ fn verify_set_request(
     validate_canonical_npub(&request.npub)?;
 
     let api_key = match request.api_key {
-        Some(value) => Some(
-            ScopedApiKey::parse(value)
-                .map_err(|_| AppError::InvalidAmount("Invalid scoped API key.".into()))?,
-        ),
+        Some(value) => {
+            Some(ScopedApiKey::parse(value).map_err(|_| AppError::BullBitcoinCredentialInvalid)?)
+        }
         None => None,
     };
     let currency_field = request
         .fiat_currency
         .map(FiatCurrency::as_str)
         .unwrap_or("");
-    let terms_field = request.terms_version.as_deref().unwrap_or("");
-    reject_nul("terms_version", terms_field)?;
-
     if request.fiat_percentage == 0 {
-        if request.fiat_currency.is_some() || request.terms_version.is_some() || api_key.is_some() {
+        if request.fiat_currency.is_some() || api_key.is_some() {
             return Err(AppError::InvalidAmount(
                 "Bitcoin-only configuration must omit fiat fields and API key.".into(),
             ));
         }
-    } else if request.fiat_currency.is_none() || terms_field != TERMS_VERSION {
+    } else if request.fiat_currency.is_none() {
         return Err(AppError::InvalidAmount(
-            "The current terms and one supported fiat currency are required.".into(),
+            "One supported fiat currency is required.".into(),
         ));
     }
 
@@ -496,7 +472,6 @@ fn verify_set_request(
             product.as_str(),
             &percentage_field,
             currency_field,
-            terms_field,
             key_field,
         ],
         request.timestamp,
@@ -573,9 +548,7 @@ fn map_store_error(error: FiatSettlementStoreError) -> AppError {
         FiatSettlementStoreError::SourceIdentityNotActive => {
             AppError::AuthError("fiat-settlement identity is unavailable".into())
         }
-        FiatSettlementStoreError::CredentialRequired => AppError::InvalidAmount(
-            "Import the scoped Bull Bitcoin API key before enabling fiat settlement.".into(),
-        ),
+        FiatSettlementStoreError::CredentialRequired => AppError::BullBitcoinCredentialRequired,
         FiatSettlementStoreError::CredentialDraining => AppError::ServiceUnavailable(
             "the previous scoped credential still supervises a settlement".into(),
         ),
@@ -594,9 +567,7 @@ fn map_preflight_error(error: crate::bull_bitcoin::BullBitcoinError) -> AppError
     match error {
         BullBitcoinError::BenchmarkEligibilityDenied => AppError::FiatConversionKycRequired,
         BullBitcoinError::Authentication | BullBitcoinError::InvalidApiKey => {
-            AppError::InvalidAmount(
-                "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
-            )
+            AppError::BullBitcoinCredentialInvalid
         }
         BullBitcoinError::Timeout
         | BullBitcoinError::Transport
@@ -637,8 +608,6 @@ fn configuration_response(
                 product,
                 fiat_percentage,
                 fiat_currency,
-                terms_version: row.terms_version,
-                terms_accepted_at_unix: row.terms_accepted_at_unix,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
@@ -785,7 +754,6 @@ mod tests {
                 Product::Invoice.as_str(),
                 percentage,
                 "CAD",
-                TERMS_VERSION,
                 &api_key,
             ],
             timestamp,
@@ -795,7 +763,6 @@ mod tests {
             npub: npub.into(),
             fiat_percentage: 50,
             fiat_currency: Some(FiatCurrency::CAD),
-            terms_version: Some(TERMS_VERSION.into()),
             api_key: Some(api_key),
             timestamp,
             signature: sign(keypair, &message),
@@ -827,19 +794,19 @@ mod tests {
         request.api_key = Some(format!("bbak-{}\0suffix", "ab".repeat(32)));
         assert!(matches!(
             verify_set_request(Product::Invoice, request),
-            Err(AppError::InvalidAmount(_))
+            Err(AppError::BullBitcoinCredentialInvalid)
         ));
     }
 
     #[test]
-    fn bitcoin_only_delete_contract_requires_no_terms_or_key() {
+    fn bitcoin_only_delete_contract_requires_no_currency_or_key() {
         let (keypair, npub) = test_keypair();
         let timestamp = now();
         let message = auth::build_la_v2_message(
             ACTION_SET,
             &npub,
             "",
-            &[VERSION_FIELD, Product::Pos.as_str(), "0", "", "", ""],
+            &[VERSION_FIELD, Product::Pos.as_str(), "0", "", ""],
             timestamp,
         );
         let request = SetRequest {
@@ -847,7 +814,6 @@ mod tests {
             npub,
             fiat_percentage: 0,
             fiat_currency: None,
-            terms_version: None,
             api_key: None,
             timestamp,
             signature: sign(&keypair, &message),

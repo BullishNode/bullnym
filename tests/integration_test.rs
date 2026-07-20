@@ -568,11 +568,6 @@ fn signed_fiat_set_body(
 ) -> Value {
     let percentage_field = percentage.to_string();
     let currency_field = currency.map(FiatCurrency::as_str).unwrap_or("");
-    let terms_field = if percentage == 0 {
-        ""
-    } else {
-        pay_service::bull_bitcoin::TERMS_VERSION
-    };
     let key_field = api_key.unwrap_or("");
     let signature = sign_la_action_with_timestamp(
         keypair,
@@ -584,7 +579,6 @@ fn signed_fiat_set_body(
             product.as_str(),
             &percentage_field,
             currency_field,
-            terms_field,
             key_field,
         ],
         timestamp,
@@ -599,9 +593,6 @@ fn signed_fiat_set_body(
     let object = body.as_object_mut().unwrap();
     if let Some(currency) = currency {
         object.insert("fiat_currency".into(), json!(currency.as_str()));
-    }
-    if percentage > 0 {
-        object.insert("terms_version".into(), json!(terms_field));
     }
     if let Some(api_key) = api_key {
         object.insert("api_key".into(), json!(api_key));
@@ -2148,6 +2139,40 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 }
 
 #[tokio::test]
+async fn fiat_settlement_options_advertise_only_operational_capability() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let disabled = test_app(test_state(pool.clone()));
+    let (status, headers, body) =
+        get_json_with_headers(&disabled, "/api/v1/fiat-settlement/options").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(
+        body,
+        json!({
+            "version": 1,
+            "accepting_new_settings": false,
+            "currencies": ["CAD", "EUR", "MXN", "CRC", "COP", "ARS", "USD"]
+        })
+    );
+
+    let enabled = test_app(fiat_activation_test_state(
+        pool.clone(),
+        ScriptedBullBitcoinApi::default(),
+    ));
+    let (status, _, body) =
+        get_json_with_headers(&enabled, "/api/v1/fiat-settlement/options").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["accepting_new_settings"], true);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_key() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -2160,21 +2185,17 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
     let fake = ScriptedBullBitcoinApi::default();
     let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
 
-    let timestamp = auth_timestamp();
+    // Mobile clock skew inside the authenticated five-minute window is valid.
+    // The signed retry marker must not impose an ordering constraint against
+    // the server's own updated_at clock.
+    let timestamp = auth_timestamp() + 60;
     let api_key = format!("bbak-{}", "ab".repeat(32));
     let signature = sign_la_action_with_timestamp(
         &keypair,
         fiat_settlement::ACTION_SET,
         &npub,
         "",
-        &[
-            "1",
-            "invoice",
-            "50",
-            "CAD",
-            pay_service::bull_bitcoin::TERMS_VERSION,
-            &api_key,
-        ],
+        &["1", "invoice", "50", "CAD", &api_key],
         timestamp,
     );
     let set_body = json!({
@@ -2182,7 +2203,6 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
         "npub": npub,
         "fiat_percentage": 50,
         "fiat_currency": "CAD",
-        "terms_version": pay_service::bull_bitcoin::TERMS_VERSION,
         "api_key": api_key,
         "timestamp": timestamp,
         "signature": signature,
@@ -2223,22 +2243,15 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
         .windows(api_key.len())
         .any(|window| window == api_key.as_bytes()));
 
-    // A second product reuses the admitted credential without accepting or
-    // returning another plaintext key.
+    // A second product reuses the admitted credential without returning
+    // another plaintext key.
     let pos_timestamp = auth_timestamp();
     let pos_signature = sign_la_action_with_timestamp(
         &keypair,
         fiat_settlement::ACTION_SET,
         &npub,
         "",
-        &[
-            "1",
-            "pos",
-            "100",
-            "EUR",
-            pay_service::bull_bitcoin::TERMS_VERSION,
-            "",
-        ],
+        &["1", "pos", "100", "EUR", ""],
         pos_timestamp,
     );
     let (pos_status, pos_response) = put_json(
@@ -2249,7 +2262,6 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
             "npub": npub,
             "fiat_percentage": 100,
             "fiat_currency": "EUR",
-            "terms_version": pay_service::bull_bitcoin::TERMS_VERSION,
             "timestamp": pos_timestamp,
             "signature": pos_signature,
         }),
@@ -2347,7 +2359,7 @@ async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
     assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert_eq!(
         response["reason"],
-        "To activate fiat conversion, your account needs to have the right KYC permissions. Please update your KYC to have unlimited trading."
+        "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later."
     );
     assert!(!response.to_string().contains(&api_key));
     assert_eq!(fake.validation_call_count(), 1);
@@ -2392,7 +2404,7 @@ async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
     let before = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
         "SELECT credential.id, credential.ciphertext, credential.nonce, \
                 setting.fiat_percentage, setting.fiat_currency, \
-                extract(epoch FROM setting.terms_accepted_at)::BIGINT \
+                extract(epoch FROM setting.request_signed_at)::BIGINT \
            FROM fiat_settlement_settings setting \
            JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
           WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
@@ -2419,7 +2431,7 @@ async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
     let after = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
         "SELECT credential.id, credential.ciphertext, credential.nonce, \
                 setting.fiat_percentage, setting.fiat_currency, \
-                extract(epoch FROM setting.terms_accepted_at)::BIGINT \
+                extract(epoch FROM setting.request_signed_at)::BIGINT \
            FROM fiat_settlement_settings setting \
            JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
           WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
@@ -2485,7 +2497,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
-    assert_eq!(response["code"], "InvalidAmount");
+    assert_eq!(response["code"], "BULL_BITCOIN_CREDENTIAL_INVALID");
     assert!(response["reason"].as_str().unwrap().contains("Reconnect"));
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
@@ -2516,6 +2528,36 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     .unwrap();
     assert_eq!(persisted, (0, 0));
     assert_eq!(fake.validation_call_count(), 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_missing_credential_has_a_stable_client_code() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-missing-credential", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-missing-credential", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(fiat_activation_test_state(
+        pool.clone(),
+        ScriptedBullBitcoinApi::default(),
+    ));
+    let body = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Invoice,
+        50,
+        Some(FiatCurrency::CAD),
+        None,
+        auth_timestamp(),
+    );
+
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "BULL_BITCOIN_CREDENTIAL_REQUIRED");
 
     cleanup_db(&pool).await;
 }
@@ -2729,7 +2771,6 @@ async fn bull_bitcoin_create_failures_never_redispatch_ambiguous_attempts() {
         request_key: "payer-intent-crash",
         fiat_percentage: 100,
         fiat_currency: "CAD",
-        terms_version: pay_service::bull_bitcoin::TERMS_VERSION,
         requested_bitcoin_sat: 25_000,
     };
     let mut connection = pool.acquire().await.unwrap();

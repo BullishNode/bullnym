@@ -160,7 +160,6 @@ pub struct InvoiceFiatSettlementPolicy {
     pub product: String,
     pub fiat_percentage: i16,
     pub fiat_currency: String,
-    pub terms_version: String,
     pub allowed_rail_mask: i16,
 }
 
@@ -595,12 +594,11 @@ async fn capture_invoice_fiat_policy(
     sqlx::query(
         "INSERT INTO invoice_fiat_settlement_policies ( \
                  invoice_id, owner_npub, credential_id, product, \
-                 fiat_percentage, fiat_currency, terms_version, \
-                 allowed_rail_mask \
+                 fiat_percentage, fiat_currency, allowed_rail_mask \
              ) \
              SELECT $1, setting.owner_npub, setting.credential_id, \
                     setting.product, setting.fiat_percentage, \
-                    setting.fiat_currency, setting.terms_version, \
+                    setting.fiat_currency, \
                     CASE WHEN setting.fiat_percentage = 100 THEN $4::SMALLINT \
                          ELSE ($4::SMALLINT & 3::SMALLINT) END \
                FROM fiat_settlement_settings setting \
@@ -795,7 +793,7 @@ where
 {
     sqlx::query_as::<_, InvoiceFiatSettlementPolicy>(
         "SELECT invoice_id, owner_npub, credential_id, product, \
-                fiat_percentage, fiat_currency, terms_version, allowed_rail_mask \
+                fiat_percentage, fiat_currency, allowed_rail_mask \
            FROM invoice_fiat_settlement_policies WHERE invoice_id = $1",
     )
     .bind(invoice_id)

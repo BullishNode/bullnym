@@ -111,12 +111,11 @@ BEGIN
         INSERT INTO bull_bitcoin_settlements (
             owner_npub, invoice_id, credential_id, product, purpose,
             payer_rail, request_key, fiat_percentage, fiat_currency,
-            terms_version, requested_bitcoin_sat
+            requested_bitcoin_sat
         ) VALUES (
             repeat('7', 64), '66000000-0000-4000-8000-000000000005',
             other_credential_id, 'invoice', 'fiat_only', 'bitcoin',
-            'migration-068-cross-owner', 100, 'CAD',
-            'bull-bitcoin-fiat-settlement-v1', 10000
+            'migration-068-cross-owner', 100, 'CAD', 10000
         );
         RAISE EXCEPTION 'migration 068 accepted a cross-owner invoice settlement';
     EXCEPTION WHEN foreign_key_violation THEN
@@ -126,12 +125,12 @@ BEGIN
     INSERT INTO bull_bitcoin_settlements (
         id, owner_npub, invoice_id, credential_id, product, purpose,
         payer_rail, request_key, fiat_percentage, fiat_currency,
-        terms_version, requested_bitcoin_sat
+        requested_bitcoin_sat
     ) VALUES (
         settlement_id, repeat('6', 64),
         '66000000-0000-4000-8000-000000000005', credential_id,
         'invoice', 'fiat_only', 'bitcoin', 'migration-068-accounting',
-        100, 'CAD', 'bull-bitcoin-fiat-settlement-v1', 10000
+        100, 'CAD', 10000
     );
     UPDATE bull_bitcoin_settlements
        SET provider_state = 'dispatch_started', updated_at = now()

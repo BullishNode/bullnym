@@ -114,11 +114,11 @@ BEGIN
 
     INSERT INTO swap_fiat_settlement_policies (
         reverse_swap_id, owner_npub, credential_id, product,
-        fiat_percentage, fiat_currency, terms_version
+        fiat_percentage, fiat_currency
     ) VALUES (
         '67000000-0000-4000-8000-000000000001', repeat('6', 64),
         '66000000-0000-4000-8000-000000000001', 'invoice',
-        40, 'CAD', 'bull-bitcoin-fiat-settlement-v1'
+        40, 'CAD'
     );
 
     BEGIN
@@ -133,14 +133,14 @@ BEGIN
     INSERT INTO bull_bitcoin_settlements (
         id, owner_npub, invoice_id, reverse_swap_id, credential_id,
         product, purpose, payer_rail, request_key, fiat_percentage,
-        fiat_currency, terms_version, requested_bitcoin_sat
+        fiat_currency, requested_bitcoin_sat
     ) VALUES (
         settlement_id, repeat('6', 64),
         '66000000-0000-4000-8000-000000000005',
         '67000000-0000-4000-8000-000000000001',
         '66000000-0000-4000-8000-000000000001',
         'invoice', 'mixed', 'lightning', 'migration-069-mixed-order',
-        40, 'CAD', 'bull-bitcoin-fiat-settlement-v1', 4000
+        40, 'CAD', 4000
     );
     UPDATE bull_bitcoin_settlements
        SET provider_state = 'dispatch_started', updated_at = now()

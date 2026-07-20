@@ -1,7 +1,7 @@
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::bull_bitcoin::{EncryptedCredential, FiatCurrency, Product, TERMS_VERSION};
+use crate::bull_bitcoin::{EncryptedCredential, FiatCurrency, Product};
 
 use super::bull_bitcoin_settlements::StoredEncryptedCredential;
 
@@ -39,8 +39,6 @@ pub struct FiatSettlementSettingRow {
     pub product: String,
     pub fiat_percentage: i16,
     pub fiat_currency: String,
-    pub terms_version: String,
-    pub terms_accepted_at_unix: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,15 +98,13 @@ pub async fn upsert_fiat_settlement_setting(
             AND setting.product = $2 \
             AND setting.fiat_percentage = $3 \
             AND setting.fiat_currency = $4 \
-            AND setting.terms_version = $5 \
-            AND extract(epoch FROM setting.terms_accepted_at)::BIGINT = $6 \
+            AND extract(epoch FROM setting.request_signed_at)::BIGINT = $5 \
             AND credential.admitted_for_new_orders",
     )
     .bind(owner_npub)
     .bind(product.as_str())
     .bind(fiat_percentage)
     .bind(fiat_currency.as_str())
-    .bind(TERMS_VERSION)
     .bind(signed_at_unix)
     .fetch_optional(&mut *transaction)
     .await?;
@@ -164,14 +160,13 @@ pub async fn upsert_fiat_settlement_setting(
         sqlx::query(
             "INSERT INTO fiat_settlement_settings ( \
                  owner_npub, product, credential_id, fiat_percentage, \
-                 fiat_currency, terms_version, terms_accepted_at, updated_at \
-             ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), now()) \
+                 fiat_currency, request_signed_at, updated_at \
+             ) VALUES ($1, $2, $3, $4, $5, to_timestamp($6), now()) \
              ON CONFLICT (owner_npub, product) DO UPDATE SET \
                  credential_id = EXCLUDED.credential_id, \
                  fiat_percentage = EXCLUDED.fiat_percentage, \
                  fiat_currency = EXCLUDED.fiat_currency, \
-                 terms_version = EXCLUDED.terms_version, \
-                 terms_accepted_at = EXCLUDED.terms_accepted_at, \
+                 request_signed_at = EXCLUDED.request_signed_at, \
                  updated_at = now()",
         )
         .bind(owner_npub)
@@ -179,7 +174,6 @@ pub async fn upsert_fiat_settlement_setting(
         .bind(credential_id)
         .bind(fiat_percentage)
         .bind(fiat_currency.as_str())
-        .bind(TERMS_VERSION)
         .bind(signed_at_unix)
         .execute(&mut *transaction)
         .await?;
@@ -423,9 +417,7 @@ async fn select_configuration_in_transaction(
     owner_npub: &str,
 ) -> Result<FiatSettlementConfiguration, sqlx::Error> {
     let settings = sqlx::query_as::<_, FiatSettlementSettingRow>(
-        "SELECT product, fiat_percentage, fiat_currency, terms_version, \
-                extract(epoch FROM terms_accepted_at)::BIGINT \
-                    AS terms_accepted_at_unix \
+        "SELECT product, fiat_percentage, fiat_currency \
            FROM fiat_settlement_settings \
           WHERE owner_npub = $1 \
           ORDER BY product",

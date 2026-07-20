@@ -70,6 +70,12 @@ pub enum AppError {
     /// The authenticated Bull Bitcoin account cannot pass the server-owned
     /// fiat-settlement eligibility benchmark at activation time.
     FiatConversionKycRequired,
+    /// Bullnym has no active scoped credential and the client did not provide
+    /// one on the signed enable request.
+    BullBitcoinCredentialRequired,
+    /// The supplied or stored scoped credential is malformed, inactive,
+    /// revoked, or lacks the required scope.
+    BullBitcoinCredentialInvalid,
     /// LUD-12 comment validation or stable-retry failure. The inner value is
     /// always server-authored static text and must never contain payer input.
     InvalidComment(&'static str),
@@ -174,6 +180,8 @@ impl AppError {
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
             | Self::FiatConversionKycRequired
+            | Self::BullBitcoinCredentialRequired
+            | Self::BullBitcoinCredentialInvalid
             | Self::InvalidComment(_)
             | Self::RecoveryAddressInvalid(_)
             | Self::RecoveryNotAvailable(_)
@@ -226,6 +234,8 @@ impl AppError {
 
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::FiatConversionKycRequired => "FIAT_CONVERSION_KYC_REQUIRED",
+            Self::BullBitcoinCredentialRequired => "BULL_BITCOIN_CREDENTIAL_REQUIRED",
+            Self::BullBitcoinCredentialInvalid => "BULL_BITCOIN_CREDENTIAL_INVALID",
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
@@ -293,6 +303,12 @@ impl std::fmt::Display for AppError {
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::FiatConversionKycRequired => {
                 write!(f, "Bull Bitcoin fiat-conversion eligibility is required")
+            }
+            Self::BullBitcoinCredentialRequired => {
+                write!(f, "Bull Bitcoin scoped credential is required")
+            }
+            Self::BullBitcoinCredentialInvalid => {
+                write!(f, "Bull Bitcoin scoped credential is invalid")
             }
             Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
@@ -374,7 +390,9 @@ impl IntoResponse for AppError {
             AppError::PubkeyUtxoMismatch => "The proof-of-funds public key does not match the script of the referenced UTXO.".into(),
 
             AppError::InvalidAmount(reason) => reason.clone(),
-            AppError::FiatConversionKycRequired => "To activate fiat conversion, your account needs to have the right KYC permissions. Please update your KYC to have unlimited trading.".into(),
+            AppError::FiatConversionKycRequired => "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later.".into(),
+            AppError::BullBitcoinCredentialRequired => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
+            AppError::BullBitcoinCredentialInvalid => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
             AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
                 "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()

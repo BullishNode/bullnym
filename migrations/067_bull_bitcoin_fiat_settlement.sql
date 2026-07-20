@@ -99,8 +99,7 @@ CREATE TABLE fiat_settlement_settings (
     credential_id     UUID        NOT NULL,
     fiat_percentage   SMALLINT    NOT NULL,
     fiat_currency     TEXT        NOT NULL,
-    terms_version     TEXT        NOT NULL,
-    terms_accepted_at TIMESTAMPTZ NOT NULL,
+    request_signed_at TIMESTAMPTZ NOT NULL,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (owner_npub, product),
     CONSTRAINT fiat_settlement_settings_credential_owner_fkey
@@ -115,12 +114,6 @@ CREATE TABLE fiat_settlement_settings (
     ),
     CONSTRAINT fiat_settlement_settings_currency_chk CHECK (
         fiat_currency IN ('ARS', 'CAD', 'COP', 'CRC', 'EUR', 'MXN', 'USD')
-    ),
-    CONSTRAINT fiat_settlement_settings_terms_chk CHECK (
-        terms_version = 'bull-bitcoin-fiat-settlement-v1'
-    ),
-    CONSTRAINT fiat_settlement_settings_time_order_chk CHECK (
-        updated_at >= terms_accepted_at
     )
 );
 
@@ -131,7 +124,6 @@ CREATE TABLE invoice_fiat_settlement_policies (
     product            TEXT        NOT NULL,
     fiat_percentage    SMALLINT    NOT NULL,
     fiat_currency      TEXT        NOT NULL,
-    terms_version      TEXT        NOT NULL,
     allowed_rail_mask  SMALLINT    NOT NULL,
     captured_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT invoice_fiat_settlement_policies_invoice_fkey
@@ -149,9 +141,6 @@ CREATE TABLE invoice_fiat_settlement_policies (
     ),
     CONSTRAINT invoice_fiat_settlement_policies_currency_chk CHECK (
         fiat_currency IN ('ARS', 'CAD', 'COP', 'CRC', 'EUR', 'MXN', 'USD')
-    ),
-    CONSTRAINT invoice_fiat_settlement_policies_terms_chk CHECK (
-        terms_version = 'bull-bitcoin-fiat-settlement-v1'
     ),
     CONSTRAINT invoice_fiat_settlement_policies_rails_chk CHECK (
         allowed_rail_mask BETWEEN 1 AND 7
@@ -184,7 +173,6 @@ CREATE TABLE bull_bitcoin_settlements (
     request_key              TEXT        NOT NULL,
     fiat_percentage          SMALLINT    NOT NULL,
     fiat_currency            TEXT        NOT NULL,
-    terms_version            TEXT        NOT NULL,
     provider_state           TEXT        NOT NULL DEFAULT 'reserved',
     funding_route            TEXT,
     fallback_category        TEXT,
@@ -237,9 +225,6 @@ CREATE TABLE bull_bitcoin_settlements (
     ),
     CONSTRAINT bull_bitcoin_settlements_currency_chk CHECK (
         fiat_currency IN ('ARS', 'CAD', 'COP', 'CRC', 'EUR', 'MXN', 'USD')
-    ),
-    CONSTRAINT bull_bitcoin_settlements_terms_chk CHECK (
-        terms_version = 'bull-bitcoin-fiat-settlement-v1'
     ),
     CONSTRAINT bull_bitcoin_settlements_request_key_chk CHECK (
         length(request_key) BETWEEN 1 AND 200
@@ -362,12 +347,12 @@ AS $$
 BEGIN
     IF (NEW.owner_npub, NEW.invoice_id, NEW.credential_id, NEW.product,
         NEW.purpose, NEW.payer_rail, NEW.request_key, NEW.fiat_percentage,
-        NEW.fiat_currency, NEW.terms_version, NEW.requested_bitcoin_sat,
+        NEW.fiat_currency, NEW.requested_bitcoin_sat,
         NEW.created_at)
        IS DISTINCT FROM
        (OLD.owner_npub, OLD.invoice_id, OLD.credential_id, OLD.product,
         OLD.purpose, OLD.payer_rail, OLD.request_key, OLD.fiat_percentage,
-        OLD.fiat_currency, OLD.terms_version, OLD.requested_bitcoin_sat,
+        OLD.fiat_currency, OLD.requested_bitcoin_sat,
         OLD.created_at) THEN
         RAISE EXCEPTION 'Bull Bitcoin settlement identity is immutable'
             USING ERRCODE = '23514',

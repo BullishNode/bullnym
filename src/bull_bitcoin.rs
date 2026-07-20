@@ -20,11 +20,6 @@ mod http;
 pub use http::HttpBullBitcoinApi;
 
 pub const CREDENTIAL_ENCRYPTION_FORMAT_VERSION: i16 = 1;
-pub const TERMS_VERSION: &str = "bull-bitcoin-fiat-settlement-v1";
-pub const TERMS_REFERENCE: &str = "https://www.bullbitcoin.com/terms-of-service";
-
-pub const COMMON_DISCLOSURE: &str = "By enabling fiat conversion, you agree to Bull Bitcoin's terms and conditions, agree that withdrawals are limited to the methods available for the currency you select, and agree that withdrawals may only be made to an account in your own name. If a full or partial conversion is below Bull Bitcoin's minimum amount, the conversion is overridden and the entire payment is sent to your Bitcoin wallet.";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Product {
@@ -97,18 +92,6 @@ impl FiatCurrency {
             Self::EUR => "EUR",
             Self::MXN => "MXN",
             Self::USD => "USD",
-        }
-    }
-
-    pub const fn disclosure(self) -> &'static str {
-        match self {
-            Self::CAD => "When converting funds to CAD, you will be able to withdraw your CAD balance to your own bank account via Interac e-Transfer, EFT, or Domestic Wire Transfer.",
-            Self::EUR => "When converting funds to EUR, you will be able to withdraw your EUR balance to your own bank account via SEPA.",
-            Self::MXN => "When converting funds to MXN, you will be able to withdraw your MXN balance to your own Mexican bank account via SPEI.",
-            Self::CRC => "When converting funds to CRC, you will be able to withdraw your CRC balance to your own Costa Rican bank account via SINPE bank transfer or SINPE Móvil.",
-            Self::COP => "When converting funds to COP, you will be able to withdraw your COP balance to your own Colombian bank account or Nequi account.",
-            Self::ARS => "When converting funds to ARS, you will be able to withdraw your ARS balance to your own Argentine bank account via CBU/CVU bank transfer.",
-            Self::USD => "You can only withdraw USD to a Costa Rican bank account via SINPE or to a Canadian bank account via Domestic Wire Transfer. Do not select USD if you do not agree to these withdrawal options. If you select USD and cannot use these withdrawal options, you can still convert your USD balance to Bitcoin.",
         }
     }
 }
@@ -595,10 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn disclosures_cover_only_locked_currencies() {
+    fn supported_currency_list_is_closed_and_round_trips() {
         assert_eq!(FiatCurrency::ALL.len(), 7);
         for currency in FiatCurrency::ALL {
-            assert!(!currency.disclosure().is_empty());
             assert_eq!(currency.as_str().parse::<FiatCurrency>().unwrap(), currency);
         }
     }

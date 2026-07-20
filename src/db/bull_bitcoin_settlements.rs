@@ -33,7 +33,6 @@ pub struct NewBullBitcoinSettlement<'a> {
     pub request_key: &'a str,
     pub fiat_percentage: i16,
     pub fiat_currency: &'a str,
-    pub terms_version: &'a str,
     pub requested_bitcoin_sat: i64,
 }
 
@@ -51,7 +50,6 @@ pub struct StoredBullBitcoinSettlement {
     pub request_key: String,
     pub fiat_percentage: i16,
     pub fiat_currency: String,
-    pub terms_version: String,
     pub provider_state: String,
     pub funding_route: Option<String>,
     pub fallback_category: Option<String>,
@@ -86,7 +84,6 @@ pub struct SwapFiatSettlementPolicy {
     pub product: String,
     pub fiat_percentage: i16,
     pub fiat_currency: String,
-    pub terms_version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
@@ -95,7 +92,6 @@ pub struct ActiveFiatSettlementSetting {
     pub credential_id: Uuid,
     pub fiat_percentage: i16,
     pub fiat_currency: String,
-    pub terms_version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,7 +182,7 @@ pub struct LightningAddressBullBitcoinSettlementProjection {
 
 const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
      credential_id, product, purpose, payer_rail, \
-     request_key, fiat_percentage, fiat_currency, terms_version, provider_state, \
+     request_key, fiat_percentage, fiat_currency, provider_state, \
      funding_route, fallback_category, settlement_status, requested_bitcoin_sat, \
      bull_bitcoin_order_id, instruction_kind, payer_instruction, \
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
@@ -205,10 +201,10 @@ pub async fn capture_invoice_reverse_mixed_policy(
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
              reverse_swap_id, owner_npub, credential_id, product, \
-             fiat_percentage, fiat_currency, terms_version \
+             fiat_percentage, fiat_currency \
          ) \
          SELECT $1, policy.owner_npub, policy.credential_id, policy.product, \
-                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+                policy.fiat_percentage, policy.fiat_currency \
            FROM invoice_fiat_settlement_policies policy \
           WHERE policy.invoice_id = $2 \
             AND policy.fiat_percentage BETWEEN 1 AND 99",
@@ -229,10 +225,10 @@ pub async fn capture_invoice_chain_mixed_policy(
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
              chain_swap_id, owner_npub, credential_id, product, \
-             fiat_percentage, fiat_currency, terms_version \
+             fiat_percentage, fiat_currency \
          ) \
          SELECT $1, policy.owner_npub, policy.credential_id, policy.product, \
-                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+                policy.fiat_percentage, policy.fiat_currency \
            FROM invoice_fiat_settlement_policies policy \
           WHERE policy.invoice_id = $2 \
             AND policy.fiat_percentage BETWEEN 1 AND 99",
@@ -253,7 +249,7 @@ pub async fn active_lightning_address_fiat_setting(
 ) -> Result<Option<ActiveFiatSettlementSetting>, sqlx::Error> {
     sqlx::query_as(
         "SELECT setting.owner_npub, setting.credential_id, \
-                setting.fiat_percentage, setting.fiat_currency, setting.terms_version \
+                setting.fiat_percentage, setting.fiat_currency \
            FROM users account \
            JOIN fiat_settlement_settings setting \
              ON setting.owner_npub = account.npub \
@@ -329,7 +325,6 @@ pub async fn validate_and_capture_lightning_address_policy(
                     AND setting.credential_id = $3 \
                     AND setting.fiat_percentage = 100 \
                     AND setting.fiat_currency = $4 \
-                    AND setting.terms_version = $5 \
                     AND credential.admitted_for_new_orders \
                     AND credential.ciphertext IS NOT NULL \
                     AND credential.nonce IS NOT NULL \
@@ -339,7 +334,6 @@ pub async fn validate_and_capture_lightning_address_policy(
         .bind(nym)
         .bind(expected.credential_id)
         .bind(&expected.fiat_currency)
-        .bind(&expected.terms_version)
         .fetch_one(&mut **tx)
         .await?;
         if !exact {
@@ -357,10 +351,10 @@ pub async fn validate_and_capture_lightning_address_policy(
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
              reverse_swap_id, owner_npub, credential_id, product, \
-             fiat_percentage, fiat_currency, terms_version \
+             fiat_percentage, fiat_currency \
          ) \
          SELECT $1, setting.owner_npub, setting.credential_id, setting.product, \
-                setting.fiat_percentage, setting.fiat_currency, setting.terms_version \
+                setting.fiat_percentage, setting.fiat_currency \
            FROM fiat_settlement_settings setting \
            JOIN bull_bitcoin_credentials credential \
              ON credential.id = setting.credential_id \
@@ -373,7 +367,6 @@ pub async fn validate_and_capture_lightning_address_policy(
             AND setting.credential_id = $4 \
             AND setting.fiat_percentage = $5 \
             AND setting.fiat_currency = $6 \
-            AND setting.terms_version = $7 \
             AND credential.admitted_for_new_orders \
             AND credential.ciphertext IS NOT NULL \
             AND credential.nonce IS NOT NULL",
@@ -384,7 +377,6 @@ pub async fn validate_and_capture_lightning_address_policy(
     .bind(expected.credential_id)
     .bind(expected.fiat_percentage)
     .bind(&expected.fiat_currency)
-    .bind(&expected.terms_version)
     .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -397,7 +389,7 @@ pub async fn reverse_swap_fiat_settlement_policy(
     sqlx::query_as(
         "SELECT policy.reverse_swap_id, policy.chain_swap_id, swap.invoice_id, \
                 policy.owner_npub, policy.credential_id, policy.product, \
-                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+                policy.fiat_percentage, policy.fiat_currency \
            FROM swap_fiat_settlement_policies policy \
            JOIN swap_records swap ON swap.id = policy.reverse_swap_id \
           WHERE policy.reverse_swap_id = $1",
@@ -414,7 +406,7 @@ pub async fn chain_swap_fiat_settlement_policy(
     sqlx::query_as(
         "SELECT policy.reverse_swap_id, policy.chain_swap_id, swap.invoice_id, \
                 policy.owner_npub, policy.credential_id, policy.product, \
-                policy.fiat_percentage, policy.fiat_currency, policy.terms_version \
+                policy.fiat_percentage, policy.fiat_currency \
            FROM swap_fiat_settlement_policies policy \
            JOIN chain_swap_records swap ON swap.id = policy.chain_swap_id \
           WHERE policy.chain_swap_id = $1",
@@ -574,13 +566,12 @@ pub async fn reserve_bull_bitcoin_settlement(
                  SELECT 1 FROM fiat_settlement_settings \
                   WHERE owner_npub = $1 AND product = 'lightning_address' \
                     AND credential_id = $2 AND fiat_percentage = 100 \
-                    AND fiat_currency = $3 AND terms_version = $4 \
+                    AND fiat_currency = $3 \
              )",
         )
         .bind(settlement.owner_npub)
         .bind(settlement.credential_id)
         .bind(settlement.fiat_currency)
-        .bind(settlement.terms_version)
         .fetch_one(&mut *transaction)
         .await?;
         if !setting_matches {
@@ -594,8 +585,8 @@ pub async fn reserve_bull_bitcoin_settlement(
              id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
              credential_id, product, purpose, \
              payer_rail, request_key, fiat_percentage, fiat_currency, \
-             terms_version, requested_bitcoin_sat \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             requested_bitcoin_sat \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(settlement.owner_npub)
@@ -609,7 +600,6 @@ pub async fn reserve_bull_bitcoin_settlement(
     .bind(settlement.request_key)
     .bind(settlement.fiat_percentage)
     .bind(settlement.fiat_currency)
-    .bind(settlement.terms_version)
     .bind(settlement.requested_bitcoin_sat)
     .execute(&mut *transaction)
     .await?;
@@ -1191,7 +1181,6 @@ fn validate_reservation_identity(
         || stored.request_key != requested.request_key
         || stored.fiat_percentage != requested.fiat_percentage
         || stored.fiat_currency != requested.fiat_currency
-        || stored.terms_version != requested.terms_version
         || stored.requested_bitcoin_sat != requested.requested_bitcoin_sat
     {
         return Err(BullBitcoinSettlementStoreError::RequestKeyConflict);
