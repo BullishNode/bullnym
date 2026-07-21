@@ -2907,6 +2907,66 @@ async fn bull_bitcoin_exact_payer_intent_replays_after_setting_change_or_deletio
 }
 
 #[tokio::test]
+async fn get_paid_history_never_labels_unprepared_mixed_payment_as_bitcoin() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "fiat-mixed-history-gap";
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, ScriptedBullBitcoinApi::default(), nym).await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::LightningAddress,
+        40,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    insert_swap(&pool, nym, "lockup_mempool", 91).await;
+    let reverse_swap_id: Uuid = sqlx::query_scalar(
+        "UPDATE swap_records SET payment_first_observed_at = NOW() \
+          WHERE boltz_swap_id = $1 RETURNING id",
+    )
+    .bind(format!("boltz-{nym}-91"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let setting = pay_service::db::active_lightning_address_fiat_setting(&pool, nym)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        pay_service::db::validate_and_capture_lightning_address_policy(
+            &mut tx,
+            reverse_swap_id,
+            nym,
+            Some(&setting),
+        )
+        .await
+        .unwrap()
+    );
+    tx.commit().await.unwrap();
+
+    let app = test_app(state);
+    let uri = get_paid_transaction_history_uri(&keypair, &owner_npub, "", 10, auth_timestamp());
+    let (status, history) = get_path(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["settlement_state"], "pending");
+    assert_eq!(transactions[0]["settlement_kind"], "unavailable");
+    assert!(transactions[0].get("settlement_details").is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -3133,6 +3193,34 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         ]
     );
 
+    let pending_app = test_app(fixture.state.clone());
+    let pending_timestamp = auth_timestamp();
+    let pending_history_uri = get_paid_transaction_history_uri(
+        &fixture.keypair,
+        &fixture.owner_npub,
+        "",
+        10,
+        pending_timestamp,
+    );
+    let (pending_status, pending_history) = get_path(&pending_app, &pending_history_uri).await;
+    assert_eq!(pending_status, StatusCode::OK, "{pending_history:?}");
+    let pending_transactions = pending_history["transactions"].as_array().unwrap();
+    assert_eq!(pending_transactions.len(), 1);
+    assert_eq!(pending_transactions[0]["settlement_state"], "pending");
+    assert_eq!(pending_transactions[0]["settlement_kind"], "mixed");
+    assert_eq!(
+        pending_transactions[0]["settlement_details"]["bitcoin"][0]["status"],
+        "settled"
+    );
+    assert_eq!(
+        pending_transactions[0]["settlement_details"]["fiat"][0]["status"],
+        "pending"
+    );
+    assert_eq!(
+        pending_transactions[0]["settlement_details"]["fiat"][0]["amount_minor"],
+        Value::Null
+    );
+
     let deletion =
         pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &fixture.owner_npub)
             .await
@@ -3211,6 +3299,41 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
     assert!(!merchant_json.contains("40500"));
     assert!(!merchant_json.contains("bbak-"));
 
+    let history_uri =
+        get_paid_transaction_history_uri(&fixture.keypair, &fixture.owner_npub, "", 10, timestamp);
+    let (history_status, history) = get_path(&app, &history_uri).await;
+    assert_eq!(history_status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(
+        transactions.len(),
+        1,
+        "mixed accounting legs must be one receipt"
+    );
+    assert_eq!(transactions[0]["transaction_id"], settlement_id.to_string());
+    assert_eq!(transactions[0]["amount_sat"], 100_000);
+    assert_eq!(transactions[0]["settlement_kind"], "mixed");
+    assert_eq!(
+        transactions[0]["settlement_details"],
+        json!({
+            "kind": "mixed",
+            "bitcoin": [{
+                "amount_sat": 60_000,
+                "network": "liquid",
+                "status": "settled",
+            }],
+            "fiat": [{
+                "amount_minor": 12_345,
+                "currency": "CAD",
+                "order_id": order_id,
+                "status": "settled",
+            }]
+        })
+    );
+    let history_json = history.to_string();
+    assert!(!history_json.contains(&claim_txid));
+    assert!(!history_json.contains("40500"));
+    assert!(!history_json.contains("bbak-"));
+
     cleanup_db(&pool).await;
 }
 
@@ -3260,6 +3383,44 @@ async fn bull_bitcoin_mixed_minimum_and_invalid_split_fall_back_once() {
         minimum_route,
         ("abandoned".into(), "bitcoin_fallback".into(), true, true)
     );
+
+    let fallback_claim_txid = "9".repeat(64);
+    sqlx::query(
+        "UPDATE swap_records SET status = 'claimed', claim_txid = $2, updated_at = NOW() \
+          WHERE id = $1",
+    )
+    .bind(minimum.reverse_swap_id)
+    .bind(&fallback_claim_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        invoice::record_reverse_claim_settlement(
+            &pool,
+            minimum.reverse_swap_id,
+            Some(minimum.invoice.id),
+            25_000,
+            &minimum.boltz_swap_id,
+            &fallback_claim_txid,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+    );
+    let app = test_app(minimum.state.clone());
+    let timestamp = auth_timestamp();
+    let history_uri =
+        get_paid_transaction_history_uri(&minimum.keypair, &minimum.owner_npub, "", 10, timestamp);
+    let (history_status, history) = get_path(&app, &history_uri).await;
+    assert_eq!(history_status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["amount_sat"], 25_000);
+    assert_eq!(transactions[0]["settlement_kind"], "bitcoin");
+    assert_eq!(
+        transactions[0]["fiat_conversion"],
+        json!({"status": "overridden", "reason": "below_minimum"})
+    );
+    assert!(transactions[0].get("settlement_details").is_none());
 
     cleanup_db(&pool).await;
     let invalid_fake = ScriptedBullBitcoinApi::default();
@@ -3555,6 +3716,33 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         assert!(!serialized.contains(&forbidden), "leaked {forbidden}");
     }
 
+    let history_uri = get_paid_transaction_history_uri(&keypair, &owner_npub, "", 10, timestamp);
+    let (history_status, history) = get_path(&app, &history_uri).await;
+    assert_eq!(history_status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["transaction_id"], settlement_id.to_string());
+    assert_eq!(transactions[0]["source"], "lightning_address");
+    assert_eq!(transactions[0]["invoice_id"], Value::Null);
+    assert_eq!(transactions[0]["amount_sat"], 27_500);
+    assert_eq!(transactions[0]["settlement_kind"], "fiat");
+    assert_eq!(
+        transactions[0]["settlement_details"],
+        json!({
+            "kind": "fiat",
+            "fiat": [{
+                "amount_minor": 12_345,
+                "currency": "CAD",
+                "order_id": order_id,
+                "status": "settled",
+            }]
+        })
+    );
+    let history_json = history.to_string();
+    assert!(!history_json.contains(&credential_id.to_string()));
+    assert!(!history_json.contains("bbak-"));
+    assert!(!history_json.contains("payer_instruction"));
+
     let other_keypair = Keypair::new(&Secp256k1::new(), &mut secp256k1::rand::thread_rng());
     let other_npub = other_keypair.x_only_public_key().0.to_string();
     pay_service::db::create_user(&pool, "fiat-la-list-other", &other_npub, TEST_DESCRIPTOR)
@@ -3800,6 +3988,30 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
     assert!(!merchant_json.contains(&settlement_id.to_string()));
     assert!(!merchant_json.contains("bc1qxy2kgdy"));
     assert!(!merchant_json.contains("bbak-"));
+
+    let history_uri = get_paid_transaction_history_uri(&keypair, &owner_npub, "", 10, timestamp);
+    let (history_status, history) = get_path(&app, &history_uri).await;
+    assert_eq!(history_status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["transaction_id"], settlement_id.to_string());
+    assert_eq!(transactions[0]["amount_sat"], 27_500);
+    assert_eq!(transactions[0]["settlement_kind"], "fiat");
+    assert_eq!(
+        transactions[0]["settlement_details"],
+        json!({
+            "kind": "fiat",
+            "fiat": [{
+                "amount_minor": 12_345,
+                "currency": "CAD",
+                "order_id": order_id,
+                "status": "settled",
+            }]
+        })
+    );
+    let history_json = history.to_string();
+    assert!(!history_json.contains("bc1qxy2kgdy"));
+    assert!(!history_json.contains("bbak-"));
 
     cleanup_db(&pool).await;
 }
@@ -14198,6 +14410,9 @@ async fn get_paid_history_unifies_payment_evidence_without_making_comments_the_r
         .iter()
         .filter(|item| item["source"] == "lightning_address")
         .all(|item| item["settlement_state"] == "settled"));
+    assert!(all_items
+        .iter()
+        .all(|item| item["settlement_kind"] == "bitcoin"));
     assert!(all_items
         .iter()
         .filter(|item| matches!(
