@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::HeaderMap;
@@ -9,6 +10,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::admission::Rail;
+use crate::bull_bitcoin::{
+    BitcoinAmountSat, BitcoinNetwork, FiatCurrency, PayerInstruction, Product,
+};
+use crate::bull_bitcoin_settlement::{
+    self, FiatOnlyInstructionOutcome, FiatOnlyInstructionRequest, SettlementServiceError,
+};
 use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
@@ -109,6 +116,8 @@ const COMMENT_RETRY_MISMATCH: &str =
 const COMMENT_LIGHTNING_ONLY: &str =
     "Comments are currently available only for Lightning payments. Retry without the L-BTC payment method.";
 const COMMENT_INTERNAL_FAILURE: &str = "LNURL comment persistence failed";
+const COMMENT_FIAT_UNAVAILABLE: &str =
+    "Comments are not available when this Lightning Address settles fully to fiat.";
 
 struct RequestedLnurlComment {
     key: LnurlCommentIntentKey,
@@ -225,6 +234,100 @@ fn requests_method(payment_method: Option<&str>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn setting_is_mixed(setting: Option<&db::ActiveFiatSettlementSetting>) -> bool {
+    setting.is_some_and(|setting| (1..=99).contains(&setting.fiat_percentage))
+}
+
+fn setting_is_fiat_only(setting: Option<&db::ActiveFiatSettlementSetting>) -> bool {
+    setting.is_some_and(|setting| setting.fiat_percentage == 100)
+}
+
+enum FiatOnlyLnurlDecision {
+    NotApplicable,
+    BullBitcoin(PayerInstruction),
+    BitcoinFallback,
+}
+
+async fn fiat_only_lnurl_instruction(
+    state: &AppState,
+    user: &db::User,
+    setting: Option<&db::ActiveFiatSettlementSetting>,
+    intent_key: &LnurlCommentIntentKey,
+    network: BitcoinNetwork,
+    amount_sat: u64,
+) -> Result<FiatOnlyLnurlDecision, AppError> {
+    let amount_sat = i64::try_from(amount_sat)
+        .map_err(|_| AppError::InvalidAmount("amount exceeds settlement range".into()))?;
+    let bitcoin_amount = BitcoinAmountSat::new(amount_sat)
+        .map_err(|_| AppError::InvalidAmount("invalid fiat-settlement amount".into()))?;
+    let request_key = format!(
+        "lnurl:{}:{}:{}",
+        intent_key.as_str(),
+        network.as_str(),
+        amount_sat
+    );
+
+    let replay = bull_bitcoin_settlement::replay_fiat_only_instruction(
+        state,
+        &user.npub,
+        &request_key,
+        Product::LightningAddress,
+        network,
+        bitcoin_amount,
+    )
+    .await
+    .map_err(|error| {
+        AppError::ServiceUnavailable(format!(
+            "fiat settlement replay is temporarily unavailable: {error}"
+        ))
+    })?;
+    if let Some(outcome) = replay {
+        return Ok(match outcome {
+            FiatOnlyInstructionOutcome::BullBitcoin { instruction, .. } => {
+                FiatOnlyLnurlDecision::BullBitcoin(instruction)
+            }
+            FiatOnlyInstructionOutcome::BitcoinFallback { .. } => {
+                FiatOnlyLnurlDecision::BitcoinFallback
+            }
+        });
+    }
+
+    let Some(setting) = setting.filter(|setting| setting.fiat_percentage == 100) else {
+        return Ok(FiatOnlyLnurlDecision::NotApplicable);
+    };
+    if setting.owner_npub != user.npub {
+        return Err(AppError::DbError(
+            "Lightning Address fiat setting identity is invalid".into(),
+        ));
+    }
+    let currency = FiatCurrency::from_str(&setting.fiat_currency)
+        .map_err(|_| AppError::DbError("invalid Lightning Address fiat currency".into()))?;
+    let request = FiatOnlyInstructionRequest {
+        owner_npub: &user.npub,
+        invoice_id: None,
+        product: Product::LightningAddress,
+        credential_id: setting.credential_id,
+        request_key: &request_key,
+        fiat_currency: currency,
+        network,
+        bitcoin_amount,
+        use_payjoin: false,
+    };
+    match bull_bitcoin_settlement::create_fiat_only_instruction(state, &request).await {
+        Ok(FiatOnlyInstructionOutcome::BullBitcoin { instruction, .. }) => {
+            Ok(FiatOnlyLnurlDecision::BullBitcoin(instruction))
+        }
+        Ok(FiatOnlyInstructionOutcome::BitcoinFallback { .. })
+        | Err(
+            SettlementServiceError::SourceIdentityUnavailable
+            | SettlementServiceError::CredentialUnavailable,
+        ) => Ok(FiatOnlyLnurlDecision::BitcoinFallback),
+        Err(error) => Err(AppError::ServiceUnavailable(format!(
+            "fiat settlement is temporarily unavailable: {error}"
+        ))),
+    }
+}
+
 fn lightning_address_unavailable(_error: LightningAddressUnavailable) -> AppError {
     AppError::MoneyAdmissionUnavailable
 }
@@ -300,6 +403,14 @@ pub async fn metadata(
     let _user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+    // The rollout flag gates new fiat admission. Persisted settings remain in
+    // the database so already-created provider orders can still be replayed
+    // and reconciled, but they must not alter metadata while admission is off.
+    let fiat_setting = if state.config.features.bull_bitcoin_fiat_settlement {
+        db::active_lightning_address_fiat_setting(&state.db, &nym).await?
+    } else {
+        None
+    };
 
     // Cheap, in-process read only. Keep it after abuse/certification and nym
     // existence gates so rejected metadata requests cannot probe provider
@@ -337,8 +448,16 @@ pub async fn metadata(
         min_sendable,
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
-        comment_allowed: LNURL_COMMENT_ALLOWED,
-        payment_methods: vec!["L-BTC"],
+        comment_allowed: if setting_is_fiat_only(fiat_setting.as_ref()) {
+            0
+        } else {
+            LNURL_COMMENT_ALLOWED
+        },
+        payment_methods: if setting_is_mixed(fiat_setting.as_ref()) {
+            Vec::new()
+        } else {
+            vec!["L-BTC"]
+        },
     }))
 }
 
@@ -393,12 +512,15 @@ fn liquid_response_addr_index(
 
 /// Liquid LUD-22 path. On rate-limit, returns `SoftRateLimited` so the
 /// caller can transparently route to Lightning (the default rail).
+#[allow(clippy::too_many_arguments)]
 async fn serve_liquid(
     state: &AppState,
     nym: &str,
     user: &db::User,
-    _amount_sat: u64,
+    amount_sat: u64,
     params: &CallbackParams,
+    intent_key: &LnurlCommentIntentKey,
+    fiat_setting: Option<&db::ActiveFiatSettlementSetting>,
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
 ) -> Result<axum::response::Response, LiquidOutcome> {
@@ -512,6 +634,42 @@ async fn serve_liquid(
         None
     };
 
+    match fiat_only_lnurl_instruction(
+        state,
+        user,
+        fiat_setting,
+        intent_key,
+        BitcoinNetwork::Liquid,
+        amount_sat,
+    )
+    .await?
+    {
+        FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
+            let PayerInstruction::Liquid {
+                confidential_address,
+            } = instruction
+            else {
+                return Err(LiquidOutcome::Hard(AppError::DbError(
+                    "Bull Bitcoin returned the wrong Lightning Address rail".into(),
+                )));
+            };
+            let response = serde_json::json!({
+                "L-BTC": { "address": confidential_address }
+            });
+            db::touch_user_callback(&state.db, nym).await;
+            return Ok(Json(response).into_response());
+        }
+        FiatOnlyLnurlDecision::BitcoinFallback => {}
+        FiatOnlyLnurlDecision::NotApplicable => {
+            if setting_is_mixed(fiat_setting) {
+                return Err(LiquidOutcome::Hard(AppError::InvalidAmount(
+                    "L-BTC is unavailable when this Lightning Address uses mixed Bitcoin/fiat settlement"
+                        .into(),
+                )));
+            }
+        }
+    }
+
     let addr_index_u32 = liquid_response_addr_index(user.next_addr_idx, reserved_addr_index)?;
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
@@ -522,6 +680,7 @@ async fn serve_liquid(
 
 /// Lightning path. Default rail; also the destination for Liquid soft
 /// fallbacks. Per-source rate-limited (loose; Boltz-quota guard).
+#[allow(clippy::too_many_arguments)]
 async fn serve_lightning(
     state: &AppState,
     nym: &str,
@@ -530,7 +689,37 @@ async fn serve_lightning(
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
     requested_comment: Option<&RequestedLnurlComment>,
+    intent_key: &LnurlCommentIntentKey,
+    fiat_setting: Option<&db::ActiveFiatSettlementSetting>,
 ) -> Result<axum::response::Response, AppError> {
+    // An exact retry belongs to the first durable fiat-only decision even if
+    // the merchant changed settings after the callback was issued.
+    let mut effective_fiat_setting = fiat_setting;
+    match fiat_only_lnurl_instruction(
+        state,
+        user,
+        None,
+        intent_key,
+        BitcoinNetwork::Lightning,
+        amount_msat / 1_000,
+    )
+    .await?
+    {
+        FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
+            if requested_comment.is_some() {
+                return Err(AppError::InvalidComment(COMMENT_FIAT_UNAVAILABLE));
+            }
+            let PayerInstruction::Lightning { bolt11 } = instruction else {
+                return Err(AppError::DbError(
+                    "Bull Bitcoin returned the wrong Lightning Address rail".into(),
+                ));
+            };
+            return Ok(Json(lightning_response(nym, &state.config.domain, bolt11)).into_response());
+        }
+        FiatOnlyLnurlDecision::BitcoinFallback => effective_fiat_setting = None,
+        FiatOnlyLnurlDecision::NotApplicable => {}
+    }
+
     let persisted_comment = if let Some(requested) = requested_comment {
         let intent = db::persist_lnurl_comment_intent(
             &state.db,
@@ -560,11 +749,49 @@ async fn serve_lightning(
         }
     }
 
+    if setting_is_fiat_only(effective_fiat_setting) {
+        match fiat_only_lnurl_instruction(
+            state,
+            user,
+            effective_fiat_setting,
+            intent_key,
+            BitcoinNetwork::Lightning,
+            amount_msat / 1_000,
+        )
+        .await?
+        {
+            FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
+                let PayerInstruction::Lightning { bolt11 } = instruction else {
+                    return Err(AppError::DbError(
+                        "Bull Bitcoin returned the wrong Lightning Address rail".into(),
+                    ));
+                };
+                return Ok(
+                    Json(lightning_response(nym, &state.config.domain, bolt11)).into_response()
+                );
+            }
+            FiatOnlyLnurlDecision::BitcoinFallback => effective_fiat_setting = None,
+            FiatOnlyLnurlDecision::NotApplicable => {
+                return Err(AppError::DbError(
+                    "Lightning Address fiat setting lost its durable decision".into(),
+                ));
+            }
+        }
+    }
+
     let binding = requested_comment.map(|requested| LnurlCommentInstructionBinding {
         owner_npub: &user.npub,
         idempotency_key: &requested.key,
     });
-    match create_lightning_swap(state, nym, amount_msat, binding.as_ref()).await {
+    match create_lightning_swap(
+        state,
+        nym,
+        amount_msat,
+        binding.as_ref(),
+        effective_fiat_setting,
+    )
+    .await
+    {
         Ok((response, _swap_id)) => Ok(Json(response).into_response()),
         Err(creation_error) => {
             // A simultaneous exact callback may have won the immutable
@@ -606,6 +833,7 @@ async fn create_lightning_swap(
     nym: &str,
     amount_msat: u64,
     comment_binding: Option<&LnurlCommentInstructionBinding<'_>>,
+    fiat_setting: Option<&db::ActiveFiatSettlementSetting>,
 ) -> Result<(LightningResponse, String), AppError> {
     state
         .admission
@@ -688,9 +916,32 @@ async fn create_lightning_swap(
         .begin()
         .await
         .map_err(|_| AppError::DbError(format!("failed to record swap {}", result.swap_id)))?;
-    db::record_swap_in_tx_with_lineage(&mut tx, &new_swap, &lineage)
+    let reverse_swap_id = db::record_swap_in_tx_with_lineage(&mut tx, &new_swap, &lineage)
         .await
         .map_err(|_| AppError::DbError(format!("failed to record swap {}", result.swap_id)))?;
+    let captured = if state.config.features.bull_bitcoin_fiat_settlement {
+        db::validate_and_capture_lightning_address_policy(
+            &mut tx,
+            reverse_swap_id,
+            nym,
+            fiat_setting,
+        )
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "Lightning Address settlement setting changed; refresh and retry: {error}"
+            ))
+        })?
+    } else {
+        // A dormant saved setting is intentionally ignored while rollout is
+        // disabled. It must not make the ordinary Bitcoin path unpayable.
+        false
+    };
+    if captured != setting_is_mixed(fiat_setting) {
+        return Err(AppError::DbError(
+            "Lightning Address mixed policy capture mismatch".into(),
+        ));
+    }
     if let Some(binding) = comment_binding {
         db::bind_lnurl_comment_instruction_in_tx(
             &mut tx,
@@ -757,11 +1008,18 @@ async fn callback_inner(
     let user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+    // Keep old write-ahead decisions replayable while the rollout flag is
+    // disabled, but never admit a new fiat decision from a dormant setting.
+    let fiat_setting = if state.config.features.bull_bitcoin_fiat_settlement {
+        db::active_lightning_address_fiat_setting(&state.db, &nym).await?
+    } else {
+        None
+    };
 
     let payer_comment = LnurlPayerComment::from_optional(params.comment.take())
         .map_err(comment_validation_error)?;
     let requested_comment = payer_comment.map(|comment| RequestedLnurlComment {
-        key: comment_intent_key,
+        key: comment_intent_key.clone(),
         comment,
     });
 
@@ -790,7 +1048,9 @@ async fn callback_inner(
     if requested_comment.is_some() && requests_method(params.payment_method.as_deref(), "L-BTC") {
         return Err(AppError::InvalidComment(COMMENT_LIGHTNING_ONLY));
     }
-
+    if requested_comment.is_some() && setting_is_fiat_only(fiat_setting.as_ref()) {
+        return Err(AppError::InvalidComment(COMMENT_FIAT_UNAVAILABLE));
+    }
     let liquid_throttle = if requests_method(params.payment_method.as_deref(), "L-BTC") {
         match serve_liquid(
             &state,
@@ -798,6 +1058,8 @@ async fn callback_inner(
             &user,
             amount_sat,
             &params,
+            &comment_intent_key,
+            fiat_setting.as_ref(),
             caller_ip,
             is_whitelisted,
         )
@@ -829,6 +1091,8 @@ async fn callback_inner(
         caller_ip,
         is_whitelisted,
         requested_comment.as_ref(),
+        &comment_intent_key,
+        fiat_setting.as_ref(),
     )
     .await
     {

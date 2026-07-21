@@ -13,6 +13,17 @@ lightning_address = true
 invoices = true
 payment_pages = true
 nip05 = false
+bull_bitcoin_fiat_settlement = false
+
+[bull_bitcoin]
+api_url = "https://api.bullbitcoin.com/ak/api-orders"
+connect_timeout_ms = 2000
+request_timeout_ms = 10000
+reconcile_interval_secs = 30
+reconcile_batch_size = 50
+retry_backoff_cap_secs = 900
+# Enable only after validating Bull Bitcoin's late-payment semantics.
+late_payment_retention_secs = 2592000
 
 [limits]
 # Match prod so simulator's amount=100000 msat works.

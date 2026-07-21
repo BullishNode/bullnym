@@ -1,6 +1,6 @@
 import type {
   FiatQuoteView,
-  PayerDemandQuoteResponse,
+  FiatFixedPayerDemandQuoteResponse,
   PayerQuoteRail,
   VersionedPayerInstruction,
 } from '$lib/api/client'
@@ -64,7 +64,7 @@ export interface LightningQuoteAuthority {
 export type PayerQuoteFetcher = (
   rail: PayerQuoteRail,
   trigger: QuoteRefreshTrigger,
-) => Promise<PayerDemandQuoteResponse>
+) => Promise<FiatFixedPayerDemandQuoteResponse>
 
 const RAILS: readonly PayerQuoteRail[] = ['lightning', 'liquid', 'bitcoin']
 export const PAYER_QUOTE_LIFETIME_SECONDS = 5 * 60
@@ -113,10 +113,14 @@ function assertInstruction(
   }
   if (rail === 'lightning') {
     if (
-      instruction.kind !== 'lightning_boltz_reverse' ||
-      !instruction.quote_offer_id ||
-      !instruction.pr
+      instruction.kind !== 'lightning_boltz_reverse' &&
+      instruction.kind !== 'lightning_direct' &&
+      instruction.kind !== 'lightning_current'
     ) {
+      throw new Error('quote instruction does not match the selected rail')
+    }
+    if (!instruction.pr) throw new Error('quote instruction does not match the selected rail')
+    if (instruction.kind === 'lightning_boltz_reverse' && !instruction.quote_offer_id) {
       throw new Error('quote instruction does not match the selected rail')
     }
     return
@@ -191,7 +195,7 @@ function quoteFingerprint(quote: Readonly<FiatQuoteView>): string {
 function snapshotFromResponse(
   invoiceId: string,
   rail: PayerQuoteRail,
-  response: PayerDemandQuoteResponse,
+  response: FiatFixedPayerDemandQuoteResponse,
   nowMs: number,
 ): PayerQuoteRailSnapshot {
   if (
@@ -205,7 +209,9 @@ function snapshotFromResponse(
   assertInstruction(rail, response.instruction)
   const direct =
     response.instruction.kind === 'liquid_direct' ||
-    response.instruction.kind === 'bitcoin_direct'
+    response.instruction.kind === 'bitcoin_direct' ||
+    response.instruction.kind === 'lightning_direct' ||
+    response.instruction.kind === 'lightning_current'
   if (
     (direct && response.instruction.payer_amount_sat !== response.quote.merchant_amount_sat) ||
     (!direct && response.instruction.payer_amount_sat <= response.quote.merchant_amount_sat)
@@ -250,14 +256,24 @@ export function quoteRailPresentation(
   const merchantAmountSat = snapshot.quote.merchant_amount_sat
   const swapCostSat = payerAmountSat - merchantAmountSat
   let qrValue: string
-  if (snapshot.instruction.kind === 'lightning_boltz_reverse') {
+  if (
+    snapshot.instruction.kind === 'lightning_boltz_reverse' ||
+    snapshot.instruction.kind === 'lightning_direct' ||
+    snapshot.instruction.kind === 'lightning_current'
+  ) {
     qrValue = snapshot.instruction.pr
   } else if (snapshot.instruction.kind === 'liquid_direct') {
     qrValue = liquidUri(snapshot.instruction.address, payerAmountSat, liquidAssetId)
-  } else {
+  } else if (
+    snapshot.instruction.kind === 'bitcoin_direct' ||
+    snapshot.instruction.kind === 'bitcoin_boltz_chain' ||
+    snapshot.instruction.kind === 'bitcoin_boltz_chain_current'
+  ) {
     // A chain offer's BIP21 is provider-bound evidence. Never synthesize it
     // from an address and amount on the client.
     qrValue = snapshot.instruction.bip21
+  } else {
+    return null
   }
   return Object.freeze({
     quoteVersionId: snapshot.quote.quote_version_id,
@@ -302,7 +318,12 @@ export function captureLightningQuoteAuthority(
 ): LightningQuoteAuthority | null {
   if (state.pending.lightning) return null
   const snapshot = activeQuoteSnapshot(state, 'lightning', nowMs)
-  if (!snapshot || snapshot.instruction.kind !== 'lightning_boltz_reverse') return null
+  if (!snapshot) return null
+  if (
+    snapshot.instruction.kind !== 'lightning_boltz_reverse' &&
+    snapshot.instruction.kind !== 'lightning_direct' &&
+    snapshot.instruction.kind !== 'lightning_current'
+  ) return null
   const authority = {
     quoteVersionId: snapshot.quote.quote_version_id,
     versionNumber: snapshot.quote.version_number,

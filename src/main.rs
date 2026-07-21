@@ -20,12 +20,12 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
-    chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, fee_runtime, gc, get_paid_transaction_history, invoice,
-    ip_whitelist, lnurl, lnurl_comment_history, nostr, og_image, pricer, rate_limit, readiness,
-    reconciler, recovery_address_registration, registration, startup_provider_reconciliation,
-    swap_manifest_runtime,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, bull_bitcoin_settlement, certification,
+    chain_fallback, chain_lockup_witness_adapter, chain_watcher, claimer, config, db,
+    derivation_guard, donation_page, donation_render, fee_runtime, fiat_settlement, gc,
+    get_paid_transaction_history, invoice, ip_whitelist, lnurl, lnurl_comment_history, nostr,
+    og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
+    registration, startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, wallet_backup, AppState,
 };
@@ -87,11 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     tracing::info!(
-        "features: lightning_address={} invoices={} payment_pages={} nip05={} workers={}",
+        "features: lightning_address={} invoices={} payment_pages={} nip05={} bull_bitcoin_fiat_settlement={} workers={}",
         config.features.lightning_address,
         config.features.invoices,
         config.features.payment_pages,
         config.features.nip05,
+        config.features.bull_bitcoin_fiat_settlement,
         config.workers.enabled,
     );
     if config.features.payment_pages && !config.workers.enabled {
@@ -523,6 +524,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = config.listen.clone();
     let config = Arc::new(config);
+    let bull_bitcoin = Arc::new(
+        pay_service::bull_bitcoin::HttpBullBitcoinApi::new(&config.bull_bitcoin)
+            .map_err(|error| format!("invalid Bull Bitcoin API client configuration: {error}"))?,
+    );
     let boltz = Arc::new(boltz_service);
     let whitelist = Arc::new(whitelist);
     let certification_allowlist = Arc::new(certification_allowlist);
@@ -619,6 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         admission,
         boltz: boltz.clone(),
+        bull_bitcoin,
         ip_whitelist: whitelist.clone(),
         certification: certification_allowlist.clone(),
         rate_limiter: rate_limiter.clone(),
@@ -765,6 +771,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.workers.enabled {
         tracing::info!("background workers enabled");
+        {
+            // The rollout flag gates new fiat admission, not supervision of
+            // already-exposed Bull Bitcoin destinations. Keep this worker
+            // running whenever this process owns background work.
+            let settlement_state = state.clone();
+            let settlement_cancel = cancel.clone();
+            tokio::spawn(async move {
+                bull_bitcoin_settlement::run_reconciler(settlement_state, settlement_cancel).await;
+            });
+            tracing::info!(
+                interval_secs = config.bull_bitcoin.reconcile_interval_secs,
+                batch_size = config.bull_bitcoin.reconcile_batch_size,
+                "Bull Bitcoin settlement reconciler started"
+            );
+        }
         if config.features.payment_pages {
             og_image::spawn_reconciler(
                 pool.clone(),
@@ -985,6 +1006,29 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/supported-currencies",
             get(pricer::supported_currencies),
+        )
+        .route(
+            "/api/v1/fiat-settlement/options",
+            get(fiat_settlement::options),
+        )
+        .route(
+            "/api/v1/fiat-settlement",
+            get(fiat_settlement::configuration),
+        )
+        .route(
+            "/api/v1/fiat-settlements",
+            get(fiat_settlement::settlements),
+        )
+        .route(
+            "/api/v1/fiat-settlement/:product",
+            put(fiat_settlement::set)
+                .delete(fiat_settlement::delete_product)
+                .layer(DefaultBodyLimit::max(fiat_settlement::BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/v1/bull-bitcoin-credential",
+            axum::routing::delete(fiat_settlement::delete_credential)
+                .layer(DefaultBodyLimit::max(fiat_settlement::BODY_LIMIT_BYTES)),
         )
         .route("/api/v1/rate", get(pricer::rate))
         .route(og_image::FALLBACK_LIVE_PATH, get(og_image::fallback_live))
@@ -1286,13 +1330,32 @@ fn apply_private_response_headers(response: &mut Response) {
 }
 
 async fn private_invoice_response_headers(req: Request<Body>, next: Next) -> Response {
-    let is_private = req
+    let route = req
         .extensions()
         .get::<MatchedPath>()
-        .is_some_and(|route| is_private_invoice_route(route.as_str()));
+        .map(|route| route.as_str().to_owned());
+    let is_private = route
+        .as_deref()
+        .is_some_and(is_private_invoice_route);
     let mut response = next.run(req).await;
     if is_private {
         apply_private_response_headers(&mut response);
+    }
+    if route
+        .as_deref()
+        .is_some_and(|route| route.starts_with("/api/v1/fiat-settlement"))
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store, max-age=0"),
+        );
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        response.headers_mut().insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
     }
     response
 }

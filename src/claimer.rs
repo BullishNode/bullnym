@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::Connection;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -31,6 +33,8 @@ use boltz_client::Keypair;
 use crate::admission::WorkerReporter;
 use crate::boltz::{ChainSwapQuote, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
 use crate::builder_fee::LiquidBuilderFeeDecision;
+use crate::bull_bitcoin_claim::{self, VerifiedClaimOutput, VerifiedMixedClaim};
+use crate::bull_bitcoin_settlement::{self, MixedSettlementPreparation};
 use crate::chain_swap_action::{
     recheck_chain_swap_execution_under_lock, reduce_chain_swap_evidence, BitcoinSourceEvidence,
     ChainSwapAction, ChainSwapExecutionAction, ChainSwapExecutionGate, EvidenceQuality,
@@ -2580,6 +2584,7 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
     match claim_swap(
         context.pool,
         swap.id,
+        Some(context.state),
         context.claim_clients,
         context.boltz_url,
         context.max_claim_attempts,
@@ -2750,6 +2755,330 @@ async fn resolve_claim_address(
     Ok(derived)
 }
 
+/// Resolve only the private key needed to verify Bullnym's own confidential
+/// output. Bull Bitcoin's output remains opaque and is authorized by its
+/// destination script plus the exact source/merchant/fee balance.
+async fn resolve_claim_blinding_key_hex(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &db::SwapRecord,
+    output_address: &str,
+) -> Result<String, AppError> {
+    if let Some(invoice_id) = swap.invoice_id {
+        let key: Option<String> =
+            sqlx::query_scalar("SELECT liquid_blinding_key_hex FROM invoices WHERE id = $1")
+                .bind(invoice_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?
+                .flatten();
+        return key.ok_or_else(|| {
+            AppError::ClaimError(format!(
+                "invoice {invoice_id} has no Liquid blinding key for mixed settlement"
+            ))
+        });
+    }
+
+    let nym = swap.nym.as_deref().ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "swap {} has no owner for mixed-settlement verification",
+            swap.id
+        ))
+    })?;
+    let user = db::get_user_by_nym(&mut **tx, nym)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("user not found: {nym}")))?;
+    descriptor::derive_blinding_key_hex(&user.ct_descriptor, output_address)
+}
+
+/// Owns the PostgreSQL session carrying the claim-preparation lock while the
+/// exact two-output fee is measured and the one allowed Bull Bitcoin create is
+/// made. Cancellation closes the backend session so a session lock can never
+/// leak back into the pool.
+struct ClaimPreparationSessionLock {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_key: String,
+    locked: bool,
+}
+
+impl ClaimPreparationSessionLock {
+    async fn acquire(pool: &sqlx::PgPool, lock_key: String) -> Result<Self, AppError> {
+        let mut connection = pool
+            .acquire()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        sqlx::query("SELECT pg_advisory_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        Ok(Self {
+            connection,
+            lock_key,
+            locked: true,
+        })
+    }
+
+    async fn unlock(&mut self) -> Result<(), AppError> {
+        let lock_key = self.lock_key.clone();
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+            .bind(lock_key)
+            .fetch_one(&mut **self)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        if !released {
+            return Err(AppError::DbError(
+                "claim-preparation advisory lock was not held by its connection".into(),
+            ));
+        }
+        self.locked = false;
+        Ok(())
+    }
+}
+
+impl Deref for ClaimPreparationSessionLock {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for ClaimPreparationSessionLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for ClaimPreparationSessionLock {
+    fn drop(&mut self) {
+        if self.locked {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn prepare_reverse_mixed_claim(
+    state: &AppState,
+    reverse_swap_id: Uuid,
+    had_persisted_claim: bool,
+    claim_clients: Option<&LiquidClaimClientFactory>,
+    boltz_url: &str,
+    fee_decision: Option<&LiquidFeeDecision>,
+) -> Result<Option<MixedSettlementPreparation>, AppError> {
+    let mut guard =
+        ClaimPreparationSessionLock::acquire(&state.db, format!("claim:{reverse_swap_id}")).await?;
+    let result = async {
+        if had_persisted_claim {
+            return bull_bitcoin_settlement::prepare_reverse_mixed_settlement_on_locked_connection(
+                state,
+                reverse_swap_id,
+                None,
+                &mut guard,
+            )
+            .await
+            .map_err(|error| {
+                AppError::ClaimError(format!("load journaled mixed reverse settlement: {error}"))
+            });
+        }
+        let claim_clients = claim_clients.ok_or_else(|| {
+            AppError::ClaimError(
+                "Liquid claim client is unavailable for mixed fee estimation".into(),
+            )
+        })?;
+        let fee_decision = fee_decision.ok_or_else(|| {
+            AppError::ClaimError("mixed reverse claim has no fee decision".into())
+        })?;
+        let mut tx = guard
+            .begin()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        let swap = db::get_swap_by_id(&mut *tx, reverse_swap_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?
+            .ok_or_else(|| AppError::ClaimError(format!("swap not found: {reverse_swap_id}")))?;
+        let status = swap
+            .parsed_status()
+            .map_err(|error| AppError::ClaimError(format!("invalid swap status: {error}")))?;
+        if swap.claim_tx_hex.is_some() {
+            tx.commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return bull_bitcoin_settlement::prepare_reverse_mixed_settlement_on_locked_connection(
+                state,
+                reverse_swap_id,
+                None,
+                &mut guard,
+            )
+            .await
+            .map_err(|error| {
+                AppError::ClaimError(format!("load raced mixed reverse journal: {error}"))
+            });
+        }
+        if !status.is_claimable() {
+            return Err(AppError::ClaimError(
+                "mixed reverse claim changed during fee preparation".into(),
+            ));
+        }
+        let output_address = resolve_claim_address(&mut tx, &swap).await?;
+        let response: CreateReverseResponse = serde_json::from_str(
+            swap.boltz_response_json
+                .as_deref()
+                .ok_or_else(|| AppError::ClaimError("missing boltz response".into()))?,
+        )
+        .map_err(|error| AppError::ClaimError(format!("invalid boltz response json: {error}")))?;
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+
+        let builder_fee = LiquidBuilderFeeDecision::from(fee_decision);
+        let claim_fee_sat = estimate_reverse_mixed_claim_fee_sat(
+            &swap,
+            &output_address,
+            claim_clients,
+            boltz_url,
+            &builder_fee,
+        )
+        .await?;
+        let net_settlement_sat = response
+            .onchain_amount
+            .checked_sub(claim_fee_sat)
+            .and_then(|amount| i64::try_from(amount).ok())
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| {
+                AppError::ClaimError("mixed reverse claim has no positive net settlement".into())
+            })?;
+        let basis = bull_bitcoin_settlement::MixedClaimBasis {
+            net_settlement_sat,
+            additional_output_script_len: confidential_liquid_script_len(&output_address)?,
+        };
+        bull_bitcoin_settlement::prepare_reverse_mixed_settlement_on_locked_connection(
+            state,
+            reverse_swap_id,
+            Some(basis),
+            &mut guard,
+        )
+        .await
+        .map_err(|error| AppError::ClaimError(format!("prepare mixed reverse settlement: {error}")))
+    }
+    .await;
+    guard.unlock().await?;
+    result
+}
+
+async fn prepare_chain_mixed_claim(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    had_persisted_claim: bool,
+    claim_clients: Option<&LiquidClaimClientFactory>,
+    boltz_url: &str,
+    fee_decision: Option<&LiquidFeeDecision>,
+) -> Result<Option<MixedSettlementPreparation>, AppError> {
+    let mut guard =
+        ClaimPreparationSessionLock::acquire(&state.db, format!("chain-claim:{chain_swap_id}"))
+            .await?;
+    let result = async {
+        if had_persisted_claim {
+            return bull_bitcoin_settlement::prepare_chain_mixed_settlement_on_locked_connection(
+                state,
+                chain_swap_id,
+                None,
+                &mut guard,
+            )
+            .await
+            .map_err(|error| {
+                AppError::ClaimError(format!("load journaled mixed chain settlement: {error}"))
+            });
+        }
+        let claim_clients = claim_clients.ok_or_else(|| {
+            AppError::ClaimError(
+                "Liquid claim client is unavailable for mixed fee estimation".into(),
+            )
+        })?;
+        let fee_decision = fee_decision
+            .ok_or_else(|| AppError::ClaimError("mixed chain claim has no fee decision".into()))?;
+        let mut tx = guard
+            .begin()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?
+            .ok_or_else(|| {
+                AppError::ClaimError(format!("chain swap not found: {chain_swap_id}"))
+            })?;
+        swap.verify_creation_response_integrity()
+            .map_err(AppError::ClaimError)?;
+        if swap.claim_tx_hex.is_some() {
+            tx.commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return bull_bitcoin_settlement::prepare_chain_mixed_settlement_on_locked_connection(
+                state,
+                chain_swap_id,
+                None,
+                &mut guard,
+            )
+            .await
+            .map_err(|error| {
+                AppError::ClaimError(format!("load raced mixed chain journal: {error}"))
+            });
+        }
+        let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?
+            .ok_or_else(|| {
+                AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id))
+            })?;
+        let output_address = if let Some(terms) = swap.creation_terms.as_ref() {
+            validated_chain_creation_destination(terms)?
+        } else {
+            invoice.liquid_address.clone().ok_or_else(|| {
+                AppError::ClaimError(format!(
+                    "legacy invoice {} has no liquid claim destination",
+                    swap.invoice_id
+                ))
+            })?
+        };
+        let source_total_sat = effective_chain_claim_amount_sat(&swap)?;
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+
+        let builder_fee = LiquidBuilderFeeDecision::from(fee_decision);
+        let claim_fee_sat = estimate_chain_mixed_claim_fee_sat(
+            &swap,
+            &output_address,
+            claim_clients,
+            boltz_url,
+            &builder_fee,
+        )
+        .await?;
+        let net_settlement_sat = source_total_sat
+            .checked_sub(claim_fee_sat)
+            .and_then(|amount| i64::try_from(amount).ok())
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| {
+                AppError::ClaimError("mixed chain claim has no positive net settlement".into())
+            })?;
+        let basis = bull_bitcoin_settlement::MixedClaimBasis {
+            net_settlement_sat,
+            additional_output_script_len: confidential_liquid_script_len(&output_address)?,
+        };
+        bull_bitcoin_settlement::prepare_chain_mixed_settlement_on_locked_connection(
+            state,
+            chain_swap_id,
+            Some(basis),
+            &mut guard,
+        )
+        .await
+        .map_err(|error| AppError::ClaimError(format!("prepare mixed chain settlement: {error}")))
+    }
+    .await;
+    guard.unlock().await?;
+    result
+}
+
 /// Single-flight, idempotent claim.
 ///
 /// `construct_claim` is non-deterministic on Liquid — random MuSig2
@@ -2794,6 +3123,7 @@ async fn resolve_claim_address(
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
+    settlement_state: Option<&AppState>,
     claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
@@ -2805,6 +3135,7 @@ async fn claim_swap(
     claim_swap_with_guard(
         pool,
         swap_id,
+        settlement_state,
         claim_clients,
         boltz_url,
         max_claim_attempts,
@@ -2836,6 +3167,7 @@ pub async fn exercise_reverse_claim_with_malformed_response(
     claim_swap_with_guard(
         pool,
         swap_id,
+        None,
         Some(&factory),
         "http://127.0.0.1:1",
         20,
@@ -2860,6 +3192,7 @@ pub async fn exercise_reverse_claim_without_fee(
         pool,
         swap_id,
         None,
+        None,
         "http://127.0.0.1:1",
         20,
         None,
@@ -2875,6 +3208,7 @@ pub async fn exercise_reverse_claim_without_fee(
 async fn claim_swap_with_guard(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
+    settlement_state: Option<&AppState>,
     claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
@@ -2890,6 +3224,7 @@ async fn claim_swap_with_guard(
     let result = claim_swap_inner(
         pool,
         swap_id,
+        settlement_state,
         claim_clients,
         boltz_url,
         utxo_backend,
@@ -3012,6 +3347,7 @@ async fn commit_chain_cooperative_refusal<T>(
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
+    settlement_state: Option<&AppState>,
     claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -3020,6 +3356,62 @@ async fn claim_swap_inner(
     fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
+    // Bull Bitcoin order creation cannot run inside the claim transaction: it
+    // is bounded provider I/O. Preflight the durable swap first, then let the
+    // settlement service serialize the one allowed create call on the exact
+    // same advisory-lock key used below.
+    let preflight: Option<(String, bool, bool)> = sqlx::query_as(
+        "SELECT swap.status, swap.claim_tx_hex IS NOT NULL, EXISTS ( \
+             SELECT 1 FROM swap_fiat_settlement_policies policy \
+              WHERE policy.reverse_swap_id = swap.id \
+         ) \
+         FROM swap_records swap WHERE swap.id = $1",
+    )
+    .bind(swap_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    let Some((preflight_status, had_preflight_claim, has_mixed_policy)) = preflight else {
+        return Err(AppError::ClaimError(format!("swap not found: {swap_id}")));
+    };
+    let preflight_status = preflight_status
+        .parse::<SwapStatus>()
+        .map_err(|error| AppError::ClaimError(format!("invalid persisted swap status: {error}")))?;
+    if !preflight_status.is_claimable() {
+        return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+    if has_mixed_policy
+        && !had_preflight_claim
+        && (fee_decision.is_none() || !liquid_claim_journal_authorized(false, fee_record))
+    {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
+    }
+    let mut mixed_preparation = if has_mixed_policy {
+        let state = settlement_state.ok_or_else(|| {
+            AppError::ClaimError(
+                "mixed reverse claim requires Bull Bitcoin settlement state".into(),
+            )
+        })?;
+        Some(
+            prepare_reverse_mixed_claim(
+                state,
+                swap_id,
+                had_preflight_claim,
+                claim_clients,
+                boltz_url,
+                fee_decision,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::ClaimError("mixed reverse policy disappeared during preparation".into())
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Acquire single-flight and prepare the claim tx.
     let mut tx = pool
         .begin()
@@ -3083,6 +3475,92 @@ async fn claim_swap_inner(
     // a saturated pool when multiple claim preparations each hold one slot.
     let output_address = resolve_claim_address(&mut tx, &swap).await?;
 
+    if let Some(preparation) = mixed_preparation.as_ref() {
+        let settlement_id = match preparation {
+            MixedSettlementPreparation::BitcoinFallback { settlement_id, .. }
+            | MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }
+            | MixedSettlementPreparation::Journaled { settlement_id, .. } => *settlement_id,
+        };
+        let settlement = db::load_bull_bitcoin_settlement(&mut tx, settlement_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        if settlement.reverse_swap_id != Some(swap.id) || settlement.chain_swap_id.is_some() {
+            return Err(AppError::ClaimError(
+                "mixed settlement no longer belongs to this reverse swap".into(),
+            ));
+        }
+        let state_matches = match preparation {
+            MixedSettlementPreparation::BitcoinFallback { category, .. } => {
+                settlement.funding_route.as_deref() == Some("bitcoin_fallback")
+                    && settlement.fallback_category.as_deref() == Some(category.as_str())
+                    && settlement.funding_committed_at_unix.is_none()
+            }
+            MixedSettlementPreparation::BullBitcoinOutput {
+                confidential_address,
+                bull_bitcoin_amount_sat,
+                ..
+            } => {
+                !had_persisted_claim
+                    && settlement.provider_state == "bound"
+                    && settlement.funding_route.is_none()
+                    && settlement.funding_committed_at_unix.is_none()
+                    && settlement.payer_instruction.as_deref()
+                        == Some(confidential_address.as_str())
+                    && settlement.requested_bitcoin_sat == *bull_bitcoin_amount_sat
+            }
+            MixedSettlementPreparation::Journaled {
+                bull_bitcoin_amount_sat,
+                ..
+            } => {
+                had_persisted_claim
+                    && settlement.provider_state == "bound"
+                    && settlement.funding_route.as_deref() == Some("bull_bitcoin")
+                    && settlement.funding_committed_at_unix.is_some()
+                    && settlement.payer_instruction.is_none()
+                    && settlement.requested_bitcoin_sat == *bull_bitcoin_amount_sat
+            }
+        };
+        if !state_matches {
+            return Err(AppError::ClaimError(
+                "mixed reverse settlement changed before claim journaling".into(),
+            ));
+        }
+    }
+
+    let mixed_output_is_authorized = matches!(
+        mixed_preparation.as_ref(),
+        Some(
+            MixedSettlementPreparation::BullBitcoinOutput { .. }
+                | MixedSettlementPreparation::Journaled { .. }
+        )
+    );
+    let merchant_blinding_key_hex = if mixed_output_is_authorized {
+        Some(resolve_claim_blinding_key_hex(&mut tx, &swap, &output_address).await?)
+    } else {
+        None
+    };
+    let reverse_response = if mixed_output_is_authorized {
+        let response_json = swap.boltz_response_json.as_deref().ok_or_else(|| {
+            AppError::ClaimError("mixed reverse swap has no Boltz response".into())
+        })?;
+        Some(
+            serde_json::from_str::<CreateReverseResponse>(response_json).map_err(|error| {
+                AppError::ClaimError(format!("invalid reverse Boltz response json: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let mixed_backend = if mixed_output_is_authorized {
+        Some(utxo_backend.ok_or_else(|| {
+            AppError::ClaimError(
+                "Liquid source-evidence backend is unavailable for mixed settlement".into(),
+            )
+        })?)
+    } else {
+        None
+    };
+
     let chain = Chain::Liquid(LiquidChain::Liquid);
     let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
         // Idempotent path: a previous attempt persisted the constructed
@@ -3098,6 +3576,59 @@ async fn claim_swap_inner(
                     &claim_tx,
                 ) {
                     return commit_claim_preparation_error(tx, error).await;
+                }
+                if let Some(MixedSettlementPreparation::Journaled {
+                    settlement_id,
+                    bull_bitcoin_amount_sat,
+                    fiat_percentage,
+                }) = mixed_preparation.as_ref()
+                {
+                    let stored_outputs =
+                        db::load_bull_bitcoin_claim_outputs(&mut *tx, *settlement_id)
+                            .await
+                            .map_err(|error| AppError::DbError(error.to_string()))?;
+                    let bull_bitcoin_script = stored_outputs
+                        .iter()
+                        .find(|output| output.role == "bull_bitcoin")
+                        .map(|output| output.script_pubkey_hex.as_str())
+                        .ok_or_else(|| {
+                            AppError::ClaimError(
+                                "journaled mixed claim lacks Bull Bitcoin output evidence".into(),
+                            )
+                        })?;
+                    let response = reverse_response.as_ref().ok_or_else(|| {
+                        AppError::ClaimError(
+                            "journaled mixed reverse claim lacks its Boltz response".into(),
+                        )
+                    })?;
+                    let source_blinding_key =
+                        response.blinding_key.as_deref().ok_or_else(|| {
+                            AppError::ClaimError(
+                                "mixed reverse lockup blinding key is missing".into(),
+                            )
+                        })?;
+                    let verified = verify_mixed_claim_evidence(
+                        &claim_tx,
+                        &output_address,
+                        merchant_blinding_key_hex.as_deref().ok_or_else(|| {
+                            AppError::ClaimError(
+                                "journaled mixed reverse claim lacks its merchant blinding key"
+                                    .into(),
+                            )
+                        })?,
+                        &response.lockup_address,
+                        source_blinding_key,
+                        mixed_backend.ok_or_else(|| {
+                            AppError::ClaimError(
+                                "journaled mixed reverse claim lacks its evidence backend".into(),
+                            )
+                        })?,
+                        BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
+                        *bull_bitcoin_amount_sat,
+                        *fiat_percentage,
+                    )
+                    .await?;
+                    require_exact_mixed_claim_evidence(&stored_outputs, &verified)?;
                 }
                 claim_tx
             }
@@ -3115,16 +3646,68 @@ async fn claim_swap_inner(
         // Once it flips, the row stays on script-path forever — no
         // ping-pong. `cooperative_refused` is a one-way flag.
         let use_cooperative = !swap.cooperative_refused;
-        let constructed = match construct_claim_tx(
+        let additional_output = match mixed_preparation.as_ref() {
+            Some(MixedSettlementPreparation::BullBitcoinOutput {
+                confidential_address,
+                bull_bitcoin_amount_sat,
+                ..
+            }) => Some((
+                confidential_address.as_str(),
+                u64::try_from(*bull_bitcoin_amount_sat).map_err(|_| {
+                    AppError::ClaimError("invalid Bull Bitcoin mixed output amount".into())
+                })?,
+            )),
+            _ => None,
+        };
+        let first_construction = construct_claim_tx(
             &swap,
             &output_address,
             claim_clients,
             boltz_url,
             &fee_decision,
             use_cooperative,
+            additional_output,
         )
-        .await
-        {
+        .await;
+        let construction = match first_construction {
+            Err(error) if additional_output.is_some() && is_mixed_primary_amount_error(&error) => {
+                let Some(MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }) =
+                    mixed_preparation.as_ref()
+                else {
+                    return Err(AppError::ClaimError(
+                        "mixed reverse output lost its settlement preparation".into(),
+                    ));
+                };
+                let routed = db::route_unfunded_mixed_settlement_to_fallback(
+                    &mut tx,
+                    *settlement_id,
+                    bull_bitcoin_settlement::FallbackCategory::InvalidSplit.as_str(),
+                )
+                .await
+                .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
+                if !routed {
+                    return Err(AppError::ClaimError(
+                        "mixed claim could not atomically fall back after fee sizing".into(),
+                    ));
+                }
+                mixed_preparation = Some(MixedSettlementPreparation::BitcoinFallback {
+                    settlement_id: *settlement_id,
+                    category: bull_bitcoin_settlement::FallbackCategory::InvalidSplit,
+                });
+                construct_claim_tx(
+                    &swap,
+                    &output_address,
+                    claim_clients,
+                    boltz_url,
+                    &fee_decision,
+                    use_cooperative,
+                    None,
+                )
+                .await
+            }
+            result => result,
+        };
+        let constructed = match construction {
             Ok(tx) => tx,
             Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
                 // Boltz refused cooperative MuSig2 (status mismatch,
@@ -3153,6 +3736,44 @@ async fn claim_swap_inner(
             actual_vbytes,
             fee_record,
         )?;
+        let fresh_mixed_evidence = if let Some(MixedSettlementPreparation::BullBitcoinOutput {
+            confidential_address,
+            bull_bitcoin_amount_sat,
+            fiat_percentage,
+            ..
+        }) = mixed_preparation.as_ref()
+        {
+            let response = reverse_response.as_ref().ok_or_else(|| {
+                AppError::ClaimError("fresh mixed reverse claim lacks its Boltz response".into())
+            })?;
+            let source_blinding_key = response.blinding_key.as_deref().ok_or_else(|| {
+                AppError::ClaimError("mixed reverse lockup blinding key is missing".into())
+            })?;
+            Some(
+                verify_mixed_claim_evidence(
+                    &constructed,
+                    &output_address,
+                    merchant_blinding_key_hex.as_deref().ok_or_else(|| {
+                        AppError::ClaimError(
+                            "fresh mixed reverse claim lacks its merchant blinding key".into(),
+                        )
+                    })?,
+                    &response.lockup_address,
+                    source_blinding_key,
+                    mixed_backend.ok_or_else(|| {
+                        AppError::ClaimError(
+                            "fresh mixed reverse claim lacks its evidence backend".into(),
+                        )
+                    })?,
+                    BullBitcoinOutputAuthority::FreshAddress(confidential_address),
+                    *bull_bitcoin_amount_sat,
+                    *fiat_percentage,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
             fee_record.quoted_at_unix(),
@@ -3231,6 +3852,25 @@ async fn claim_swap_inner(
                 "reverse claim preparation lost its locked row: {}",
                 swap.id
             )));
+        }
+        if let Some(verified) = fresh_mixed_evidence.as_ref() {
+            let settlement_id = match mixed_preparation.as_ref() {
+                Some(MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }) => {
+                    *settlement_id
+                }
+                _ => {
+                    return Err(AppError::ClaimError(
+                        "verified mixed reverse evidence lost its settlement preparation".into(),
+                    ))
+                }
+            };
+            let merchant = new_bull_bitcoin_claim_output(&verified.merchant);
+            let bull_bitcoin = new_bull_bitcoin_claim_output(&verified.bull_bitcoin);
+            db::commit_mixed_bull_bitcoin_funding(&mut tx, settlement_id, &merchant, &bull_bitcoin)
+                .await
+                .map_err(|error| {
+                    AppError::DbError(format!("commit mixed reverse claim evidence: {error}"))
+                })?;
         }
         constructed
     };
@@ -3389,11 +4029,11 @@ async fn claim_swap_inner(
         tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
     }
 
-    // Merchant-side claim succeeded. This is the Lightning accounting
-    // boundary; lockup confirmation, refund, and claim-stuck states do
-    // not record invoice payment events.
-    invoice::flip_invoice_on_lightning_settlement(
+    // Merchant-side claim succeeded. Re-read the durable mixed authority so
+    // both the live path and crash repair use the exact same accounting rule.
+    invoice::record_reverse_claim_settlement(
         pool,
+        swap.id,
         swap.invoice_id,
         swap.amount_sat,
         &swap.boltz_swap_id,
@@ -3606,6 +4246,8 @@ async fn claim_chain_swap_with_guard(
 #[derive(Debug)]
 struct PreparedChainClaimJournal {
     journal: PersistableMerchantTransactionJournal,
+    source_outputs: Vec<boltz_elements::TxOut>,
+    source_total_sat: u64,
     fee_amount_sat: u64,
     fee_rate_sat_vb: f64,
 }
@@ -3677,6 +4319,7 @@ fn require_exact_persisted_chain_claim_journal<T>(
 /// transaction bytes and the independently fetched source transactions. This
 /// runs while the per-swap advisory transaction is still open and before any
 /// broadcaster can observe the claim.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_chain_claim_settlement_journal(
     claim_tx: &BtcLikeTransaction,
     approved_destination_address: &str,
@@ -3685,6 +4328,7 @@ async fn prepare_chain_claim_settlement_journal(
     source_lockup_address: &str,
     source_blinding_key_hex: &str,
     backend: &Arc<dyn UtxoBackend>,
+    expected_additional_amount_sat: Option<i64>,
 ) -> Result<PreparedChainClaimJournal, AppError> {
     let BtcLikeTransaction::Liquid(transaction) = claim_tx else {
         return Err(AppError::ClaimError(
@@ -3730,6 +4374,7 @@ async fn prepare_chain_claim_settlement_journal(
     let source_script = source_address.script_pubkey();
 
     let mut source_prevouts = Vec::with_capacity(transaction.input.len());
+    let mut source_outputs = Vec::with_capacity(transaction.input.len());
     let mut total_source_sat = 0u64;
     for input in &transaction.input {
         if input.is_pegin || !input.asset_issuance.is_null() {
@@ -3801,6 +4446,7 @@ async fn prepare_chain_claim_settlement_journal(
             amount_sat: opened.value,
             script_pubkey_hex: hex::encode(source_output.script_pubkey.as_bytes()),
         });
+        source_outputs.push(source_output.clone());
     }
 
     let destination =
@@ -3840,6 +4486,16 @@ async fn prepare_chain_claim_settlement_journal(
 
     let fee_amount_sat = transaction.fee_in(expected_asset);
     let fee_vsize = transaction.discount_vsize();
+    let expected_non_fee_outputs = if expected_additional_amount_sat.is_some() {
+        2
+    } else {
+        1
+    };
+    let expected_additional_amount_sat = expected_additional_amount_sat
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| AppError::ClaimError("invalid mixed claim output amount".into()))?
+        .unwrap_or(0);
     if fee_amount_sat == 0
         || fee_vsize == 0
         || transaction.all_fees().len() != 1
@@ -3848,8 +4504,12 @@ async fn prepare_chain_claim_settlement_journal(
             .iter()
             .filter(|output| !output.is_fee())
             .count()
-            != 1
-        || total_source_sat.checked_sub(fee_amount_sat) != Some(journal.amount_sat)
+            != expected_non_fee_outputs
+        || journal
+            .amount_sat
+            .checked_add(expected_additional_amount_sat)
+            .and_then(|amount| amount.checked_add(fee_amount_sat))
+            != Some(total_source_sat)
     {
         return Err(AppError::ClaimError(
             "Liquid claim transaction has an invalid exact output/fee balance".into(),
@@ -3858,9 +4518,178 @@ async fn prepare_chain_claim_settlement_journal(
 
     Ok(PreparedChainClaimJournal {
         journal,
+        source_outputs,
+        source_total_sat: total_source_sat,
         fee_amount_sat,
         fee_rate_sat_vb: fee_amount_sat as f64 / fee_vsize as f64,
     })
+}
+
+enum BullBitcoinOutputAuthority<'a> {
+    FreshAddress(&'a str),
+    JournaledScript(&'a str),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_mixed_claim_evidence(
+    claim_tx: &BtcLikeTransaction,
+    output_address: &str,
+    merchant_blinding_key_hex: &str,
+    source_lockup_address: &str,
+    source_blinding_key_hex: &str,
+    backend: &Arc<dyn UtxoBackend>,
+    bull_bitcoin_authority: BullBitcoinOutputAuthority<'_>,
+    bull_bitcoin_amount_sat: i64,
+    fiat_percentage: i16,
+) -> Result<VerifiedMixedClaim, AppError> {
+    let liquid_asset_id = elements::AssetId::LIQUID_BTC.to_string();
+    let prepared = prepare_chain_claim_settlement_journal(
+        claim_tx,
+        output_address,
+        &liquid_asset_id,
+        merchant_blinding_key_hex,
+        source_lockup_address,
+        source_blinding_key_hex,
+        backend,
+        Some(bull_bitcoin_amount_sat),
+    )
+    .await?;
+    verify_mixed_claim_against_prepared(
+        claim_tx,
+        output_address,
+        merchant_blinding_key_hex,
+        &prepared,
+        bull_bitcoin_authority,
+        bull_bitcoin_amount_sat,
+        fiat_percentage,
+    )
+}
+
+fn verify_mixed_claim_against_prepared(
+    claim_tx: &BtcLikeTransaction,
+    output_address: &str,
+    merchant_blinding_key_hex: &str,
+    prepared: &PreparedChainClaimJournal,
+    bull_bitcoin_authority: BullBitcoinOutputAuthority<'_>,
+    bull_bitcoin_amount_sat: i64,
+    fiat_percentage: i16,
+) -> Result<VerifiedMixedClaim, AppError> {
+    let verified = match bull_bitcoin_authority {
+        BullBitcoinOutputAuthority::FreshAddress(address) => {
+            bull_bitcoin_claim::verify_mixed_liquid_claim(
+                claim_tx,
+                &prepared.source_outputs,
+                prepared.source_total_sat,
+                output_address,
+                merchant_blinding_key_hex,
+                address,
+                bull_bitcoin_amount_sat,
+            )
+        }
+        BullBitcoinOutputAuthority::JournaledScript(script_pubkey_hex) => {
+            bull_bitcoin_claim::verify_mixed_liquid_claim_for_script(
+                claim_tx,
+                &prepared.source_outputs,
+                prepared.source_total_sat,
+                output_address,
+                merchant_blinding_key_hex,
+                script_pubkey_hex,
+                bull_bitcoin_amount_sat,
+            )
+        }
+    }
+    .map_err(|error| AppError::ClaimError(format!("verify mixed Liquid claim: {error}")))?;
+    let journal_amount_sat = i64::try_from(prepared.journal.amount_sat)
+        .map_err(|_| AppError::ClaimError("mixed merchant output exceeds storage range".into()))?;
+    if verified.merchant.authorized_amount_sat != journal_amount_sat
+        || verified.fee_amount_sat != prepared.fee_amount_sat
+    {
+        return Err(AppError::ClaimError(
+            "mixed claim verifiers disagree on exact output accounting".into(),
+        ));
+    }
+    require_exact_mixed_percentage(
+        verified.merchant.authorized_amount_sat,
+        verified.bull_bitcoin.authorized_amount_sat,
+        fiat_percentage,
+    )?;
+    Ok(verified)
+}
+
+fn require_exact_mixed_percentage(
+    merchant_amount_sat: i64,
+    bull_bitcoin_amount_sat: i64,
+    fiat_percentage: i16,
+) -> Result<(), AppError> {
+    let net_settlement_sat = merchant_amount_sat
+        .checked_add(bull_bitcoin_amount_sat)
+        .ok_or_else(|| AppError::ClaimError("mixed net settlement overflow".into()))?;
+    let expected_bull_bitcoin_sat = net_settlement_sat
+        .checked_mul(i64::from(fiat_percentage))
+        .filter(|_| {
+            (1..=99).contains(&fiat_percentage)
+                && merchant_amount_sat > 0
+                && bull_bitcoin_amount_sat > 0
+        })
+        .map(|amount| amount / 100)
+        .ok_or_else(|| AppError::ClaimError("mixed settlement percentage is invalid".into()))?;
+    if expected_bull_bitcoin_sat != bull_bitcoin_amount_sat {
+        return Err(AppError::ClaimError(
+            "mixed claim outputs do not implement the captured net settlement percentage".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn new_bull_bitcoin_claim_output(
+    output: &VerifiedClaimOutput,
+) -> db::NewBullBitcoinClaimOutput<'_> {
+    db::NewBullBitcoinClaimOutput {
+        role: output.role,
+        txid: &output.txid,
+        vout: output.vout,
+        script_pubkey_hex: &output.script_pubkey_hex,
+        authorized_amount_sat: output.authorized_amount_sat,
+        asset_commitment_sha256: &output.asset_commitment_sha256,
+        value_commitment_sha256: &output.value_commitment_sha256,
+        nonce_commitment_sha256: &output.nonce_commitment_sha256,
+        surjection_proof_sha256: &output.surjection_proof_sha256,
+        rangeproof_sha256: &output.rangeproof_sha256,
+    }
+}
+
+fn require_exact_mixed_claim_evidence(
+    stored: &[db::StoredBullBitcoinClaimOutput],
+    verified: &VerifiedMixedClaim,
+) -> Result<(), AppError> {
+    let expected = [&verified.merchant, &verified.bull_bitcoin];
+    if stored.len() != expected.len()
+        || stored.iter().zip(expected).any(|(stored, expected)| {
+            stored.role != expected.role
+                || stored.txid != expected.txid
+                || stored.vout != expected.vout
+                || stored.script_pubkey_hex != expected.script_pubkey_hex
+                || stored.authorized_amount_sat != expected.authorized_amount_sat
+                || stored.asset_commitment_sha256 != expected.asset_commitment_sha256
+                || stored.value_commitment_sha256 != expected.value_commitment_sha256
+                || stored.nonce_commitment_sha256 != expected.nonce_commitment_sha256
+                || stored.surjection_proof_sha256 != expected.surjection_proof_sha256
+                || stored.rangeproof_sha256 != expected.rangeproof_sha256
+        })
+    {
+        return Err(AppError::ClaimError(
+            "persisted mixed-claim evidence does not match exact claim bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_mixed_primary_amount_error(error: &AppError) -> bool {
+    let AppError::ClaimError(message) = error else {
+        return false;
+    };
+    message.contains("is less than fees")
+        || message.contains("Primary output value is zero after fees and additional outputs")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3876,6 +4705,60 @@ async fn claim_chain_swap_inner(
     evidence_state: Option<&AppState>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
+    let preflight: Option<(String, bool, bool)> = sqlx::query_as(
+        "SELECT swap.status, swap.claim_tx_hex IS NOT NULL, EXISTS ( \
+             SELECT 1 FROM swap_fiat_settlement_policies policy \
+              WHERE policy.chain_swap_id = swap.id \
+         ) \
+         FROM chain_swap_records swap WHERE swap.id = $1",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    let Some((preflight_status, had_preflight_claim, has_mixed_policy)) = preflight else {
+        return Err(AppError::ClaimError(format!(
+            "chain swap not found: {chain_swap_id}"
+        )));
+    };
+    let preflight_status = preflight_status
+        .parse::<ChainSwapStatus>()
+        .map_err(|error| {
+            AppError::ClaimError(format!("invalid persisted chain status: {error}"))
+        })?;
+    if preflight_status.is_terminal() && preflight_status != ChainSwapStatus::Claimed {
+        return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+    if has_mixed_policy
+        && !had_preflight_claim
+        && (fee_decision.is_none() || !liquid_claim_journal_authorized(false, fee_record))
+    {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
+    }
+    let mut mixed_preparation = if has_mixed_policy {
+        let state = evidence_state.ok_or_else(|| {
+            AppError::ClaimError("mixed chain claim requires Bull Bitcoin settlement state".into())
+        })?;
+        Some(
+            prepare_chain_mixed_claim(
+                state,
+                chain_swap_id,
+                had_preflight_claim,
+                claim_clients,
+                boltz_url,
+                fee_decision,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::ClaimError("mixed chain policy disappeared during preparation".into())
+            })?,
+        )
+    } else {
+        None
+    };
+
     let mut tx = pool
         .begin()
         .await
@@ -4057,6 +4940,58 @@ async fn claim_chain_swap_inner(
         .map(|terms| terms.liquid_asset_id.as_str())
         .unwrap_or(&default_liquid_asset_id);
 
+    if let Some(preparation) = mixed_preparation.as_ref() {
+        let settlement_id = match preparation {
+            MixedSettlementPreparation::BitcoinFallback { settlement_id, .. }
+            | MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }
+            | MixedSettlementPreparation::Journaled { settlement_id, .. } => *settlement_id,
+        };
+        let settlement = db::load_bull_bitcoin_settlement(&mut tx, settlement_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        if settlement.chain_swap_id != Some(swap.id) || settlement.reverse_swap_id.is_some() {
+            return Err(AppError::ClaimError(
+                "mixed settlement no longer belongs to this chain swap".into(),
+            ));
+        }
+        let state_matches = match preparation {
+            MixedSettlementPreparation::BitcoinFallback { category, .. } => {
+                settlement.funding_route.as_deref() == Some("bitcoin_fallback")
+                    && settlement.fallback_category.as_deref() == Some(category.as_str())
+                    && settlement.funding_committed_at_unix.is_none()
+            }
+            MixedSettlementPreparation::BullBitcoinOutput {
+                confidential_address,
+                bull_bitcoin_amount_sat,
+                ..
+            } => {
+                !had_persisted_claim
+                    && settlement.provider_state == "bound"
+                    && settlement.funding_route.is_none()
+                    && settlement.funding_committed_at_unix.is_none()
+                    && settlement.payer_instruction.as_deref()
+                        == Some(confidential_address.as_str())
+                    && settlement.requested_bitcoin_sat == *bull_bitcoin_amount_sat
+            }
+            MixedSettlementPreparation::Journaled {
+                bull_bitcoin_amount_sat,
+                ..
+            } => {
+                had_persisted_claim
+                    && settlement.provider_state == "bound"
+                    && settlement.funding_route.as_deref() == Some("bull_bitcoin")
+                    && settlement.funding_committed_at_unix.is_some()
+                    && settlement.payer_instruction.is_none()
+                    && settlement.requested_bitcoin_sat == *bull_bitcoin_amount_sat
+            }
+        };
+        if !state_matches {
+            return Err(AppError::ClaimError(
+                "mixed chain settlement changed before claim journaling".into(),
+            ));
+        }
+    }
+
     let claim_tx = if let Some(claim_tx) = persisted_claim_tx {
         claim_tx
     } else {
@@ -4072,16 +5007,71 @@ async fn claim_chain_swap_inner(
         // this execution selector by itself. One-way flag, so no
         // cooperative/script ping-pong. Mirrors claim_swap_inner (reverse path).
         let use_cooperative = !swap.cooperative_refused;
-        let constructed = match construct_chain_claim_tx(
+        let additional_output = match mixed_preparation.as_ref() {
+            Some(MixedSettlementPreparation::BullBitcoinOutput {
+                confidential_address,
+                bull_bitcoin_amount_sat,
+                ..
+            }) => Some((
+                confidential_address.as_str(),
+                u64::try_from(*bull_bitcoin_amount_sat).map_err(|_| {
+                    AppError::ClaimError("invalid Bull Bitcoin mixed output amount".into())
+                })?,
+            )),
+            _ => None,
+        };
+        let first_construction = construct_chain_claim_tx(
             &swap,
             &output_address,
             claim_clients,
             boltz_url,
             &fee_decision,
             use_cooperative,
+            additional_output,
         )
-        .await
-        {
+        .await;
+        let construction = match first_construction {
+            Err(error) if additional_output.is_some() && is_mixed_primary_amount_error(&error) => {
+                let settlement_id = match mixed_preparation.as_ref() {
+                    Some(MixedSettlementPreparation::BullBitcoinOutput {
+                        settlement_id, ..
+                    }) => *settlement_id,
+                    _ => {
+                        return Err(AppError::ClaimError(
+                            "mixed chain output lost its settlement preparation".into(),
+                        ))
+                    }
+                };
+                let routed = db::route_unfunded_mixed_settlement_to_fallback(
+                    &mut tx,
+                    settlement_id,
+                    bull_bitcoin_settlement::FallbackCategory::InvalidSplit.as_str(),
+                )
+                .await
+                .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
+                if !routed {
+                    return Err(AppError::ClaimError(
+                        "mixed chain claim could not atomically fall back after fee sizing".into(),
+                    ));
+                }
+                mixed_preparation = Some(MixedSettlementPreparation::BitcoinFallback {
+                    settlement_id,
+                    category: bull_bitcoin_settlement::FallbackCategory::InvalidSplit,
+                });
+                construct_chain_claim_tx(
+                    &swap,
+                    &output_address,
+                    claim_clients,
+                    boltz_url,
+                    &fee_decision,
+                    use_cooperative,
+                    None,
+                )
+                .await
+            }
+            result => result,
+        };
+        let constructed = match construction {
             Ok(t) => t,
             Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
                 return commit_chain_cooperative_refusal(tx, swap.id, &swap.boltz_swap_id, e).await;
@@ -4091,6 +5081,17 @@ async fn claim_chain_swap_inner(
         constructed
     };
 
+    let expected_mixed_amount_sat = match mixed_preparation.as_ref() {
+        Some(MixedSettlementPreparation::BullBitcoinOutput {
+            bull_bitcoin_amount_sat,
+            ..
+        })
+        | Some(MixedSettlementPreparation::Journaled {
+            bull_bitcoin_amount_sat,
+            ..
+        }) => Some(*bull_bitcoin_amount_sat),
+        _ => None,
+    };
     let prepared = prepare_chain_claim_settlement_journal(
         &claim_tx,
         &output_address,
@@ -4105,8 +5106,55 @@ async fn claim_chain_swap_inner(
                 AppError::ClaimError("committed Liquid lockup blinding key is missing".into())
             })?,
         backend,
+        expected_mixed_amount_sat,
     )
     .await?;
+    let mixed_evidence = match mixed_preparation.as_ref() {
+        Some(MixedSettlementPreparation::BullBitcoinOutput {
+            confidential_address,
+            bull_bitcoin_amount_sat,
+            fiat_percentage,
+            ..
+        }) => Some(verify_mixed_claim_against_prepared(
+            &claim_tx,
+            &output_address,
+            merchant_blinding_key_hex,
+            &prepared,
+            BullBitcoinOutputAuthority::FreshAddress(confidential_address),
+            *bull_bitcoin_amount_sat,
+            *fiat_percentage,
+        )?),
+        Some(MixedSettlementPreparation::Journaled {
+            settlement_id,
+            bull_bitcoin_amount_sat,
+            fiat_percentage,
+        }) => {
+            let stored_outputs = db::load_bull_bitcoin_claim_outputs(&mut *tx, *settlement_id)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            let bull_bitcoin_script = stored_outputs
+                .iter()
+                .find(|output| output.role == "bull_bitcoin")
+                .map(|output| output.script_pubkey_hex.as_str())
+                .ok_or_else(|| {
+                    AppError::ClaimError(
+                        "journaled mixed chain claim lacks Bull Bitcoin evidence".into(),
+                    )
+                })?;
+            let verified = verify_mixed_claim_against_prepared(
+                &claim_tx,
+                &output_address,
+                merchant_blinding_key_hex,
+                &prepared,
+                BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
+                *bull_bitcoin_amount_sat,
+                *fiat_percentage,
+            )?;
+            require_exact_mixed_claim_evidence(&stored_outputs, &verified)?;
+            Some(verified)
+        }
+        _ => None,
+    };
     let new_journal = db::NewLiquidMerchantSettlementJournal {
         chain_swap_id: swap.id,
         replaces_txid: None,
@@ -4209,6 +5257,25 @@ async fn claim_chain_swap_inner(
                     "insert Liquid merchant settlement journal: {error}"
                 ))
             })?;
+        if let Some(verified) = mixed_evidence.as_ref() {
+            let settlement_id = match mixed_preparation.as_ref() {
+                Some(MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }) => {
+                    *settlement_id
+                }
+                _ => {
+                    return Err(AppError::ClaimError(
+                        "verified mixed chain evidence lost its settlement preparation".into(),
+                    ))
+                }
+            };
+            let merchant = new_bull_bitcoin_claim_output(&verified.merchant);
+            let bull_bitcoin = new_bull_bitcoin_claim_output(&verified.bull_bitcoin);
+            db::commit_mixed_bull_bitcoin_funding(&mut tx, settlement_id, &merchant, &bull_bitcoin)
+                .await
+                .map_err(|error| {
+                    AppError::DbError(format!("commit mixed chain claim evidence: {error}"))
+                })?;
+        }
         db::ExactLiquidMerchantSettlementJournalDisposition::Broadcastable
     } else {
         if swap.claim_tx_hex.as_deref() != Some(prepared.journal.raw_transaction_hex.as_str())
@@ -4489,6 +5556,89 @@ async fn claim_chain_swap_inner(
 /// Pure I/O — called under the per-swap advisory lock so at most one
 /// `construct_claim` runs per swap at a time, regardless of webhook /
 /// sweep / reconciler concurrency.
+fn exact_relative_fee_sat(
+    vsize: usize,
+    fee_decision: &LiquidBuilderFeeDecision,
+) -> Result<u64, AppError> {
+    let fee = vsize as f64 * fee_decision.rate().as_f64();
+    if vsize == 0 || !fee.is_finite() || fee <= 0.0 || fee.ceil() > u64::MAX as f64 {
+        return Err(AppError::ClaimError(
+            "Liquid claim fee estimate is outside the supported range".into(),
+        ));
+    }
+    Ok(fee.ceil() as u64)
+}
+
+fn confidential_liquid_script_len(address: &str) -> Result<usize, AppError> {
+    let address = boltz_elements::Address::from_str(address)
+        .map_err(|_| AppError::ClaimError("mixed Liquid destination is invalid".into()))?;
+    if address.params != &boltz_elements::AddressParams::LIQUID || address.blinding_pubkey.is_none()
+    {
+        return Err(AppError::ClaimError(
+            "mixed destination must be confidential Liquid mainnet".into(),
+        ));
+    }
+    Ok(address.script_pubkey().len())
+}
+
+/// Measure the exact two-payment-output reverse-claim shape without asking
+/// Boltz to sign it. The merchant address is deliberately reused as the
+/// placeholder second output; Bull Bitcoin's returned destination must have
+/// the same script length before the order is accepted for funding.
+async fn estimate_reverse_mixed_claim_fee_sat(
+    swap: &db::SwapRecord,
+    output_address: &str,
+    claim_clients: &LiquidClaimClientFactory,
+    boltz_url: &str,
+    fee_decision: &LiquidBuilderFeeDecision,
+) -> Result<u64, AppError> {
+    let claim_key_hex = swap
+        .claim_key_hex
+        .as_deref()
+        .ok_or_else(|| AppError::ClaimError("missing claim key".to_string()))?;
+    let response_json = swap
+        .boltz_response_json
+        .as_deref()
+        .ok_or_else(|| AppError::ClaimError("missing boltz response".to_string()))?;
+    let key_bytes = hex::decode(claim_key_hex)
+        .map_err(|error| AppError::ClaimError(format!("invalid claim key hex: {error}")))?;
+    let secp = boltz_client::Secp256k1::new();
+    let secret_key = boltz_client::bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
+        .map_err(|error| AppError::ClaimError(format!("invalid secret key: {error}")))?;
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let response: CreateReverseResponse = serde_json::from_str(response_json)
+        .map_err(|error| AppError::ClaimError(format!("invalid boltz response json: {error}")))?;
+    let claim_public_key = boltz_client::PublicKey::new(keypair.public_key());
+    let swap_script = SwapScript::reverse_from_swap_resp(
+        Chain::Liquid(LiquidChain::Liquid),
+        &response,
+        claim_public_key,
+    )
+    .map_err(|error| AppError::ClaimError(format!("swap script build failed: {error}")))?;
+    let liquid_client = claim_clients.connect().await?;
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
+    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
+    let options = TransactionOptions::default()
+        .with_cooperative(!swap.cooperative_refused)
+        .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
+    let params = SwapTransactionParams {
+        keys: keypair,
+        output_address: output_address.to_owned(),
+        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        swap_id: swap.boltz_swap_id.clone(),
+        chain_client: &chain_client,
+        boltz_client: &boltz_api,
+        options: Some(options),
+    };
+    let vsize = swap_script
+        .estimate_liquid_claim_vsize(&params)
+        .await
+        .map_err(|error| {
+            AppError::ClaimError(format!("estimate mixed reverse claim size: {error}"))
+        })?;
+    exact_relative_fee_sat(vsize, fee_decision)
+}
+
 async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
@@ -4496,6 +5646,7 @@ async fn construct_claim_tx(
     boltz_url: &str,
     fee_decision: &LiquidBuilderFeeDecision,
     cooperative: bool,
+    additional_output: Option<(&str, u64)>,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_hex = swap
         .preimage_hex
@@ -4541,6 +5692,10 @@ async fn construct_claim_tx(
     // money is lost. 15s covers the MuSig2 round-trip while still failing fast.
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
 
+    let mut options = TransactionOptions::default().with_cooperative(cooperative);
+    if let Some((address, amount_sat)) = additional_output {
+        options = options.with_additional_outputs(vec![(address.to_owned(), amount_sat)]);
+    }
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: output_address.to_string(),
@@ -4548,13 +5703,82 @@ async fn construct_claim_tx(
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
-        options: Some(TransactionOptions::default().with_cooperative(cooperative)),
+        options: Some(options),
     };
 
     swap_script
         .construct_claim(&preimage, params)
         .await
         .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))
+}
+
+async fn estimate_chain_mixed_claim_fee_sat(
+    swap: &db::ChainSwapRecord,
+    output_address: &str,
+    claim_clients: &LiquidClaimClientFactory,
+    boltz_url: &str,
+    fee_decision: &LiquidBuilderFeeDecision,
+) -> Result<u64, AppError> {
+    let claim_key_bytes = hex::decode(&swap.claim_key_hex)
+        .map_err(|error| AppError::ClaimError(format!("invalid chain claim key hex: {error}")))?;
+    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
+        .map_err(|error| AppError::ClaimError(format!("invalid chain refund key hex: {error}")))?;
+    let secp = boltz_client::Secp256k1::new();
+    let claim_secret_key = boltz_client::bitcoin::secp256k1::SecretKey::from_slice(
+        &claim_key_bytes,
+    )
+    .map_err(|error| AppError::ClaimError(format!("invalid chain claim secret key: {error}")))?;
+    let refund_secret_key = boltz_client::bitcoin::secp256k1::SecretKey::from_slice(
+        &refund_key_bytes,
+    )
+    .map_err(|error| AppError::ClaimError(format!("invalid chain refund secret key: {error}")))?;
+    let claim_keypair = Keypair::from_secret_key(&secp, &claim_secret_key);
+    let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
+            AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
+        })?;
+    let claim_public_key = boltz_client::PublicKey::new(claim_keypair.public_key());
+    let refund_public_key = boltz_client::PublicKey::new(refund_keypair.public_key());
+    let mut claim_details = response.claim_details.clone();
+    claim_details.amount = effective_chain_claim_amount_sat(swap)?;
+    let claim_script = SwapScript::chain_from_swap_resp(
+        Chain::Liquid(LiquidChain::Liquid),
+        Side::Claim,
+        claim_details,
+        claim_public_key,
+    )
+    .map_err(|error| AppError::ClaimError(format!("chain claim script build failed: {error}")))?;
+    let lockup_script = SwapScript::chain_from_swap_resp(
+        Chain::Bitcoin(BitcoinChain::Bitcoin),
+        Side::Lockup,
+        response.lockup_details.clone(),
+        refund_public_key,
+    )
+    .map_err(|error| AppError::ClaimError(format!("chain lockup script build failed: {error}")))?;
+    let liquid_client = claim_clients.connect().await?;
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
+    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
+    let options = TransactionOptions::default()
+        .with_chain_claim(refund_keypair, lockup_script)
+        .with_cooperative(!swap.cooperative_refused)
+        .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
+    let params = SwapTransactionParams {
+        keys: claim_keypair,
+        output_address: output_address.to_owned(),
+        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        swap_id: swap.boltz_swap_id.clone(),
+        chain_client: &chain_client,
+        boltz_client: &boltz_api,
+        options: Some(options),
+    };
+    let vsize = claim_script
+        .estimate_liquid_claim_vsize(&params)
+        .await
+        .map_err(|error| {
+            AppError::ClaimError(format!("estimate mixed chain claim size: {error}"))
+        })?;
+    exact_relative_fee_sat(vsize, fee_decision)
 }
 
 async fn construct_chain_claim_tx(
@@ -4564,6 +5788,7 @@ async fn construct_chain_claim_tx(
     boltz_url: &str,
     fee_decision: &LiquidBuilderFeeDecision,
     use_cooperative: bool,
+    additional_output: Option<(&str, u64)>,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_bytes = hex::decode(&swap.preimage_hex)
         .map_err(|e| AppError::ClaimError(format!("invalid chain preimage hex: {e}")))?;
@@ -4615,6 +5840,12 @@ async fn construct_chain_claim_tx(
     // money is lost. 15s covers the MuSig2 round-trip while still failing fast.
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
 
+    let mut options = TransactionOptions::default()
+        .with_chain_claim(refund_keypair, lockup_script)
+        .with_cooperative(use_cooperative);
+    if let Some((address, amount_sat)) = additional_output {
+        options = options.with_additional_outputs(vec![(address.to_owned(), amount_sat)]);
+    }
     let params = SwapTransactionParams {
         keys: claim_keypair,
         output_address: output_address.to_string(),
@@ -4622,11 +5853,7 @@ async fn construct_chain_claim_tx(
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
-        options: Some(
-            TransactionOptions::default()
-                .with_chain_claim(refund_keypair, lockup_script)
-                .with_cooperative(use_cooperative),
-        ),
+        options: Some(options),
     };
 
     claim_script
@@ -5259,6 +6486,7 @@ pub fn spawn_background_claimer(
                             match claim_swap(
                                 &pool,
                                 swap.id,
+                                Some(&chain_evidence_state),
                                 claim_clients.as_deref(),
                                 &config.boltz.api_url,
                                 config.claim.max_claim_attempts,

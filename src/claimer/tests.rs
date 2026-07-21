@@ -8,6 +8,20 @@ use tokio::sync::Mutex;
 
 use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
 
+#[test]
+fn pinned_boltz_client_exposes_fixed_additional_output_options() {
+    let _options = TransactionOptions::default()
+        .with_additional_outputs(vec![("lq1-provider-destination".to_string(), 12_345)]);
+}
+
+#[test]
+fn mixed_percentage_is_bound_to_the_final_net_outputs() {
+    assert!(require_exact_mixed_percentage(59_400, 39_600, 40).is_ok());
+    assert!(require_exact_mixed_percentage(59_399, 39_601, 40).is_err());
+    assert!(require_exact_mixed_percentage(60_000, 40_000, 0).is_err());
+    assert!(require_exact_mixed_percentage(0, 40_000, 40).is_err());
+}
+
 fn liquid_builder_fee(rate: f64) -> LiquidBuilderFeeDecision {
     let observation = LiveLiquid::new(
         SatPerVbyte::try_from(rate).unwrap(),
@@ -630,6 +644,7 @@ async fn chain_claim_journal_preparation_binds_raw_sources_output_and_fee() {
         &fixture.source_address,
         &fixture.source_blinding_key_hex,
         &fixture.backend,
+        None,
     )
     .await
     .unwrap();

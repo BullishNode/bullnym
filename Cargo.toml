@@ -13,7 +13,7 @@ elements-miniscript = "0.4.0"
 # Bitcoin mainnet address validation for invoice handlers (validators.rs).
 # Only needed for parse + network-discriminate; no chainstate, no descriptors.
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
-boltz-client = { git = "https://github.com/BullishNode/boltz-rust.git", rev = "c20511854bbd996a74f914fa0327d4601b5d4f62", features = ["electrum"] }
+boltz-client = { git = "https://github.com/BullishNode/boltz-rust.git", rev = "bbf3ee8048b638a80c23e1bcecff77ee3dc89ec3", features = ["electrum"] }
 lightning-invoice = "0.32"
 secp256k1 = { version = "0.29", features = ["global-context"] }
 # MuSig2 is the same pinned implementation used by boltz-client. Bullnym uses

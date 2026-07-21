@@ -247,6 +247,37 @@ the timestamp column, immutable stamping trigger, indexes, and runtime read
 privilege before serving traffic. The endpoint reads existing swap and invoice
 payment evidence; it does not create or mutate accounting events.
 
+## Migrations 067-069 Bull Bitcoin fiat settlement
+
+Apply `067_bull_bitcoin_fiat_settlement.sql`,
+`068_bull_bitcoin_invoice_accounting.sql`, and
+`069_bull_bitcoin_mixed_settlement.sql` in order as the privileged schema owner
+with `--set runtime_role=bullnym_app` while every Bullnym writer is stopped.
+Take and validate a schema-066 backup first. Keep
+`features.bull_bitcoin_fiat_settlement = false` throughout migration and
+initial service verification.
+
+Deploy the compatible API-Orders release before Bullnym. Its scoped contract
+must provide `validateSellToBalance`, `sellToBalance`, and same-key
+`getSellToFiatBalanceOrder`; Bullnym treats a hidden preflight method as a
+wrong-scope credential, so starting it against an older API-Orders release is
+not a supported mixed-version state. Configure the reviewed Bull Bitcoin API
+URL and a fresh root-only `BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY` containing
+exactly 32 random bytes encoded as 64 lowercase hexadecimal characters. Never
+copy a production credential or encryption key into staging.
+
+Start only the schema-069 binary. Require `/ready`, `/version`, the installed
+artifact digest, and the release record to agree while admission remains off.
+Then test one eligible scoped key, one benchmark-ineligible account, one
+wrong-scope key, and one unavailable-API response before enabling the feature.
+Each failed activation must preserve the previous setting and credential; the
+eligibility call must create no Bull Bitcoin order.
+
+Automatic rollback across migration 067 is refused. To return to a pre-067
+release, stop every writer and restore the validated schema-066 database with
+its matching binary, PWA, release record, and configuration. A schema-069
+feature-off binary is the safe rollback target after the migrations exist.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

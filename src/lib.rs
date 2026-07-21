@@ -8,6 +8,9 @@ pub mod boltz_restore;
 pub mod boltz_restore_fetch;
 pub mod boltz_transport;
 pub mod builder_fee;
+pub mod bull_bitcoin;
+pub mod bull_bitcoin_claim;
+pub mod bull_bitcoin_settlement;
 pub(crate) mod canonical_json;
 pub mod certification;
 pub mod chain_fallback;
@@ -40,6 +43,7 @@ pub mod fee_policy;
 pub mod fee_refresh_cycle;
 pub mod fee_runtime;
 pub mod fiat_quote_credit;
+pub mod fiat_settlement;
 pub mod gc;
 pub mod get_paid_transaction_history;
 pub mod invoice;
@@ -90,6 +94,9 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     pub admission: admission::MoneyAdmission,
     pub boltz: Arc<boltz::BoltzService>,
+    /// Narrow scoped capability: create sell-to-balance and read only the
+    /// exact orders created by that same key.
+    pub bull_bitcoin: Arc<dyn bull_bitcoin::BullBitcoinApi>,
     pub ip_whitelist: Arc<ip_whitelist::IpWhitelist>,
     pub certification: Arc<certification::CertificationAllowlist>,
     pub rate_limiter: Arc<rate_limit::RateLimiter>,

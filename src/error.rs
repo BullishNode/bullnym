@@ -67,6 +67,15 @@ pub enum AppError {
 
     // --- Amount validation (LNURL callback) ---
     InvalidAmount(String),
+    /// The authenticated Bull Bitcoin account cannot pass the server-owned
+    /// fiat-settlement eligibility benchmark at activation time.
+    FiatConversionKycRequired,
+    /// Bullnym has no active scoped credential and the client did not provide
+    /// one on the signed enable request.
+    BullBitcoinCredentialRequired,
+    /// The supplied or stored scoped credential is malformed, inactive,
+    /// revoked, or lacks the required scope.
+    BullBitcoinCredentialInvalid,
     /// LUD-12 comment validation or stable-retry failure. The inner value is
     /// always server-authored static text and must never contain payer input.
     InvalidComment(&'static str),
@@ -170,6 +179,9 @@ impl AppError {
             | Self::UtxoSpent
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
+            | Self::FiatConversionKycRequired
+            | Self::BullBitcoinCredentialRequired
+            | Self::BullBitcoinCredentialInvalid
             | Self::InvalidComment(_)
             | Self::RecoveryAddressInvalid(_)
             | Self::RecoveryNotAvailable(_)
@@ -221,6 +233,9 @@ impl AppError {
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
 
             Self::InvalidAmount(_) => "InvalidAmount",
+            Self::FiatConversionKycRequired => "FIAT_CONVERSION_KYC_REQUIRED",
+            Self::BullBitcoinCredentialRequired => "FIAT_CREDENTIAL_REQUIRED",
+            Self::BullBitcoinCredentialInvalid => "FIAT_CREDENTIAL_INVALID",
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
@@ -286,6 +301,15 @@ impl std::fmt::Display for AppError {
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
 
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
+            Self::FiatConversionKycRequired => {
+                write!(f, "Bull Bitcoin fiat-conversion eligibility is required")
+            }
+            Self::BullBitcoinCredentialRequired => {
+                write!(f, "Bull Bitcoin scoped credential is required")
+            }
+            Self::BullBitcoinCredentialInvalid => {
+                write!(f, "Bull Bitcoin scoped credential is invalid")
+            }
             Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
@@ -366,6 +390,9 @@ impl IntoResponse for AppError {
             AppError::PubkeyUtxoMismatch => "The proof-of-funds public key does not match the script of the referenced UTXO.".into(),
 
             AppError::InvalidAmount(reason) => reason.clone(),
+            AppError::FiatConversionKycRequired => "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later.".into(),
+            AppError::BullBitcoinCredentialRequired => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
+            AppError::BullBitcoinCredentialInvalid => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
             AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
                 "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
@@ -516,6 +543,19 @@ impl From<sqlx::Error> for AppError {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct FiatSettlementErrorFixture {
+        errors: Vec<FiatSettlementErrorCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct FiatSettlementErrorCase {
+        name: String,
+        http_status: u16,
+        response: Value,
+    }
 
     async fn response_json(error: AppError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -525,6 +565,26 @@ mod tests {
             .expect("read error response body");
         let value = serde_json::from_slice(&body).expect("parse error response JSON");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn fiat_settlement_error_fixture_matches_wire_responses() {
+        let fixture: FiatSettlementErrorFixture = serde_json::from_str(include_str!(
+            "../docs/api/fixtures/fiat-settlement-errors-v1.json"
+        ))
+        .expect("parse fiat-settlement error fixture");
+
+        for case in fixture.errors {
+            let error = match case.name.as_str() {
+                "credential_required" => AppError::BullBitcoinCredentialRequired,
+                "credential_invalid" => AppError::BullBitcoinCredentialInvalid,
+                "kyc_required" => AppError::FiatConversionKycRequired,
+                unknown => panic!("unknown fiat-settlement error fixture case: {unknown}"),
+            };
+            let (status, body) = response_json(error).await;
+            assert_eq!(status.as_u16(), case.http_status, "{} status", case.name);
+            assert_eq!(body, case.response, "{} response", case.name);
+        }
     }
 
     #[tokio::test]

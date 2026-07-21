@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=66
+EXPECTED_MIGRATION_COUNT=69
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "066_get_paid_transaction_history.sql" ]] \
-  || die "unexpected migration-066 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "069_bull_bitcoin_mixed_settlement.sql" ]] \
+  || die "unexpected migration-069 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -320,7 +320,10 @@ apply_migrations() {
        || "$base" == "063_checkout_private_memo" \
        || "$base" == "064_wallet_backup_blobs" \
        || "$base" == "065_private_invoice_presentations" \
-       || "$base" == "066_get_paid_transaction_history" ]]; then
+       || "$base" == "066_get_paid_transaction_history" \
+       || "$base" == "067_bull_bitcoin_fiat_settlement" \
+       || "$base" == "068_bull_bitcoin_invoice_accounting" \
+       || "$base" == "069_bull_bitcoin_mixed_settlement" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

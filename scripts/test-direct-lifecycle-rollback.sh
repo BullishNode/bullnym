@@ -83,6 +83,18 @@ expect_refused \
   063_checkout_private_memo \
   065_future_wallet_backup_aware_schema \
   0
+expect_allowed \
+  067_bull_bitcoin_fiat_settlement \
+  067_bull_bitcoin_fiat_settlement \
+  0
+expect_allowed \
+  067_bull_bitcoin_fiat_settlement \
+  068_future_bull_bitcoin_schema \
+  0
+expect_refused \
+  066_get_paid_transaction_history \
+  067_bull_bitcoin_fiat_settlement \
+  0
 expect_refused \
   malformed-previous-marker \
   050_swap_key_lineage \

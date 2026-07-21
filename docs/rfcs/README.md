@@ -9,6 +9,7 @@ into maintained docs and the RFC archived when it no longer aids maintenance.
 - [001: Chain-swap reliability](001-chain-swap-reliability.md)
 - [002: Public name reservation](002-public-name-reservation.md)
 - [003: Permanent public names](003-permanent-public-names.md)
+- [004: Bull Bitcoin fiat settlement](004-bull-bitcoin-fiat-settlement.md)
 - [Template](template.md)
 
 RFC-001 and RFC-002 are historical/superseded design records, retained for

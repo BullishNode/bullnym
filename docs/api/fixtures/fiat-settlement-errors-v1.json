@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "errors": [
+    {
+      "name": "credential_required",
+      "http_status": 200,
+      "response": {
+        "status": "ERROR",
+        "code": "FIAT_CREDENTIAL_REQUIRED",
+        "reason": "Reconnect your Bull Bitcoin account before activating fiat conversion."
+      }
+    },
+    {
+      "name": "credential_invalid",
+      "http_status": 200,
+      "response": {
+        "status": "ERROR",
+        "code": "FIAT_CREDENTIAL_INVALID",
+        "reason": "Reconnect your Bull Bitcoin account before activating fiat conversion."
+      }
+    },
+    {
+      "name": "kyc_required",
+      "http_status": 200,
+      "response": {
+        "status": "ERROR",
+        "code": "FIAT_CONVERSION_KYC_REQUIRED",
+        "reason": "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later."
+      }
+    }
+  ]
+}

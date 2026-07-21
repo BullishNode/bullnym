@@ -17,7 +17,7 @@ use object_store::{
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -36,6 +36,15 @@ use pay_service::boltz_transport::{
     ScriptedBoltzCall, ScriptedBoltzError, ScriptedBoltzStep, ScriptedBoltzTransport,
     ScriptedBoltzWebhookEvent, ScriptedBoltzWebhookInstruction, ScriptedBoltzWebhookPlan,
 };
+use pay_service::bull_bitcoin::{
+    BitcoinAmountSat, BitcoinNetwork, BullBitcoinApi, BullBitcoinError, CreateSellRequest,
+    CreatedSellOrder, CredentialCipher, FiatAmountMinor, FiatCurrency, OrderObservation,
+    PayerInstruction, Product, ScopedApiKey,
+};
+use pay_service::bull_bitcoin_settlement::{
+    FallbackCategory, FiatOnlyInstructionOutcome, FiatOnlyInstructionRequest, MixedClaimBasis,
+    MixedSettlementPreparation,
+};
 use pay_service::chain_fault_harness::{
     ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
     ScriptedBitcoinRecoveryBackend as FakeBitcoinChain,
@@ -46,10 +55,10 @@ use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
 };
 use pay_service::config::{
-    BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
-    ElectrumConfig, FeaturesConfig, FeePolicyConfig, InvoiceAccountingConfig, LimitsConfig,
-    LiquidWatcherConfig, PricerConfig, ProofConfig, PwaConfig, RateLimitConfig, ReconcilerConfig,
-    WorkersConfig,
+    BitcoinWatcherConfig, BoltzConfig, BullBitcoinConfig, CertificationConfig, ClaimConfig, Config,
+    DonationConfig, ElectrumConfig, FeaturesConfig, FeePolicyConfig, InvoiceAccountingConfig,
+    LimitsConfig, LiquidWatcherConfig, PricerConfig, ProofConfig, PwaConfig, RateLimitConfig,
+    ReconcilerConfig, WorkersConfig,
 };
 use pay_service::donation_render::PwaShells;
 use pay_service::error::AppError;
@@ -67,9 +76,9 @@ use pay_service::swap_manifest_store::{
     S3ManifestStoreConfig,
 };
 use pay_service::{
-    certification, claimer, donation_page, donation_render, get_paid_transaction_history, invoice,
-    lnurl, lnurl_comment_history, nostr, readiness, recovery_address_registration, registration,
-    AppState,
+    certification, claimer, donation_page, donation_render, fiat_settlement,
+    get_paid_transaction_history, invoice, lnurl, lnurl_comment_history, nostr, readiness,
+    recovery_address_registration, registration, AppState,
 };
 
 use bitcoin::absolute::LockTime;
@@ -296,10 +305,12 @@ fn test_config() -> Config {
         fee_policy: FeePolicyConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
+        bull_bitcoin: BullBitcoinConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
         boltz_webhook_url_secret: TEST_BOLTZ_WEBHOOK_CURRENT_SECRET.to_string(),
         boltz_webhook_url_secret_previous: TEST_BOLTZ_WEBHOOK_PREVIOUS_SECRET.to_string(),
+        bull_bitcoin_credential_encryption_key: None,
     }
 }
 
@@ -336,6 +347,8 @@ fn test_state_with_provider_limits(
     let pricer = Arc::new(PricerClient::new(PricerConfig::default()).unwrap());
     let boltz_api_url = config.boltz.api_url.clone();
     let boltz = Arc::new(BoltzService::new(&boltz_api_url, swap_master_key, None));
+    let bull_bitcoin =
+        Arc::new(pay_service::bull_bitcoin::HttpBullBitcoinApi::new(&config.bull_bitcoin).unwrap());
     if let Some((pair, completed_at)) = refresh {
         let _ = boltz
             .provider_limits()
@@ -366,6 +379,7 @@ fn test_state_with_provider_limits(
         config: Arc::new(config),
         admission: pay_service::admission::MoneyAdmission::healthy_test_fixture(),
         boltz,
+        bull_bitcoin,
         ip_whitelist: Arc::new(IpWhitelist::default()),
         certification: Arc::new(certification::CertificationAllowlist::default()),
         rate_limiter,
@@ -387,6 +401,375 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
     test_state_with_config(pool, config)
 }
 
+#[derive(Clone, Default)]
+struct ScriptedBullBitcoinApi {
+    validation_calls: Arc<AtomicUsize>,
+    create_calls: Arc<AtomicUsize>,
+    read_calls: Arc<AtomicUsize>,
+    validation_results: Arc<Mutex<VecDeque<Result<(), BullBitcoinError>>>>,
+    create_results: Arc<Mutex<VecDeque<Result<CreatedSellOrder, BullBitcoinError>>>>,
+    read_results: Arc<Mutex<VecDeque<Result<OrderObservation, BullBitcoinError>>>>,
+}
+
+impl ScriptedBullBitcoinApi {
+    async fn push_validation(&self, result: Result<(), BullBitcoinError>) {
+        self.validation_results.lock().await.push_back(result);
+    }
+
+    fn validation_call_count(&self) -> usize {
+        self.validation_calls.load(Ordering::SeqCst)
+    }
+
+    async fn push_create(&self, result: Result<CreatedSellOrder, BullBitcoinError>) {
+        self.create_results.lock().await.push_back(result);
+    }
+
+    async fn push_read(&self, result: Result<OrderObservation, BullBitcoinError>) {
+        self.read_results.lock().await.push_back(result);
+    }
+
+    fn create_call_count(&self) -> usize {
+        self.create_calls.load(Ordering::SeqCst)
+    }
+
+    fn read_call_count(&self) -> usize {
+        self.read_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl BullBitcoinApi for ScriptedBullBitcoinApi {
+    async fn validate_sell_to_balance(&self, _key: &ScopedApiKey) -> Result<(), BullBitcoinError> {
+        self.validation_calls.fetch_add(1, Ordering::SeqCst);
+        self.validation_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn create_sell_to_balance(
+        &self,
+        _key: &ScopedApiKey,
+        _request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
+        self.create_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Err(BullBitcoinError::Upstream))
+    }
+
+    async fn get_created_order(
+        &self,
+        _key: &ScopedApiKey,
+        _order_id: Uuid,
+    ) -> Result<OrderObservation, BullBitcoinError> {
+        self.read_calls.fetch_add(1, Ordering::SeqCst);
+        self.read_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Err(BullBitcoinError::Upstream))
+    }
+}
+
+async fn fiat_lifecycle_test_state(
+    pool: &PgPool,
+    fake: ScriptedBullBitcoinApi,
+    owner_label: &str,
+) -> (AppState, String, Uuid, Keypair) {
+    let (owner_npub, _, _, keypair) = sign_registration_with_keypair(owner_label, TEST_DESCRIPTOR);
+    pay_service::db::create_user(pool, owner_label, &owner_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let encryption_key =
+        pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap();
+    let credential_id = Uuid::new_v4();
+    let scoped_key = ScopedApiKey::parse(format!("bbak-{}", "ab".repeat(32))).unwrap();
+    let encrypted = CredentialCipher::new(encryption_key.clone())
+        .encrypt(credential_id, &owner_npub, &scoped_key)
+        .unwrap();
+    pay_service::db::upsert_fiat_settlement_setting(
+        pool,
+        &owner_npub,
+        Product::LightningAddress,
+        100,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::New(pay_service::db::NewEncryptedCredential {
+            id: credential_id,
+            encrypted,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut config = test_config();
+    config.features.bull_bitcoin_fiat_settlement = true;
+    config.bull_bitcoin_credential_encryption_key = Some(encryption_key);
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.bull_bitcoin = Arc::new(fake);
+    (state, owner_npub, credential_id, keypair)
+}
+
+fn fiat_only_test_request<'a>(
+    owner_npub: &'a str,
+    credential_id: Uuid,
+    request_key: &'a str,
+) -> FiatOnlyInstructionRequest<'a> {
+    FiatOnlyInstructionRequest {
+        owner_npub,
+        invoice_id: None,
+        product: Product::LightningAddress,
+        credential_id,
+        request_key,
+        fiat_currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Bitcoin,
+        bitcoin_amount: BitcoinAmountSat::new(25_000).unwrap(),
+        use_payjoin: false,
+    }
+}
+
+fn scripted_created_order(order_id: Uuid) -> CreatedSellOrder {
+    CreatedSellOrder {
+        order_id,
+        currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Bitcoin,
+        requested_bitcoin: BitcoinAmountSat::new(25_000).unwrap(),
+        instruction: PayerInstruction::Bitcoin {
+            address_or_bip21: "bitcoin:bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh?amount=0.00025"
+                .into(),
+        },
+        expires_at_unix: Some(2_000_000_000),
+    }
+}
+
+fn fiat_activation_test_state(pool: PgPool, fake: ScriptedBullBitcoinApi) -> AppState {
+    let mut config = test_config();
+    config.features.bull_bitcoin_fiat_settlement = true;
+    config.bull_bitcoin_credential_encryption_key =
+        Some(pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap());
+    let mut state = test_state_with_config(pool, config);
+    state.bull_bitcoin = Arc::new(fake);
+    state
+}
+
+fn signed_fiat_set_body(
+    keypair: &Keypair,
+    npub: &str,
+    product: Product,
+    percentage: u8,
+    currency: Option<FiatCurrency>,
+    api_key: Option<&str>,
+    timestamp: u64,
+) -> Value {
+    let percentage_field = percentage.to_string();
+    let currency_field = currency.map(FiatCurrency::as_str).unwrap_or("");
+    let key_field = api_key.unwrap_or("");
+    let signature = sign_la_action_with_timestamp(
+        keypair,
+        fiat_settlement::ACTION_SET,
+        npub,
+        "",
+        &[
+            "1",
+            product.as_str(),
+            &percentage_field,
+            currency_field,
+            key_field,
+        ],
+        timestamp,
+    );
+    let mut body = json!({
+        "version": 1,
+        "npub": npub,
+        "fiat_percentage": percentage,
+        "timestamp": timestamp,
+        "signature": signature,
+    });
+    let object = body.as_object_mut().unwrap();
+    if let Some(currency) = currency {
+        object.insert("fiat_currency".into(), json!(currency.as_str()));
+    }
+    if let Some(api_key) = api_key {
+        object.insert("api_key".into(), json!(api_key));
+    }
+    body
+}
+
+fn scripted_liquid_order(order_id: Uuid, amount_sat: i64) -> CreatedSellOrder {
+    scripted_liquid_order_at(
+        order_id,
+        amount_sat,
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 77).unwrap(),
+    )
+}
+
+fn scripted_liquid_order_at(
+    order_id: Uuid,
+    amount_sat: i64,
+    confidential_address: String,
+) -> CreatedSellOrder {
+    CreatedSellOrder {
+        order_id,
+        currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Liquid,
+        requested_bitcoin: BitcoinAmountSat::new(amount_sat).unwrap(),
+        instruction: PayerInstruction::Liquid {
+            confidential_address,
+        },
+        expires_at_unix: Some(2_000_000_000),
+    }
+}
+
+fn mixed_claim_basis(net_settlement_sat: i64) -> MixedClaimBasis {
+    let address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 77).unwrap();
+    let address = boltz_client::elements::Address::from_str(&address).unwrap();
+    MixedClaimBasis {
+        net_settlement_sat,
+        additional_output_script_len: address.script_pubkey().len(),
+    }
+}
+
+struct MixedReverseFixture {
+    state: AppState,
+    owner_npub: String,
+    credential_id: Uuid,
+    keypair: Keypair,
+    invoice: pay_service::db::Invoice,
+    reverse_swap_id: Uuid,
+    boltz_swap_id: String,
+}
+
+async fn mixed_reverse_fixture(
+    pool: &PgPool,
+    fake: ScriptedBullBitcoinApi,
+    owner_label: &str,
+    total_amount_sat: i64,
+    fiat_percentage: i16,
+) -> MixedReverseFixture {
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(pool, fake, owner_label).await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        pool,
+        &owner_npub,
+        Product::Invoice,
+        fiat_percentage,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let liquid_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let liquid_blinding_key_hex =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: total_amount_sat,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        2,
+    )
+    .await
+    .unwrap();
+
+    let child_index = pay_service::db::next_swap_key_index(pool).await.unwrap();
+    let claim_secret = SecretKey::from_slice(&[17; 32]).unwrap();
+    let claim_public =
+        secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &claim_secret).to_string();
+    let preimage_hash = hex::encode(Sha256::digest(format!(
+        "mixed-reverse:{owner_label}:{child_index}"
+    )));
+    let allocation_id = pay_service::db::reserve_swap_key_allocation(
+        pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: i64::try_from(child_index).unwrap(),
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &claim_public,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let boltz_swap_id = format!("MIXED_REVERSE_{owner_label}");
+    let preimage = "21".repeat(32);
+    let claim_key = claim_secret.display_secret().to_string();
+    let bolt11 = fresh_bolt11(u64::try_from(total_amount_sat).unwrap());
+    let mut tx = pool.begin().await.unwrap();
+    let reverse_swap_id = pay_service::db::record_swap_in_tx_with_lineage(
+        &mut tx,
+        &pay_service::db::NewSwapRecord {
+            nym: None,
+            boltz_swap_id: &boltz_swap_id,
+            address: None,
+            address_index: None,
+            amount_sat: u64::try_from(total_amount_sat).unwrap(),
+            invoice: &bolt11,
+            preimage_hex: &preimage,
+            claim_key_hex: &claim_key,
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+            key_index: Some(i64::try_from(child_index).unwrap()),
+            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
+        },
+        &pay_service::db::ReverseSwapLineage {
+            allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public,
+            preimage_hash_hex: &preimage_hash,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(pay_service::db::capture_invoice_reverse_mixed_policy(
+        &mut tx,
+        reverse_swap_id,
+        invoice.id,
+    )
+    .await
+    .unwrap());
+    tx.commit().await.unwrap();
+
+    MixedReverseFixture {
+        state,
+        owner_npub,
+        credential_id,
+        keypair,
+        invoice,
+        reverse_swap_id,
+        boltz_swap_id,
+    }
+}
+
 fn test_app(state: AppState) -> Router {
     Router::new()
         .route(
@@ -402,6 +785,26 @@ fn test_app(state: AppState) -> Router {
             put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
                 recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
             )),
+        )
+        .route(
+            "/api/v1/fiat-settlement/options",
+            get(fiat_settlement::options),
+        )
+        .route(
+            "/api/v1/fiat-settlement",
+            get(fiat_settlement::configuration),
+        )
+        .route(
+            "/api/v1/fiat-settlements",
+            get(fiat_settlement::settlements),
+        )
+        .route(
+            "/api/v1/fiat-settlement/:product",
+            put(fiat_settlement::set).delete(fiat_settlement::delete_product),
+        )
+        .route(
+            "/api/v1/bull-bitcoin-credential",
+            axum::routing::delete(fiat_settlement::delete_credential),
         )
         .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
@@ -861,6 +1264,18 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Fiat policies and settlement evidence intentionally use RESTRICT links
+    // and omit runtime DELETE. The disposable schema owner truncates this
+    // feature family solely for per-test isolation.
+    sqlx::query(
+        "TRUNCATE bull_bitcoin_settlements, \
+                  invoice_fiat_settlement_policies, \
+                  fiat_settlement_settings, \
+                  bull_bitcoin_credentials CASCADE",
+    )
+    .execute(pool)
+    .await
+    .ok();
     // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
     // events. The disposable database owner truncates the entire attribution
     // family solely for per-test isolation.
@@ -1724,6 +2139,1672 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 }
 
 #[tokio::test]
+async fn fiat_settlement_options_advertise_only_operational_capability() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let disabled = test_app(test_state(pool.clone()));
+    let (status, headers, body) =
+        get_json_with_headers(&disabled, "/api/v1/fiat-settlement/options").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(
+        body,
+        json!({
+            "version": 1,
+            "accepting_new_settings": false,
+            "currencies": ["CAD", "EUR", "MXN", "CRC", "COP", "ARS", "USD"]
+        })
+    );
+
+    let enabled = test_app(fiat_activation_test_state(
+        pool.clone(),
+        ScriptedBullBitcoinApi::default(),
+    ));
+    let (status, _, body) =
+        get_json_with_headers(&enabled, "/api/v1/fiat-settlement/options").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["accepting_new_settings"], true);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_key() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-config-merchant", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-config-merchant", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let fake = ScriptedBullBitcoinApi::default();
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+
+    // Mobile clock skew inside the authenticated five-minute window is valid.
+    // The signed retry marker must not impose an ordering constraint against
+    // the server's own updated_at clock.
+    let timestamp = auth_timestamp() + 60;
+    let api_key = format!("bbak-{}", "ab".repeat(32));
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_SET,
+        &npub,
+        "",
+        &["1", "invoice", "50", "CAD", &api_key],
+        timestamp,
+    );
+    let set_body = json!({
+        "version": 1,
+        "npub": npub,
+        "fiat_percentage": 50,
+        "fiat_currency": "CAD",
+        "api_key": api_key,
+        "timestamp": timestamp,
+        "signature": signature,
+    });
+
+    let (set_status, set_response) =
+        put_json(&app, "/api/v1/fiat-settlement/invoice", set_body.clone()).await;
+    assert_eq!(set_status, StatusCode::OK, "{set_response:?}");
+    let serialized = set_response.to_string();
+    assert!(!serialized.contains("bbak-"));
+    assert_eq!(set_response["credential_status"], "active");
+    assert_eq!(set_response["settings"][0]["fiat_percentage"], 50);
+
+    // Exact signed retry is idempotent and must not create another key
+    // generation after a lost response.
+    let (retry_status, retry_response) =
+        put_json(&app, "/api/v1/fiat-settlement/invoice", set_body).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_response:?}");
+    let credential_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(credential_count, 1);
+    let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+        "SELECT ciphertext, nonce FROM bull_bitcoin_credentials \
+          WHERE owner_npub = $1 AND admitted_for_new_orders",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ciphertext.len(), 85);
+    assert_eq!(nonce.len(), 24);
+    assert!(!ciphertext
+        .windows(api_key.len())
+        .any(|window| window == api_key.as_bytes()));
+
+    // A second product reuses the admitted credential without returning
+    // another plaintext key.
+    let pos_timestamp = auth_timestamp();
+    let pos_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_SET,
+        &npub,
+        "",
+        &["1", "pos", "100", "EUR", ""],
+        pos_timestamp,
+    );
+    let (pos_status, pos_response) = put_json(
+        &app,
+        "/api/v1/fiat-settlement/pos",
+        json!({
+            "version": 1,
+            "npub": npub,
+            "fiat_percentage": 100,
+            "fiat_currency": "EUR",
+            "timestamp": pos_timestamp,
+            "signature": pos_signature,
+        }),
+    )
+    .await;
+    assert_eq!(pos_status, StatusCode::OK, "{pos_response:?}");
+    assert_eq!(pos_response["settings"].as_array().unwrap().len(), 2);
+    assert_eq!(fake.validation_call_count(), 3);
+
+    let get_timestamp = auth_timestamp();
+    let get_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_GET,
+        &npub,
+        "",
+        &["1"],
+        get_timestamp,
+    );
+    let (get_status, get_headers, get_response) = get_json_with_headers(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlement?version=1&npub={npub}&timestamp={get_timestamp}&signature={get_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK, "{get_response:?}");
+    assert_eq!(
+        get_headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert!(!get_response.to_string().contains("bbak-"));
+    assert!(!get_response.to_string().contains("instruction"));
+
+    let delete_timestamp = auth_timestamp();
+    let delete_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_DELETE_CREDENTIAL,
+        &npub,
+        "",
+        &["1"],
+        delete_timestamp,
+    );
+    let (delete_status, delete_response) = delete_json_path(
+        &app,
+        "/api/v1/bull-bitcoin-credential",
+        json!({
+            "version": 1,
+            "npub": npub,
+            "timestamp": delete_timestamp,
+            "signature": delete_signature,
+        }),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK, "{delete_response:?}");
+    assert_eq!(delete_response["credential_status"], "absent");
+    assert!(delete_response["settings"].as_array().unwrap().is_empty());
+    let erased = sqlx::query_as::<_, (Option<Vec<u8>>, Option<Vec<u8>>, bool)>(
+        "SELECT ciphertext, nonce, erased_at IS NOT NULL \
+           FROM bull_bitcoin_credentials WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(erased, (None, None, true));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) = sign_registration_with_keypair("fiat-kyc-denied", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-kyc-denied", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_validation(Err(BullBitcoinError::BenchmarkEligibilityDenied))
+        .await;
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "cd".repeat(32));
+    let body = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Invoice,
+        50,
+        Some(FiatCurrency::CAD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert_eq!(
+        response["reason"],
+        "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later."
+    );
+    assert!(!response.to_string().contains(&api_key));
+    assert_eq!(fake.validation_call_count(), 1);
+    let persisted = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (0, 0));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-update-denied", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-update-denied", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "de".repeat(32));
+    let initial = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        40,
+        Some(FiatCurrency::CAD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", initial).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+
+    let before = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
+        "SELECT credential.id, credential.ciphertext, credential.nonce, \
+                setting.fiat_percentage, setting.fiat_currency, \
+                extract(epoch FROM setting.request_signed_at)::BIGINT \
+           FROM fiat_settlement_settings setting \
+           JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
+          WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    fake.push_validation(Err(BullBitcoinError::BenchmarkEligibilityDenied))
+        .await;
+    let update = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        75,
+        Some(FiatCurrency::EUR),
+        None,
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", update).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    let after = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
+        "SELECT credential.id, credential.ciphertext, credential.nonce, \
+                setting.fiat_percentage, setting.fiat_currency, \
+                extract(epoch FROM setting.request_signed_at)::BIGINT \
+           FROM fiat_settlement_settings setting \
+           JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
+          WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(fake.validation_call_count(), 2);
+
+    let disable = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        0,
+        None,
+        None,
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", disable).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert!(response["settings"].as_array().unwrap().is_empty());
+    assert_eq!(fake.validation_call_count(), 2);
+    let remaining = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials \
+               WHERE owner_npub = $1 AND admitted_for_new_orders), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, (1, 0));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_errors() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-preflight-errors", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-preflight-errors", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_validation(Err(BullBitcoinError::Authentication))
+        .await;
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "ef".repeat(32));
+
+    let auth_failure = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Pos,
+        100,
+        Some(FiatCurrency::USD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CREDENTIAL_INVALID");
+    assert!(response["reason"].as_str().unwrap().contains("Reconnect"));
+    assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert!(!response.to_string().contains(&api_key));
+
+    fake.push_validation(Err(BullBitcoinError::Timeout)).await;
+    let transient_failure = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Pos,
+        100,
+        Some(FiatCurrency::USD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", transient_failure).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
+    assert_eq!(response["code"], "ServiceUnavailable");
+    assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert!(!response.to_string().contains(&api_key));
+    let persisted = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (0, 0));
+    assert_eq!(fake.validation_call_count(), 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_missing_credential_has_a_stable_client_code() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-missing-credential", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-missing-credential", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(fiat_activation_test_state(
+        pool.clone(),
+        ScriptedBullBitcoinApi::default(),
+    ));
+    let body = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Invoice,
+        50,
+        Some(FiatCurrency::CAD),
+        None,
+        auth_timestamp(),
+    );
+
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CREDENTIAL_REQUIRED");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_stale_credential_id_cannot_commit_after_preflight() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let (_, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake, "fiat-stale-credential").await;
+
+    let result = pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        50,
+        FiatCurrency::EUR,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: Uuid::new_v4(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(pay_service::db::FiatSettlementStoreError::CredentialChanged)
+    ));
+
+    let active_credential = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM bull_bitcoin_credentials \
+          WHERE owner_npub = $1 AND admitted_for_new_orders",
+    )
+    .bind(&owner_npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_credential, credential_id);
+    let invoice_settings = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM fiat_settlement_settings \
+          WHERE owner_npub = $1 AND product = 'invoice'",
+    )
+    .bind(&owner_npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(invoice_settings, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_create_is_write_ahead_idempotent_and_request_bound() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-lifecycle-idempotent").await;
+    let request = fiat_only_test_request(&owner_npub, credential_id, "payer-intent-1");
+
+    let first =
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap();
+    let retry =
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap();
+    assert_eq!(first, retry);
+    assert_eq!(fake.create_call_count(), 1);
+    assert!(matches!(
+        first,
+        FiatOnlyInstructionOutcome::BullBitcoin {
+            order_id: returned,
+            ..
+        } if returned == order_id
+    ));
+
+    let mut conflicting = fiat_only_test_request(&owner_npub, credential_id, "payer-intent-1");
+    conflicting.bitcoin_amount = BitcoinAmountSat::new(25_001).unwrap();
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &conflicting,)
+            .await
+            .unwrap_err(),
+        pay_service::bull_bitcoin_settlement::SettlementServiceError::RequestKeyConflict
+    );
+    assert_eq!(fake.create_call_count(), 1);
+
+    let persisted = sqlx::query_as::<_, (String, String, String, Option<Uuid>, i64)>(
+        "SELECT provider_state, funding_route, settlement_status, \
+                bull_bitcoin_order_id, requested_bitcoin_sat \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&owner_npub)
+    .bind("payer-intent-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted,
+        (
+            "bound".into(),
+            "bull_bitcoin".into(),
+            "pending".into(),
+            Some(order_id),
+            25_000,
+        )
+    );
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_concurrent_exact_create_dispatches_once() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Ok(scripted_created_order(Uuid::new_v4())))
+        .await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-lifecycle-concurrent").await;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let state = state.clone();
+        let owner_npub = owner_npub.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let request =
+                fiat_only_test_request(&owner_npub, credential_id, "payer-intent-concurrent");
+            pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+                .await
+        }));
+    }
+    barrier.wait().await;
+    let first = tasks.remove(0).await.unwrap().unwrap();
+    let second = tasks.remove(0).await.unwrap().unwrap();
+    assert_eq!(first, second);
+    assert_eq!(fake.create_call_count(), 1);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_create_failures_never_redispatch_ambiguous_attempts() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let timeout_fake = ScriptedBullBitcoinApi::default();
+    timeout_fake
+        .push_create(Err(BullBitcoinError::Timeout))
+        .await;
+    let (timeout_state, timeout_owner, timeout_credential, _) =
+        fiat_lifecycle_test_state(&pool, timeout_fake.clone(), "fiat-lifecycle-timeout").await;
+    let timeout_request =
+        fiat_only_test_request(&timeout_owner, timeout_credential, "payer-intent-timeout");
+    for _ in 0..2 {
+        assert!(matches!(
+            pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
+                &timeout_state,
+                &timeout_request,
+            )
+            .await
+            .unwrap(),
+            FiatOnlyInstructionOutcome::BitcoinFallback {
+                category: FallbackCategory::AmbiguousCreate,
+                ..
+            }
+        ));
+    }
+    assert_eq!(timeout_fake.create_call_count(), 1);
+
+    let minimum_fake = ScriptedBullBitcoinApi::default();
+    minimum_fake
+        .push_create(Err(BullBitcoinError::Minimum))
+        .await;
+    let (minimum_state, minimum_owner, minimum_credential, _) =
+        fiat_lifecycle_test_state(&pool, minimum_fake.clone(), "fiat-lifecycle-minimum").await;
+    let minimum_request =
+        fiat_only_test_request(&minimum_owner, minimum_credential, "payer-intent-minimum");
+    assert!(matches!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
+            &minimum_state,
+            &minimum_request,
+        )
+        .await
+        .unwrap(),
+        FiatOnlyInstructionOutcome::BitcoinFallback {
+            category: FallbackCategory::BelowMinimum,
+            ..
+        }
+    ));
+    assert_eq!(minimum_fake.create_call_count(), 1);
+
+    let crash_fake = ScriptedBullBitcoinApi::default();
+    let (crash_state, crash_owner, crash_credential, _) =
+        fiat_lifecycle_test_state(&pool, crash_fake.clone(), "fiat-lifecycle-crash").await;
+    let crash_request =
+        fiat_only_test_request(&crash_owner, crash_credential, "payer-intent-crash");
+    let reservation = pay_service::db::NewBullBitcoinSettlement {
+        owner_npub: &crash_owner,
+        invoice_id: None,
+        reverse_swap_id: None,
+        chain_swap_id: None,
+        credential_id: crash_credential,
+        product: Product::LightningAddress.as_str(),
+        purpose: "fiat_only",
+        payer_rail: "bitcoin",
+        request_key: "payer-intent-crash",
+        fiat_percentage: 100,
+        fiat_currency: "CAD",
+        requested_bitcoin_sat: 25_000,
+    };
+    let mut connection = pool.acquire().await.unwrap();
+    let row = pay_service::db::reserve_bull_bitcoin_settlement(&mut connection, &reservation)
+        .await
+        .unwrap();
+    assert!(
+        pay_service::db::begin_bull_bitcoin_dispatch(&mut connection, row.id)
+            .await
+            .unwrap()
+    );
+    drop(connection);
+    assert!(matches!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
+            &crash_state,
+            &crash_request,
+        )
+        .await
+        .unwrap(),
+        FiatOnlyInstructionOutcome::BitcoinFallback {
+            category: FallbackCategory::AmbiguousCreate,
+            ..
+        }
+    ));
+    assert_eq!(crash_fake.create_call_count(), 0);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_lightning_address_feature_flag_gates_dormant_settings() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let (enabled_state, _, _, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-flag-dormant").await;
+
+    let enabled_app = test_app(enabled_state.clone());
+    let (enabled_status, enabled_metadata) =
+        get_path(&enabled_app, "/.well-known/lnurlp/fiat-flag-dormant").await;
+    assert_eq!(enabled_status, StatusCode::OK, "{enabled_metadata:?}");
+    assert_eq!(enabled_metadata["commentAllowed"], 0);
+    assert_eq!(enabled_metadata["payment_methods"], json!(["L-BTC"]));
+
+    let mut disabled_config = (*enabled_state.config).clone();
+    disabled_config.features.bull_bitcoin_fiat_settlement = false;
+    let mut disabled_state = enabled_state;
+    disabled_state.config = Arc::new(disabled_config);
+    let disabled_app = test_app(disabled_state);
+    let (disabled_status, disabled_metadata) =
+        get_path(&disabled_app, "/.well-known/lnurlp/fiat-flag-dormant").await;
+    assert_eq!(disabled_status, StatusCode::OK, "{disabled_metadata:?}");
+    assert_eq!(disabled_metadata["commentAllowed"], 120);
+    assert_eq!(disabled_metadata["payment_methods"], json!(["L-BTC"]));
+    assert_eq!(fake.create_call_count(), 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_exact_payer_intent_replays_after_setting_change_or_deletion() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Ok(scripted_created_order(Uuid::new_v4())))
+        .await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-setting-replay").await;
+    let request_key = "lnurl:stable-intent:bitcoin:25000";
+    let request = fiat_only_test_request(&owner_npub, credential_id, request_key);
+    let original =
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap();
+
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::LightningAddress,
+        40,
+        FiatCurrency::EUR,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+    let changed_replay = pay_service::bull_bitcoin_settlement::replay_fiat_only_instruction(
+        &state,
+        &owner_npub,
+        request_key,
+        Product::LightningAddress,
+        BitcoinNetwork::Bitcoin,
+        BitcoinAmountSat::new(25_000).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(changed_replay, original);
+
+    pay_service::db::delete_fiat_settlement_setting(&pool, &owner_npub, Product::LightningAddress)
+        .await
+        .unwrap();
+    let deleted_replay = pay_service::bull_bitcoin_settlement::replay_fiat_only_instruction(
+        &state,
+        &owner_npub,
+        request_key,
+        Product::LightningAddress,
+        BitcoinNetwork::Bitcoin,
+        BitcoinAmountSat::new(25_000).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(deleted_replay, original);
+    assert_eq!(fake.create_call_count(), 1);
+
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::replay_fiat_only_instruction(
+            &state,
+            &owner_npub,
+            request_key,
+            Product::LightningAddress,
+            BitcoinNetwork::Liquid,
+            BitcoinAmountSat::new(25_000).unwrap(),
+        )
+        .await
+        .unwrap_err(),
+        pay_service::bull_bitcoin_settlement::SettlementServiceError::RequestKeyConflict
+    );
+    assert_eq!(fake.create_call_count(), 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_liquid_order(order_id, 40_000)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(40_500),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: true,
+    }))
+    .await;
+    let fixture = mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-exact", 100_000, 40).await;
+
+    let first = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(100_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (settlement_id, provider_address) = match first {
+        MixedSettlementPreparation::BullBitcoinOutput {
+            settlement_id,
+            confidential_address,
+            bull_bitcoin_amount_sat,
+            ..
+        } => {
+            assert_eq!(bull_bitcoin_amount_sat, 40_000);
+            (settlement_id, confidential_address)
+        }
+        _ => panic!("expected a funded mixed preparation"),
+    };
+    let stored = sqlx::query_as::<_, (String, Option<String>, String, Option<String>)>(
+        "SELECT provider_state, funding_route, settlement_status, payer_instruction \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, "bound");
+    assert_eq!(stored.1, None);
+    assert_eq!(stored.2, "none");
+    assert_eq!(stored.3.as_deref(), Some(provider_address.as_str()));
+
+    let retry = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(100_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        retry,
+        MixedSettlementPreparation::BullBitcoinOutput {
+            settlement_id: replayed_id,
+            confidential_address: replayed_address,
+            bull_bitcoin_amount_sat: 40_000,
+            ..
+        } if replayed_id == settlement_id && replayed_address == provider_address
+    ));
+    assert_eq!(fake.create_call_count(), 1);
+
+    let claim_txid = "61".repeat(32);
+    let merchant_script = "0014".to_owned() + &"62".repeat(20);
+    let provider_script = "0014".to_owned() + &"63".repeat(20);
+    let asset_hash = "64".repeat(32);
+    let value_hash = "65".repeat(32);
+    let nonce_hash = "66".repeat(32);
+    let surjection_hash = "67".repeat(32);
+    let rangeproof_hash = "68".repeat(32);
+    let merchant = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "merchant",
+        txid: &claim_txid,
+        vout: 0,
+        script_pubkey_hex: &merchant_script,
+        authorized_amount_sat: 60_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let bull_bitcoin = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "bull_bitcoin",
+        txid: &claim_txid,
+        vout: 1,
+        script_pubkey_hex: &provider_script,
+        authorized_amount_sat: 40_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    pay_service::db::commit_mixed_bull_bitcoin_funding(
+        &mut tx,
+        settlement_id,
+        &merchant,
+        &bull_bitcoin,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let journaled = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(100_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        journaled,
+        MixedSettlementPreparation::Journaled {
+            settlement_id: replayed_id,
+            bull_bitcoin_amount_sat: 40_000,
+            ..
+        } if replayed_id == settlement_id
+    ));
+    let erased_instruction: (Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT instruction_kind, payer_instruction, funding_committed_at IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(erased_instruction, (None, None, true));
+
+    sqlx::query(
+        "UPDATE swap_records SET status = 'claimed', claim_txid = $2, \
+                updated_at = NOW() - INTERVAL '30 days' WHERE id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .bind(&claim_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let repair_epoch_micros: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let repair = pay_service::db::list_claimed_swaps_missing_lightning_event(
+        &pool,
+        1,
+        repair_epoch_micros,
+        None,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(repair.len(), 1, "funded mixed claims have no repair expiry");
+    assert_eq!(repair[0].id, fixture.reverse_swap_id);
+
+    assert!(
+        invoice::record_reverse_claim_settlement(
+            &pool,
+            fixture.reverse_swap_id,
+            Some(fixture.invoice.id),
+            100_000,
+            &fixture.boltz_swap_id,
+            &claim_txid,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+    );
+    assert!(
+        invoice::record_reverse_claim_settlement(
+            &pool,
+            fixture.reverse_swap_id,
+            Some(fixture.invoice.id),
+            100_000,
+            &fixture.boltz_swap_id,
+            &claim_txid,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+    );
+    assert!(pay_service::db::list_claimed_swaps_missing_lightning_event(
+        &pool,
+        1,
+        repair_epoch_micros,
+        None,
+        10,
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    let events = sqlx::query_as::<_, (String, String, i64, Option<i32>)>(
+        "SELECT source, rail, amount_sat, vout FROM invoice_payment_events \
+          WHERE invoice_id = $1 ORDER BY accounting_sequence",
+    )
+    .bind(fixture.invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            (
+                "lightning_boltz_reverse".into(),
+                "lightning".into(),
+                60_000,
+                None
+            ),
+            (
+                "bull_bitcoin_mixed_output".into(),
+                "liquid".into(),
+                40_000,
+                Some(1)
+            ),
+        ]
+    );
+
+    let deletion =
+        pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &fixture.owner_npub)
+            .await
+            .unwrap();
+    assert_eq!(
+        deletion.credential,
+        pay_service::db::CredentialLifecycle::DeletionPending
+    );
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&fixture.state)
+        .await
+        .unwrap();
+    assert_eq!(fake.read_call_count(), 1);
+    let final_row = sqlx::query_as::<_, (String, i64, i64, bool)>(
+        "SELECT settlement_status, actual_received_sat, credited_fiat_minor, provider_final \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(final_row, ("settled".into(), 40_500, 12_345, true));
+    let key_erased: (bool, bool, bool) = sqlx::query_as(
+        "SELECT ciphertext IS NULL, nonce IS NULL, erased_at IS NOT NULL \
+           FROM bull_bitcoin_credentials WHERE id = $1",
+    )
+    .bind(fixture.credential_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(key_erased, (true, true, true));
+
+    let app = test_app(fixture.state);
+    let (public_status, public) = get_path(
+        &app,
+        &format!("/api/v1/invoices/{}/status", fixture.invoice.id),
+    )
+    .await;
+    assert_eq!(public_status, StatusCode::OK, "{public:?}");
+    let public_json = public.to_string();
+    assert!(!public_json.contains(&order_id.to_string()));
+    assert!(!public_json.contains("12345"));
+    assert!(!public_json.contains("40500"));
+    assert!(!public_json.contains("bull_bitcoin"));
+
+    let (signature, timestamp) =
+        sign_invoice_list_with_keypair(&fixture.keypair, &fixture.owner_npub, 1, 10, "");
+    let (merchant_status, merchant_view) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}",
+            fixture.owner_npub
+        ),
+    )
+    .await;
+    assert_eq!(merchant_status, StatusCode::OK, "{merchant_view:?}");
+    assert_eq!(
+        merchant_view["invoices"][0]["settlement_details"],
+        json!({
+            "kind": "mixed",
+            "bitcoin": [{
+                "amount_sat": 60_000,
+                "network": "liquid",
+                "status": "settled",
+            }],
+            "fiat": [{
+                "amount_minor": 12_345,
+                "currency": "CAD",
+                "order_id": order_id,
+                "status": "settled",
+            }]
+        })
+    );
+    let merchant_json = merchant_view.to_string();
+    assert!(!merchant_json.contains(&settlement_id.to_string()));
+    assert!(!merchant_json.contains(&claim_txid));
+    assert!(!merchant_json.contains("40500"));
+    assert!(!merchant_json.contains("bbak-"));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_mixed_minimum_and_invalid_split_fall_back_once() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let minimum_fake = ScriptedBullBitcoinApi::default();
+    minimum_fake
+        .push_create(Err(BullBitcoinError::Minimum))
+        .await;
+    let minimum = mixed_reverse_fixture(
+        &pool,
+        minimum_fake.clone(),
+        "fiat-mixed-minimum",
+        25_000,
+        40,
+    )
+    .await;
+    for _ in 0..2 {
+        assert!(matches!(
+            pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+                &minimum.state,
+                minimum.reverse_swap_id,
+                mixed_claim_basis(25_000),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            MixedSettlementPreparation::BitcoinFallback {
+                category: FallbackCategory::BelowMinimum,
+                ..
+            }
+        ));
+    }
+    assert_eq!(minimum_fake.create_call_count(), 1);
+    let minimum_route = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "SELECT provider_state, funding_route, payer_instruction IS NULL, \
+                funding_committed_at IS NULL FROM bull_bitcoin_settlements \
+          WHERE reverse_swap_id = $1",
+    )
+    .bind(minimum.reverse_swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        minimum_route,
+        ("abandoned".into(), "bitcoin_fallback".into(), true, true)
+    );
+
+    cleanup_db(&pool).await;
+    let invalid_fake = ScriptedBullBitcoinApi::default();
+    let invalid =
+        mixed_reverse_fixture(&pool, invalid_fake.clone(), "fiat-mixed-invalid", 1, 99).await;
+    assert!(matches!(
+        pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+            &invalid.state,
+            invalid.reverse_swap_id,
+            mixed_claim_basis(1),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        MixedSettlementPreparation::BitcoinFallback {
+            category: FallbackCategory::InvalidSplit,
+            ..
+        }
+    ));
+    assert_eq!(invalid_fake.create_call_count(), 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_mixed_uses_net_fee_basis_and_does_not_resize_a_bound_order() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Ok(scripted_liquid_order(Uuid::new_v4(), 39_600)))
+        .await;
+    let fixture = mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-net", 100_000, 40).await;
+
+    let first = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(99_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        first,
+        MixedSettlementPreparation::BullBitcoinOutput {
+            bull_bitcoin_amount_sat: 39_600,
+            fiat_percentage: 40,
+            ..
+        }
+    ));
+    assert_eq!(fake.create_call_count(), 1);
+
+    let changed_basis = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(98_999),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        changed_basis,
+        MixedSettlementPreparation::BitcoinFallback {
+            category: FallbackCategory::InvalidSplit,
+            ..
+        }
+    ));
+    assert_eq!(fake.create_call_count(), 1);
+    let stored = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "SELECT provider_state, funding_route, payer_instruction IS NULL, \
+                bull_bitcoin_order_id IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE reverse_swap_id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        ("bound".into(), "bitcoin_fallback".into(), true, true)
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_mixed_rejects_an_unmeasured_liquid_script_shape() {
+    const CONFIDENTIAL_P2TR: &str = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Ok(scripted_liquid_order_at(
+        Uuid::new_v4(),
+        40_000,
+        CONFIDENTIAL_P2TR.into(),
+    )))
+    .await;
+    let fixture =
+        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-script", 100_000, 40).await;
+    let expected_len = mixed_claim_basis(100_000).additional_output_script_len;
+    let returned_len = boltz_client::elements::Address::from_str(CONFIDENTIAL_P2TR)
+        .unwrap()
+        .script_pubkey()
+        .len();
+    assert_ne!(expected_len, returned_len);
+
+    let result = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(100_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        result,
+        MixedSettlementPreparation::BitcoinFallback {
+            category: FallbackCategory::InvalidSplit,
+            ..
+        }
+    ));
+    assert_eq!(fake.create_call_count(), 1);
+    let stored = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "SELECT provider_state, funding_route, payer_instruction IS NULL, \
+                bull_bitcoin_order_id IS NULL \
+           FROM bull_bitcoin_settlements WHERE reverse_swap_id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        ("abandoned".into(), "bitcoin_fallback".into(), true, true)
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_drains_key() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(27_500),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: true,
+    }))
+    .await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-lifecycle-reconcile").await;
+    let request = fiat_only_test_request(&owner_npub, credential_id, "payer-intent-reconcile");
+    pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+        .await
+        .unwrap();
+
+    let deletion = pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &owner_npub)
+        .await
+        .unwrap();
+    assert_eq!(
+        deletion.credential,
+        pay_service::db::CredentialLifecycle::DeletionPending
+    );
+    let material_before = sqlx::query_as::<_, (bool, bool)>(
+        "SELECT ciphertext IS NOT NULL, nonce IS NOT NULL \
+           FROM bull_bitcoin_credentials WHERE id = $1",
+    )
+    .bind(credential_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(material_before, (true, true));
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(fake.read_call_count(), 1);
+    let settlement = sqlx::query_as::<_, (String, i64, i64, bool, bool)>(
+        "SELECT settlement_status, actual_received_sat, credited_fiat_minor, \
+                provider_final, payer_instruction IS NULL \
+           FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement, ("settled".into(), 27_500, 12_345, true, true));
+    let material_after = sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT ciphertext IS NULL, nonce IS NULL, erased_at IS NOT NULL \
+           FROM bull_bitcoin_credentials WHERE id = $1",
+    )
+    .bind(credential_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(material_after, (true, true, true));
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_isolated() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(27_500),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: true,
+    }))
+    .await;
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, fake, "fiat-la-list-owner").await;
+    let request = fiat_only_test_request(&owner_npub, credential_id, "fiat-la-list-intent");
+    let settlement_id =
+        match pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap()
+        {
+            FiatOnlyInstructionOutcome::BullBitcoin { settlement_id, .. } => settlement_id,
+            other => panic!("expected Bull Bitcoin instruction, got {other:?}"),
+        };
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+
+    let app = test_app(state);
+    let timestamp = auth_timestamp();
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "10"],
+        timestamp,
+    );
+    let (status, headers, body) = get_json_with_headers(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(headers.get("pragma").unwrap(), "no-cache");
+    assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(
+        body,
+        json!({
+            "version": 1,
+            "settlements": [{
+                "kind": "fiat",
+                "fiat": {
+                    "amount_minor": 12_345,
+                    "currency": "CAD",
+                    "order_id": order_id,
+                    "status": "settled",
+                }
+            }],
+            "page": 1,
+            "pageSize": 10,
+            "has_more": false,
+        })
+    );
+    let serialized = body.to_string();
+    for forbidden in [
+        settlement_id.to_string(),
+        credential_id.to_string(),
+        owner_npub.clone(),
+        "27500".into(),
+        "25000".into(),
+        "bbak-".into(),
+        "payer_instruction".into(),
+        "actual_received".into(),
+    ] {
+        assert!(!serialized.contains(&forbidden), "leaked {forbidden}");
+    }
+
+    let other_keypair = Keypair::new(&Secp256k1::new(), &mut secp256k1::rand::thread_rng());
+    let other_npub = other_keypair.x_only_public_key().0.to_string();
+    pay_service::db::create_user(&pool, "fiat-la-list-other", &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let other_timestamp = auth_timestamp();
+    let other_signature = sign_la_action_with_timestamp(
+        &other_keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &other_npub,
+        "",
+        &["1", "1", "10"],
+        other_timestamp,
+    );
+    let (other_status, other_body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={other_npub}&page=1&pageSize=10&timestamp={other_timestamp}&signature={other_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(other_status, StatusCode::OK, "{other_body:?}");
+    assert!(other_body["settlements"].as_array().unwrap().is_empty());
+
+    let forged_timestamp = auth_timestamp();
+    let forged_signature = sign_la_action_with_timestamp(
+        &other_keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "10"],
+        forged_timestamp,
+    );
+    let (forged_status, _) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=10&timestamp={forged_timestamp}&signature={forged_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED);
+
+    let oversized_timestamp = auth_timestamp();
+    let oversized_signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "101"],
+        oversized_timestamp,
+    );
+    let (oversized_status, oversized_body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=101&timestamp={oversized_timestamp}&signature={oversized_signature}"
+        ),
+    )
+    .await;
+    assert_eq!(oversized_status, StatusCode::OK);
+    assert_eq!(oversized_body["code"], "InvalidAmount");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_after_crash() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-invoice-reconcile").await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        100,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 25_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: true,
+            accept_ln: false,
+            accept_liquid: false,
+            bitcoin_address: Some("bc1qfiatinvoicereconcile"),
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        1,
+    )
+    .await
+    .unwrap();
+    let request = FiatOnlyInstructionRequest {
+        owner_npub: &owner_npub,
+        invoice_id: Some(invoice.id),
+        product: Product::Invoice,
+        credential_id,
+        request_key: "invoice-payer-intent-reconcile",
+        fiat_currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Bitcoin,
+        bitcoin_amount: BitcoinAmountSat::new(25_000).unwrap(),
+        use_payjoin: true,
+    };
+    let instruction =
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap();
+    let settlement_id = match instruction {
+        FiatOnlyInstructionOutcome::BullBitcoin { settlement_id, .. } => settlement_id,
+        other => panic!("expected Bull Bitcoin instruction, got {other:?}"),
+    };
+    let pending = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.fiat_settlement_status, "pending");
+    assert_eq!(pending.settlement_status, "pending");
+    assert_eq!(pending.paid_amount_sat, None);
+
+    // Simulate the crash boundary after the normalized provider-final update
+    // committed but before the idempotent invoice event was written.
+    pay_service::db::record_bull_bitcoin_observation(
+        &pool,
+        settlement_id,
+        &OrderObservation {
+            order_id,
+            currency: FiatCurrency::CAD,
+            order_status: "Completed".into(),
+            payin_status: "Completed".into(),
+            payout_status: "Completed".into(),
+            actual_received_sat: Some(27_500),
+            credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+            provider_final: true,
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.read_call_count(),
+        0,
+        "crash repair must use local final evidence"
+    );
+
+    let event = sqlx::query_as::<_, (String, String, i64, i64, Uuid)>(
+        "SELECT source, rail, amount_sat, fiat_credited_minor, bull_bitcoin_settlement_id \
+           FROM invoice_payment_events WHERE bull_bitcoin_settlement_id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        event,
+        (
+            "bull_bitcoin_fiat".into(),
+            "bitcoin".into(),
+            27_500,
+            12_345,
+            settlement_id,
+        )
+    );
+    let paid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.status, "overpaid");
+    assert_eq!(paid.presentation_status.as_deref(), Some("overpaid"));
+    assert_eq!(paid.paid_amount_sat, Some(27_500));
+    assert_eq!(paid.fiat_settlement_status, "settled");
+    assert_eq!(paid.settlement_status, "settled");
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_payment_events WHERE bull_bitcoin_settlement_id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 1);
+    assert_eq!(fake.read_call_count(), 0);
+
+    let app = test_app(state);
+    let (status, public) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK, "{public:?}");
+    let public_json = public.to_string();
+    assert!(!public_json.contains(&order_id.to_string()));
+    assert!(!public_json.contains(&settlement_id.to_string()));
+    assert!(!public_json.contains("12345"));
+    assert!(!public_json.contains("Bull Bitcoin"));
+    assert!(!public_json.contains("bbak-"));
+
+    let (signature, timestamp) = sign_invoice_list_with_keypair(&keypair, &owner_npub, 1, 10, "");
+    let (list_status, merchant) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={owner_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK, "{merchant:?}");
+    assert_eq!(
+        merchant["invoices"][0]["settlement_details"],
+        json!({
+            "kind": "fiat",
+            "fiat": [{
+                "amount_minor": 12_345,
+                "currency": "CAD",
+                "order_id": order_id,
+                "status": "settled",
+            }]
+        })
+    );
+    assert_eq!(merchant["invoices"][0]["fiat_conversion"], Value::Null);
+    let merchant_json = merchant.to_string();
+    assert!(!merchant_json.contains(&settlement_id.to_string()));
+    assert!(!merchant_json.contains("bc1qxy2kgdy"));
+    assert!(!merchant_json.contains("bbak-"));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn retired_liquid_offer_route_is_absent_while_status_remains_current() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -1779,7 +3860,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "066_get_paid_transaction_history"
+        "069_bull_bitcoin_mixed_settlement"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -2020,7 +4101,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "066_get_paid_transaction_history"
+        "069_bull_bitcoin_mixed_settlement"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -12466,6 +14547,41 @@ async fn insert_test_wallet_invoice(
     }
 }
 
+async fn insert_test_wallet_invoice_with_fiat_policy(
+    pool: &PgPool,
+    invoice: &pay_service::db::NewInvoice<'_>,
+    product: Product,
+    allowed_rail_mask: i16,
+) -> Result<pay_service::db::Invoice, sqlx::Error> {
+    assert_eq!(invoice.origin, "wallet");
+    let client_request_id = Uuid::new_v4();
+    let request_digest: [u8; 32] = Sha256::digest(client_request_id.as_bytes()).into();
+    let mut presentation_envelope = vec![0_u8; 4_125];
+    presentation_envelope[0] = 1;
+    let private = pay_service::db::PrivateInvoiceCreate {
+        client_request_id,
+        request_digest: &request_digest,
+        presentation_envelope: &presentation_envelope,
+    };
+    match pay_service::db::insert_or_reuse_wallet_invoice_with_fiat_policy(
+        pool,
+        invoice,
+        &private,
+        product,
+        allowed_rail_mask,
+    )
+    .await?
+    {
+        pay_service::db::WalletInvoiceCreateResolution::Created(invoice) => Ok(invoice),
+        pay_service::db::WalletInvoiceCreateResolution::Reused(_) => Err(sqlx::Error::Protocol(
+            "fresh test wallet request unexpectedly reused an invoice".to_string(),
+        )),
+        pay_service::db::WalletInvoiceCreateResolution::Conflict => Err(sqlx::Error::Protocol(
+            "fresh test wallet request unexpectedly conflicted".to_string(),
+        )),
+    }
+}
+
 fn private_invoice_test_candidate<'a>(
     npub: &'a str,
     bitcoin_address: &'a str,
@@ -15714,6 +17830,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         vout: None,
         boltz_swap_id: Some(reverse_provider_id),
         address: None,
+        bull_bitcoin_settlement_id: None,
+        bull_bitcoin_credited_fiat_minor: None,
     };
     assert_eq!(
         pay_service::db::record_invoice_payment(
@@ -15735,6 +17853,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         vout: None,
         boltz_swap_id: Some(reverse_provider_id),
         address: None,
+        bull_bitcoin_settlement_id: None,
+        bull_bitcoin_credited_fiat_minor: None,
     };
     assert_eq!(
         pay_service::db::record_invoice_payment(
@@ -15784,6 +17904,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             vout: None,
             boltz_swap_id: Some(reverse_provider_id),
             address: None,
+            bull_bitcoin_settlement_id: None,
+            bull_bitcoin_credited_fiat_minor: None,
         },
         chain_attribution,
         pay_service::db::InvoiceAccountingTolerances::default(),
@@ -15807,6 +17929,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
                 vout: None,
                 boltz_swap_id: Some(chain_provider_id),
                 address: None,
+                bull_bitcoin_settlement_id: None,
+                bull_bitcoin_credited_fiat_minor: None,
             },
             pay_service::db::InvoiceAccountingTolerances::default(),
         )
@@ -16171,6 +18295,8 @@ fn liquid_direct_evidence<'a>(
         vout: Some(vout),
         boltz_swap_id: None,
         address: Some(address),
+        bull_bitcoin_settlement_id: None,
+        bull_bitcoin_credited_fiat_minor: None,
     }
 }
 
@@ -16190,6 +18316,8 @@ fn bitcoin_direct_evidence<'a>(
         vout: Some(vout),
         boltz_swap_id: None,
         address: Some(address),
+        bull_bitcoin_settlement_id: None,
+        bull_bitcoin_credited_fiat_minor: None,
     }
 }
 
@@ -18361,13 +20489,26 @@ async fn signed_invoice_list_is_auth_bound_and_npub_isolated() {
     let _bob_invoice = insert_test_invoice(&pool, "listbob", &bob_npub, "lq1listbob", 3_600).await;
 
     let (sig, timestamp) = sign_invoice_list_with_keypair(&alice_keypair, &alice_npub, 1, 10, "");
-    let (status, body) = get_path(
-        &app,
-        &format!(
-            "/api/v1/invoices?npub={alice_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={sig}"
-        ),
-    )
-    .await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/invoices?npub={alice_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(response.headers().get("pragma").unwrap(), "no-cache");
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let invoices = body["invoices"].as_array().unwrap();
     assert_eq!(invoices.len(), 1, "body: {body}");
