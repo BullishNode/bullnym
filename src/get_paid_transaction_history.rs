@@ -315,7 +315,12 @@ fn project_merchant_settlement(
     Option<GetPaidFiatConversionOverride>,
 ) {
     if !transaction.settlement_present {
-        return (GetPaidSettlementKind::Bitcoin, None, None);
+        let kind = if transaction.fiat_policy_present {
+            GetPaidSettlementKind::Unavailable
+        } else {
+            GetPaidSettlementKind::Bitcoin
+        };
+        return (kind, None, None);
     }
 
     if transaction.settlement_funding_route.as_deref() == Some("bitcoin_fallback") {
@@ -450,6 +455,7 @@ mod tests {
             late: false,
             comment: None,
             settlement_present: true,
+            fiat_policy_present: true,
             settlement_purpose: Some("fiat_only".into()),
             settlement_order_id: Some(Uuid::from_u128(9)),
             settlement_currency: Some("CAD".into()),
@@ -484,6 +490,7 @@ mod tests {
             late: false,
             comment: None,
             settlement_present: false,
+            fiat_policy_present: false,
             settlement_purpose: None,
             settlement_order_id: None,
             settlement_currency: None,
@@ -526,6 +533,7 @@ mod tests {
             late: true,
             comment: Some("private text".into()),
             settlement_present: false,
+            fiat_policy_present: false,
             settlement_purpose: None,
             settlement_order_id: None,
             settlement_currency: None,
@@ -565,6 +573,7 @@ mod tests {
     fn projection_emits_explicit_bitcoin_and_fallback_contracts() {
         let mut ordinary = settlement_transaction();
         ordinary.settlement_present = false;
+        ordinary.fiat_policy_present = false;
         let ordinary = serde_json::to_value(project_transaction(ordinary).unwrap()).unwrap();
         assert_eq!(ordinary["settlement_kind"], "bitcoin");
         assert!(ordinary.get("settlement_details").is_none());
@@ -582,6 +591,24 @@ mod tests {
             json!({"status": "overridden", "reason": "below_minimum"})
         );
         assert!(fallback.get("settlement_details").is_none());
+    }
+
+    #[test]
+    fn captured_fiat_policy_without_a_settlement_fails_closed() {
+        let mut pending = settlement_transaction();
+        pending.settlement_present = false;
+        pending.fiat_policy_present = true;
+        pending.settlement_purpose = None;
+        pending.settlement_order_id = None;
+        pending.settlement_currency = None;
+        pending.settlement_status_detail = None;
+        pending.settlement_credited_fiat_minor = None;
+        pending.settlement_funding_route = None;
+
+        let pending = serde_json::to_value(project_transaction(pending).unwrap()).unwrap();
+        assert_eq!(pending["settlement_kind"], "unavailable");
+        assert!(pending.get("settlement_details").is_none());
+        assert!(pending.get("fiat_conversion").is_none());
     }
 
     #[test]

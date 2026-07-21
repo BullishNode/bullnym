@@ -2907,6 +2907,66 @@ async fn bull_bitcoin_exact_payer_intent_replays_after_setting_change_or_deletio
 }
 
 #[tokio::test]
+async fn get_paid_history_never_labels_unprepared_mixed_payment_as_bitcoin() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "fiat-mixed-history-gap";
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, ScriptedBullBitcoinApi::default(), nym).await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::LightningAddress,
+        40,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    insert_swap(&pool, nym, "lockup_mempool", 91).await;
+    let reverse_swap_id: Uuid = sqlx::query_scalar(
+        "UPDATE swap_records SET payment_first_observed_at = NOW() \
+          WHERE boltz_swap_id = $1 RETURNING id",
+    )
+    .bind(format!("boltz-{nym}-91"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let setting = pay_service::db::active_lightning_address_fiat_setting(&pool, nym)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        pay_service::db::validate_and_capture_lightning_address_policy(
+            &mut tx,
+            reverse_swap_id,
+            nym,
+            Some(&setting),
+        )
+        .await
+        .unwrap()
+    );
+    tx.commit().await.unwrap();
+
+    let app = test_app(state);
+    let uri = get_paid_transaction_history_uri(&keypair, &owner_npub, "", 10, auth_timestamp());
+    let (status, history) = get_path(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["settlement_state"], "pending");
+    assert_eq!(transactions[0]["settlement_kind"], "unavailable");
+    assert!(transactions[0].get("settlement_details").is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

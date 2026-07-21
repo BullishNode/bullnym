@@ -18,6 +18,7 @@ pub struct GetPaidTransaction {
     pub late: bool,
     pub comment: Option<String>,
     pub settlement_present: bool,
+    pub fiat_policy_present: bool,
     pub settlement_purpose: Option<String>,
     pub settlement_order_id: Option<Uuid>,
     pub settlement_currency: Option<String>,
@@ -122,7 +123,12 @@ pub async fn list_get_paid_transactions(
                     COALESCE( \
                         event.fiat_credit_policy = 'late_observation_rate_v1', FALSE \
                     ) AS late, \
-                    CASE WHEN invoice.origin = 'checkout' THEN invoice.memo END AS comment \
+                    CASE WHEN invoice.origin = 'checkout' THEN invoice.memo END AS comment, \
+                    EXISTS ( \
+                        SELECT 1 FROM invoice_fiat_settlement_policies policy \
+                         WHERE policy.invoice_id = event.invoice_id \
+                           AND policy.owner_npub = invoice.npub_owner \
+                    ) AS fiat_policy_present \
                FROM invoice_payment_events event \
                JOIN invoices invoice ON invoice.id = event.invoice_id \
           LEFT JOIN invoice_payment_observations observation \
@@ -159,6 +165,7 @@ pub async fn list_get_paid_transactions(
                     END::TEXT AS settlement_state, \
                     FALSE AS late, comment.comment, \
                     settlement.id IS NOT NULL AS settlement_present, \
+                    swap_policy.id IS NOT NULL AS fiat_policy_present, \
                     settlement.purpose AS settlement_purpose, \
                     settlement.bull_bitcoin_order_id AS settlement_order_id, \
                     settlement.fiat_currency AS settlement_currency, \
@@ -184,6 +191,9 @@ pub async fn list_get_paid_transactions(
                  ON settlement.reverse_swap_id = swap.id \
                 AND settlement.owner_npub = owner.npub \
                 AND settlement.product = 'lightning_address' \
+          LEFT JOIN swap_fiat_settlement_policies swap_policy \
+                 ON swap_policy.reverse_swap_id = swap.id \
+                AND swap_policy.owner_npub = owner.npub \
           LEFT JOIN settlement_outputs outputs ON outputs.settlement_id = settlement.id \
               WHERE owner.npub = $1 AND swap.invoice_id IS NULL \
                 AND swap.payment_first_observed_at IS NOT NULL \
@@ -196,7 +206,7 @@ pub async fn list_get_paid_transactions(
                     NULL::UUID, settlement.actual_received_sat, \
                     (EXTRACT(EPOCH FROM settlement.terminal_at) * 1000000)::BIGINT, \
                     settlement.payer_rail, 'settled'::TEXT, FALSE, NULL::TEXT, \
-                    TRUE, settlement.purpose, settlement.bull_bitcoin_order_id, \
+                    TRUE, TRUE, settlement.purpose, settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
                     settlement.credited_fiat_minor, settlement.funding_route, \
                     settlement.fallback_category, NULL::BIGINT, NULL::TEXT \
@@ -212,7 +222,8 @@ pub async fn list_get_paid_transactions(
              SELECT event.transaction_id, event.source, event.source_rank, \
                     event.invoice_id, event.amount_sat, event.received_at_unix_micros, \
                     event.rail, event.settlement_state, event.late, event.comment, \
-                    FALSE, NULL::TEXT, NULL::UUID, NULL::TEXT, NULL::TEXT, \
+                    FALSE, event.fiat_policy_present, NULL::TEXT, NULL::UUID, \
+                    NULL::TEXT, NULL::TEXT, \
                     NULL::BIGINT, NULL::TEXT, NULL::TEXT, NULL::BIGINT, NULL::TEXT \
                FROM invoice_events event \
               WHERE event.bull_bitcoin_settlement_id IS NULL \
@@ -236,7 +247,7 @@ pub async fn list_get_paid_transactions(
              UNION ALL \
              SELECT settlement.id, event.source, event.source_rank, event.invoice_id, \
                     event.amount_sat, event.received_at_unix_micros, event.rail, \
-                    event.settlement_state, event.late, event.comment, TRUE, \
+                    event.settlement_state, event.late, event.comment, TRUE, TRUE, \
                     settlement.purpose, settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
                     settlement.credited_fiat_minor, settlement.funding_route, \
@@ -259,7 +270,7 @@ pub async fn list_get_paid_transactions(
                               OR settlement.settlement_status <> 'settled') THEN 'pending' \
                         ELSE event.settlement_state \
                     END::TEXT, \
-                    event.late, event.comment, TRUE, settlement.purpose, \
+                    event.late, event.comment, TRUE, TRUE, settlement.purpose, \
                     settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
                     settlement.settlement_status, settlement.credited_fiat_minor, \
                     settlement.funding_route, settlement.fallback_category, \
@@ -282,7 +293,8 @@ pub async fn list_get_paid_transactions(
          ) \
          SELECT transaction_id, source, source_rank, invoice_id, amount_sat, \
                 received_at_unix_micros, rail, settlement_state, late, comment, \
-                settlement_present, settlement_purpose, settlement_order_id, \
+                settlement_present, fiat_policy_present, settlement_purpose, \
+                settlement_order_id, \
                 settlement_currency, settlement_status_detail, \
                 settlement_credited_fiat_minor, settlement_funding_route, \
                 settlement_fallback_category, settlement_bitcoin_amount_sat, \

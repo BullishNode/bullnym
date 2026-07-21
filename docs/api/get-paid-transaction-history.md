@@ -133,6 +133,17 @@ when their durable payment evidence proves ordinary Bitcoin settlement.
 Ambiguous or inconsistent historical rows are `unavailable`; field absence is
 not used as an implicit classification.
 
+A captured nonzero fiat policy is durable evidence that ordinary Bitcoin
+settlement has not been established. If payment evidence becomes visible
+before its settlement row is prepared, the transaction is therefore
+`unavailable` until Bullnym can project the authoritative settlement; it is
+never temporarily labeled `bitcoin`.
+
+Corruption in optional settlement evidence fails closed on that transaction as
+`unavailable`. Corruption in a core receipt field such as source, rail, amount,
+time, or payment state fails the entire request instead of silently omitting a
+payment from the merchant's history.
+
 The canonical version-one response fixtures are in
 [`fixtures/get-paid-transactions-settlement-v1.json`](fixtures/get-paid-transactions-settlement-v1.json).
 Server and client contract tests must parse those values without rewriting the
