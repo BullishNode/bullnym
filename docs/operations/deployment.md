@@ -15,7 +15,11 @@
 3. Preserve the staged record with the installed artifact. It contains the
    binary SHA-256 plus the embedded Bullnym, verified Boltz source, schema,
    build profile, pinned Rust/Cargo toolchain, target, and PWA content
-   identities.
+   identities. Install the PWA tree independently of the uploader's umask:
+   owner `root:root`, directories mode `0755`, and regular files mode `0644`.
+   Before restarting, verify the POS and donation shells and their referenced
+   assets are readable as the configured Bullnym service user. Do not promote
+   a binary and PWA tree as separate releases.
 4. Back up PostgreSQL and confirm the swap mnemonic recovery procedure.
 5. Apply migrations before starting a binary that depends on the new schema.
    Migration 050 is a stop-the-writers boundary; follow the dedicated sequence
@@ -38,7 +42,10 @@
 8. Verify worker-start events for claimers, reconcilers, chain watchers,
    settlement repair, slow recovery, and GC.
 9. Exercise public metadata, a Payment Page, POS, invoice status, static assets,
-   and webhook reachability without moving funds.
+   and webhook reachability without moving funds. Require
+   `x-bullnym-pwa-shell: donation` from the Payment Page and
+   `x-bullnym-pwa-shell: pos` from POS, then fetch at least one hashed asset
+   referenced by each shell through the public origin.
 10. Monitor error and recovery events through at least one reconciler cycle.
 
 Before promotion and again against the installed release, run the

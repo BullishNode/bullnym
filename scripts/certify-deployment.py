@@ -125,6 +125,43 @@ def regular_directory(path: pathlib.Path, label: str) -> None:
         fail(f"{label} must be a non-symlink directory: {path}")
 
 
+def check_pwa_readability(pwa_dir: pathlib.Path) -> None:
+    """Require access that does not depend on the artifact uploader's owner."""
+
+    def check_directory(path: pathlib.Path) -> None:
+        regular_directory(path, "PWA directory")
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        required = stat.S_IROTH | stat.S_IXOTH
+        if mode & required != required:
+            fail(
+                f"PWA directory {path} has mode {mode:04o}; "
+                "it must be readable and traversable independently of its owner"
+            )
+
+    def check_file(path: pathlib.Path) -> None:
+        regular_file(path, "PWA file")
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if mode & stat.S_IROTH == 0:
+            fail(
+                f"PWA file {path} has mode {mode:04o}; "
+                "it must be readable independently of its owner"
+            )
+
+    check_directory(pwa_dir)
+
+    def walk_error(error: OSError) -> None:
+        fail(f"cannot inspect PWA content tree {pwa_dir}: {error}")
+
+    for root, directories, files in os.walk(
+        pwa_dir, topdown=True, onerror=walk_error, followlinks=False
+    ):
+        root_path = pathlib.Path(root)
+        for name in sorted(directories):
+            check_directory(root_path / name)
+        for name in sorted(files):
+            check_file(root_path / name)
+
+
 def sha256_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -525,6 +562,7 @@ def certify(args: argparse.Namespace) -> dict[str, Any]:
     )
     if sha256_file(binary) != expected_artifact:
         fail("release binary bytes do not match expected artifact SHA-256")
+    check_pwa_readability(pwa_dir)
     if hash_content_tree(repo, pwa_dir) != expected_pwa:
         fail("PWA content does not match expected SHA-256")
 
@@ -564,6 +602,7 @@ def certify(args: argparse.Namespace) -> dict[str, Any]:
         fail("release record changed while certification probes ran")
     if sha256_file(binary) != expected_artifact:
         fail("release binary changed while certification probes ran")
+    check_pwa_readability(pwa_dir)
     if hash_content_tree(repo, pwa_dir) != expected_pwa:
         fail("PWA content changed while certification probes ran")
 

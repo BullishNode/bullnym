@@ -47,6 +47,15 @@ actual executable bytes and PWA tree against the four explicit authorities.
 The clean checkout, record, executable, and PWA facts are checked again after
 the network probes so a concurrent local change fails the run.
 
+The PWA tree must also be readable independently of the account that copied
+it: non-symlink directories require the other-read and other-execute bits, and
+non-symlink regular files require the other-read bit. The supported installer
+then normalizes these to exact directory mode `0755` and file mode `0644`.
+This check is independent of the content digest because file modes are not
+part of that digest. It prevents an artifact copied with a restrictive
+uploader umask from passing certification while remaining unreadable to the
+Bullnym service user.
+
 The remote side is restricted to these bounded unauthenticated requests, in
 this order:
 
