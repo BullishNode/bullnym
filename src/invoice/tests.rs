@@ -399,6 +399,44 @@ fn template_qr_loading_failure_does_not_block_the_payment_state_machine() {
 }
 
 #[test]
+fn invoice_payment_inline_module_is_valid_javascript() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let html = payment_template_fixture("unpaid", "unpaid", "none", true)
+        .render()
+        .expect("template renders");
+    let script = html
+        .split_once("<script type=\"module\">")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map(|(script, _)| script)
+        .expect("invoice payment template contains its inline module");
+
+    let mut child = Command::new("node")
+        .args(["--check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Node.js is required to validate the invoice template JavaScript");
+    child
+        .stdin
+        .take()
+        .expect("node stdin is piped")
+        .write_all(script.as_bytes())
+        .expect("write rendered invoice JavaScript to node");
+
+    let output = child
+        .wait_with_output()
+        .expect("wait for JavaScript syntax validation");
+    assert!(
+        output.status.success(),
+        "rendered invoice JavaScript is invalid: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn private_presentation_is_wallet_only_and_cannot_hide_payment_instructions() {
     let mut template = payment_template_fixture("unpaid", "unpaid", "none", true);
     let private_html = template.render().expect("private template renders");
