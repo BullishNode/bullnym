@@ -55,9 +55,8 @@ function bullnymServiceWorkerPrecache(): Plugin {
   }
 }
 
-// Two entry points, one workspace. The Rust server picks the shell to
-// serve based on donation_pages.kind and injects the config JSON in
-// place of the <!-- BULLNYM_CONFIG --> placeholder.
+// Three UI entry points, one workspace. The Rust server selects Payment Page,
+// POS, or invoice and injects only that surface's minimal boot config.
 //
 // base is /pwa-assets/ so hashed assets resolve regardless of which
 // /<nym> path the shell is served under. The Rust router mounts
@@ -80,6 +79,7 @@ export default defineConfig({
       input: {
         donation: resolve(__dirname, 'apps/donation/index.html'),
         pos: resolve(__dirname, 'apps/pos/index.html'),
+        invoice: resolve(__dirname, 'apps/invoice/index.html'),
         invoiceQr: resolve(__dirname, 'lib/invoiceQr.ts'),
         privateInvoice: resolve(__dirname, 'lib/privateInvoice.ts'),
       },

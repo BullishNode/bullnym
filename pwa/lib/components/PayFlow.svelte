@@ -36,12 +36,14 @@
     onSuccessSecondary,
     onPaid,
     onExit,
+    autoExitExpired = true,
+    paymentContextKey = config.page_key,
   }: {
     id: string
     /** Single header row for every screen state (loading/error/live/terminal) — each caller supplies its own so it's never duplicated (the old bug: POS's PayScreen wrapped PaymentScreen, which used to render its own header too). */
     header: Snippet<[boolean]>
-    successActionLabel: string
-    onSuccessAction: () => void
+    successActionLabel?: string
+    onSuccessAction?: () => void
     successSecondaryLabel?: string
     onSuccessSecondary?: () => void
     /**
@@ -54,6 +56,12 @@
     onPaid?: (status: InvoiceStatus, ctx: CachedInvoice) => void
     /** Navigate back to the entry screen ('/'). Called automatically ~1.8s after an 'expired' terminal state (matching the pre-rewrite POS grace period), and by every other terminal panel's action button. */
     onExit: () => void
+    /** POS/Donation return to their entry screen after expiry; standalone
+     * invoices remain on their terminal state. */
+    autoExitExpired?: boolean
+    /** Namespaces the remembered payer rail. Standalone invoice pages use the
+     * invoice id instead of sharing one empty fallback namespace. */
+    paymentContextKey?: string
   } = $props()
 
   let loadState = $state<'loading' | 'ready' | 'error'>('loading')
@@ -189,7 +197,7 @@
   // UX (apps/pos/screens/PayScreen.svelte's old onExpired). Every other
   // terminal panel instead waits for the user to tap its action button.
   $effect(() => {
-    if (terminal?.kind !== 'expired') return
+    if (!autoExitExpired || terminal?.kind !== 'expired') return
     const t = setTimeout(() => onExit(), 1800)
     return () => clearTimeout(t)
   })
@@ -289,7 +297,7 @@
         <PaymentScreen
           bind:this={paymentScreen}
           invoice={loaded.invoice}
-          nym={config.page_key}
+          nym={paymentContextKey}
           {amountLabel}
           onTerminal={handleTerminal}
           onCancelableChange={(value) => (canCancel = value)}

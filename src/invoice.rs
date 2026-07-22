@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use askama::Template;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -767,8 +766,15 @@ fn parse_invoice_id(s: &str) -> Result<Uuid, AppError> {
 /// indexing + caching posture beyond `donation_render`'s baseline so the
 /// invoice page (which is reachable at a guessable URL) cannot be
 /// indexed by crawlers and cannot be served from intermediate caches.
-fn html_response(html: String) -> Response {
-    let mut resp = (StatusCode::OK, html).into_response();
+const INVOICE_CSP: &str = "default-src 'self'; \
+             img-src 'self' data:; \
+             script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; \
+             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com; \
+             frame-ancestors 'none'; \
+             base-uri 'none'";
+
+fn apply_invoice_html_headers(resp: &mut Response) {
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -788,9 +794,28 @@ fn html_response(html: String) -> Response {
         HeaderValue::from_static("private, no-store"),
     );
     h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(INVOICE_CSP),
+    );
+    h.insert(
         HeaderName::from_static("x-robots-tag"),
         HeaderValue::from_static("noindex, nofollow"),
     );
+}
+
+fn html_response(html: String) -> Response {
+    let mut resp = (StatusCode::OK, html).into_response();
+    apply_invoice_html_headers(&mut resp);
+    resp
+}
+
+fn invoice_pwa_unavailable_response() -> Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Invoice temporarily unavailable",
+    )
+        .into_response();
+    apply_invoice_html_headers(&mut resp);
     resp
 }
 
@@ -1259,75 +1284,22 @@ fn parse_create_request(
 // GET /<nym>/i/<id> — render the linked payment view
 // =====================================================================
 
-#[derive(Template)]
-#[template(path = "invoice_payment.html")]
-struct InvoicePaymentTpl<'a> {
-    /// Nym for the linked render path; empty string for unlinked. Templates
-    /// gate URL construction on `is_unlinked` rather than this field.
-    nym: &'a str,
-    /// True when nym_owner is None — page is reached via /invoice/<id>
-    /// rather than /<nym>/i/<id>. Drives header copy and URL templating.
-    is_unlinked: bool,
-    /// True when the invoice is rendered under a nym-free alias path
-    /// (`/a/<slug>/i/<id>`). The invoice is still nym-linked internally, but
-    /// the served page must not reveal the nym, so the header renders the same
-    /// generic branch as `is_unlinked`. Distinct concept from `is_unlinked`
-    /// (which means "no owner at all").
-    hide_owner: bool,
-    /// True only for wallet-origin native merchant invoices. Anonymous
-    /// checkout pages never attempt private-presentation decryption.
+#[derive(Serialize)]
+struct InvoicePwaConfig {
+    invoice_id: Uuid,
     private_presentation: bool,
-    invoice_id: String,
-    domain: &'a str,
-    status: &'a str,
-    /// Server-computed money presentation. Empty means the projection is
-    /// unknown (for example, an unresolved row from the migration rollout).
-    presentation_status: &'a str,
-    presentation_known: bool,
-    settlement_status: &'a str,
-    rails_payable: bool,
-    /// True when every payer destination must be obtained from the explicit
-    /// selected-rail POST boundary. This is a public checkout behavior flag;
-    /// it contains no settlement percentage, currency, credential, or order
-    /// identity.
-    payer_demand_required: bool,
-    amount_sat: i64,
-    remaining_amount_sat: i64,
-    fiat_display: Option<String>,
-    accept_btc: bool,
-    accept_ln: bool,
-    accept_liquid: bool,
-    bitcoin_chain_address: Option<&'a str>,
-    bitcoin_chain_amount_sat: Option<i64>,
-    lightning_pr_js: String,
-    lightning_amount_sat: Option<i64>,
-    liquid_amount_sat: Option<i64>,
-    bitcoin_address_js: String,
-    bitcoin_chain_address_js: String,
-    bitcoin_chain_bip21_js: String,
-    liquid_address_js: String,
-    liquid_btc_asset_id: &'a str,
 }
 
-fn format_fiat_major(minor: i32, currency: &str) -> String {
-    let p = pricer::currency_precision(currency);
-    if p == 0 {
-        format!("{minor} {currency}")
-    } else {
-        let divisor = 10i64.pow(p as u32);
-        let major = minor as i64 / divisor;
-        let frac = (minor as i64 % divisor).unsigned_abs();
-        format!("{major}.{frac:0>width$} {currency}", width = p as usize)
+fn inject_invoice_pwa_shell(shell: &str, config: &InvoicePwaConfig) -> Option<String> {
+    const MARKER: &str = "<!-- BULLNYM_INVOICE_CONFIG -->";
+    if shell.matches(MARKER).count() != 1 {
+        return None;
     }
-}
-
-fn js_string_literal(value: Option<&str>) -> Result<String, AppError> {
-    let json = serde_json::to_string(value.unwrap_or(""))
-        .map_err(|e| AppError::DbError(format!("js string encode: {e}")))?;
-    Ok(json
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026"))
+    let json = serde_json::to_string(config).ok()?.replace('<', "\\u003c");
+    Some(shell.replace(
+        MARKER,
+        &format!(r#"<script id="bullnym-invoice-config" type="application/json">{json}</script>"#),
+    ))
 }
 
 fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
@@ -1480,9 +1452,7 @@ pub async fn render_payment(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
-    Ok(html_response(
-        render_invoice_template(&state, &inv, false).await?,
-    ))
+    Ok(render_invoice_pwa(&state, &inv).await)
 }
 
 // =====================================================================
@@ -1501,9 +1471,7 @@ pub async fn render_unlinked_payment(
     // The unlinked render path serves both nym-linked AND nym-NULL invoices
     // (the wallet may always share via /invoice/<id> regardless of linkage).
     // Distinct handlers for the two paths only affect URL parsing.
-    Ok(html_response(
-        render_invoice_template(&state, &inv, false).await?,
-    ))
+    Ok(render_invoice_pwa(&state, &inv).await)
 }
 
 // =====================================================================
@@ -1533,127 +1501,25 @@ pub async fn render_payment_alias(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
-    Ok(html_response(
-        render_invoice_template(&state, &inv, true).await?,
-    ))
+    Ok(render_invoice_pwa(&state, &inv).await)
 }
 
-async fn render_invoice_template(
-    state: &AppState,
-    inv: &db::Invoice,
-    hide_owner: bool,
-) -> Result<String, AppError> {
-    let mut snapshot = begin_invoice_read_snapshot(&state.db).await?;
-    let inv = db::get_invoice_by_id(&mut *snapshot, inv.id)
-        .await?
-        .ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string()))?;
-    let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
-        (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
-        _ => None,
+async fn render_invoice_pwa(state: &AppState, inv: &db::Invoice) -> Response {
+    let Some(shell) = state.pwa_shells.invoice_shell().await else {
+        return invoice_pwa_unavailable_response();
     };
-    let received_sat = db::invoice_presentation_received_sat(&mut *snapshot, inv.id)
-        .await?
-        .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
-    let remaining_sat = remaining_amount_from_received(&inv, received_sat);
-    let fiat_settlement_policy = db::invoice_fiat_settlement_policy(&mut *snapshot, inv.id).await?;
-    let payer_demand_required =
-        inv.pricing_mode == "fiat_fixed" || fiat_settlement_policy.is_some();
-    let payer_demand_availability =
-        payer_quote_rail_availability(&inv, fiat_settlement_policy.as_ref());
-    let legacy_instructions_payable =
-        sat_fixed_payment_instructions_are_payable(&inv) && !payer_demand_required;
-    let rails_payable = if let Some(availability) = payer_demand_availability.as_ref() {
-        invoice_payment_rails_are_payable(&inv)
-            && (availability.bitcoin || availability.lightning || availability.liquid)
-    } else {
-        legacy_instructions_payable
-    };
-    let lightning_offer = if legacy_instructions_payable {
-        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?
-    } else {
-        None
-    };
-    let bitcoin_chain_offer = if legacy_instructions_payable {
-        db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
-            .await?
-    } else {
-        None
-    };
-    snapshot.commit().await?;
-    // Suppress the nym in the served page when rendering under an alias path,
-    // even though the invoice is nym-linked internally.
-    let nym = if hide_owner {
-        ""
-    } else {
-        inv.nym_owner.as_deref().unwrap_or("")
-    };
-    let is_unlinked = inv.nym_owner.is_none();
-    let bitcoin_chain_offer = bitcoin_chain_offer
-        .as_ref()
-        .and_then(payer_exposable_bitcoin_chain_offer);
-    let bitcoin_chain_address = bitcoin_chain_offer.map(|offer| offer.lockup_address);
-    let bitcoin_chain_bip21 = bitcoin_chain_offer
-        .and_then(|offer| public_bitcoin_chain_bip21(offer.lockup_address, offer.payer_amount_sat));
-    let bitcoin_chain_amount_sat = bitcoin_chain_offer.map(|offer| offer.payer_amount_sat);
-    let direct_addresses = if payer_demand_required {
-        PublicDirectPaymentAddresses {
-            bitcoin: None,
-            liquid: None,
-        }
-    } else {
-        public_direct_payment_addresses(&inv)
-    };
-    let liquid_amount_sat = direct_addresses
-        .liquid
-        .filter(|_| legacy_instructions_payable && remaining_sat > 0)
-        .map(|_| remaining_sat);
-    let (accept_btc, accept_ln, accept_liquid) = payer_demand_availability
-        .as_ref()
-        .map(|availability| {
-            (
-                availability.bitcoin,
-                availability.lightning,
-                availability.liquid,
-            )
-        })
-        .unwrap_or((inv.accept_btc, inv.accept_ln, inv.accept_liquid));
-    let tpl = InvoicePaymentTpl {
-        nym,
-        is_unlinked,
-        hide_owner,
+    let config = InvoicePwaConfig {
+        invoice_id: inv.id,
         private_presentation: inv.origin == "wallet",
-        invoice_id: inv.id.to_string(),
-        domain: &state.config.domain,
-        status: &inv.status,
-        presentation_status: inv.presentation_status.as_deref().unwrap_or(""),
-        presentation_known: matches!(
-            inv.presentation_status.as_deref(),
-            Some("unpaid" | "partial" | "payment_received" | "overpaid")
-        ),
-        settlement_status: &inv.settlement_status,
-        rails_payable,
-        payer_demand_required,
-        amount_sat: inv.amount_sat,
-        remaining_amount_sat: remaining_sat,
-        fiat_display,
-        accept_btc,
-        accept_ln,
-        accept_liquid,
-        bitcoin_chain_address,
-        bitcoin_chain_amount_sat,
-        lightning_pr_js: js_string_literal(
-            lightning_offer.as_ref().map(|offer| offer.pr.as_str()),
-        )?,
-        lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
-        liquid_amount_sat,
-        bitcoin_address_js: js_string_literal(direct_addresses.bitcoin)?,
-        bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
-        bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21.as_deref())?,
-        liquid_address_js: js_string_literal(direct_addresses.liquid)?,
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
     };
-    tpl.render()
-        .map_err(|e| AppError::DbError(format!("template render: {e}")))
+    let Some(html) = inject_invoice_pwa_shell(&shell, &config) else {
+        tracing::error!(
+            event = "invoice_pwa_shell_injection_error",
+            "invoice PWA shell does not contain exactly one config marker"
+        );
+        return invoice_pwa_unavailable_response();
+    };
+    html_response(html)
 }
 
 // =====================================================================

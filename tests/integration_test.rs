@@ -21714,17 +21714,16 @@ async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private()
         format!("/lnonlyprivate/i/{}", invoice.id),
         format!("/invoice/{}", invoice.id),
     ] {
-        let (status, html) = get_text_path(&app, &path).await;
+        let (status, headers, html) = get_text_with_headers(&app, &path).await;
         assert_eq!(status, StatusCode::OK, "path: {path}");
+        assert!(!headers.contains_key("x-bullnym-pwa-shell"), "path: {path}");
         assert!(
             !html.contains("lq1internalclaimdestination"),
             "path: {path}"
         );
-        assert!(
-            html.contains("const INITIAL_LIQUID_ADDRESS = \"\";"),
-            "path: {path}"
-        );
-        assert!(!html.contains("id=\"rail-liquid\""), "path: {path}");
+        assert!(html.contains(&format!(r#""invoice_id":"{}""#, invoice.id)));
+        assert!(html.contains(r#""private_presentation":true"#));
+        assert!(!html.contains("lnonlyprivate"), "path: {path}");
     }
 
     let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");

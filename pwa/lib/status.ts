@@ -69,7 +69,7 @@ export function statusBorderTone(status: string): string {
 // ---------------------------------------------------------------------------
 // PayView — the live payment-screen view model (CONTRACT 1).
 //
-// Reference: templates/invoice_payment.html:526-605's pollStatus(), which
+// Reference: the former standalone invoice poller, now shared here, which
 // this is a direct port of the *branching logic* for (the old page's
 // initial-server-render markup is NOT the source of truth here — see the
 // brief's ground rules). derivePayView is pure and exhaustively unit-tested
@@ -365,7 +365,7 @@ export const LN_REFRESH_COOLDOWN_MS = 15_000
 
 /**
  * The Lightning offer to hold after a `/status` poll, mirroring
- * invoice_payment.html:562-576. Adopt a fresh server-issued offer; CLEAR a
+ * the former standalone invoice flow. Adopt a fresh server-issued offer; CLEAR a
  * stale one to null when the server reports no offer on a still-payable
  * invoice (waiting/partially_paid) so shouldRefreshLightning re-requests it.
  * Without the clear, a partial payment that invalidates the full-amount

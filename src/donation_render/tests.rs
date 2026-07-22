@@ -344,9 +344,15 @@ async fn pwa_shell_reads_current_file_from_disk() {
     let root =
         std::env::temp_dir().join(format!("bullnym-pwa-shell-{unique}-{}", std::process::id()));
     let donation_dir = root.join("apps").join("donation");
+    let pos_dir = root.join("apps").join("pos");
+    let invoice_dir = root.join("apps").join("invoice");
     std::fs::create_dir_all(&donation_dir).expect("create donation shell dir");
+    std::fs::create_dir_all(&pos_dir).expect("create pos shell dir");
+    std::fs::create_dir_all(&invoice_dir).expect("create invoice shell dir");
     let donation_path = donation_dir.join("index.html");
     std::fs::write(&donation_path, "first shell").expect("write first shell");
+    std::fs::write(pos_dir.join("index.html"), "pos shell").expect("write pos shell");
+    std::fs::write(invoice_dir.join("index.html"), "invoice shell").expect("write invoice shell");
 
     let shells = PwaShells::load(&root);
 
@@ -360,6 +366,10 @@ async fn pwa_shell_reads_current_file_from_disk() {
     assert_eq!(
         shells.shell_for(false).await.as_deref(),
         Some("rebuilt shell")
+    );
+    assert_eq!(
+        shells.invoice_shell().await.as_deref(),
+        Some("invoice shell")
     );
 
     std::fs::remove_dir_all(root).expect("remove temp shell dir");

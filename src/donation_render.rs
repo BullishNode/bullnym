@@ -53,6 +53,7 @@ struct DonationArchivedTpl<'a> {
 pub struct PwaShells {
     pub donation: Option<PathBuf>,
     pub pos: Option<PathBuf>,
+    pub invoice: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -109,8 +110,10 @@ impl PwaShells {
         let mut missing = Vec::new();
         let donation = shell_path(dist_dir, "donation");
         let pos = shell_path(dist_dir, "pos");
+        let invoice = shell_path(dist_dir, "invoice");
         check_shell_readable(&donation, "donation", &mut missing);
         check_shell_readable(&pos, "pos", &mut missing);
+        check_shell_readable(&invoice, "invoice", &mut missing);
         if !missing.is_empty() {
             tracing::warn!(
                 event = "pwa_shells_missing",
@@ -121,28 +124,36 @@ impl PwaShells {
         Self {
             donation: Some(donation),
             pos: Some(pos),
+            invoice: Some(invoice),
         }
     }
 
     async fn shell_for(&self, is_pos: bool) -> Option<String> {
+        let shell_kind = if is_pos { "pos" } else { "donation" };
         let path = if is_pos {
             self.pos.as_ref()
         } else {
             self.donation.as_ref()
         }?;
+        read_shell(path, shell_kind).await
+    }
 
-        let shell_kind = if is_pos { "pos" } else { "donation" };
-        match tokio::fs::read_to_string(path).await {
-            Ok(shell) => Some(shell),
-            Err(e) => {
-                tracing::warn!(
-                    event = "pwa_shell_read_error",
-                    shell_kind,
-                    error_kind = ?e.kind(),
-                    "PWA shell is unavailable"
-                );
-                None
-            }
+    pub(crate) async fn invoice_shell(&self) -> Option<String> {
+        read_shell(self.invoice.as_ref()?, "invoice").await
+    }
+}
+
+async fn read_shell(path: &Path, shell_kind: &str) -> Option<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(shell) => Some(shell),
+        Err(e) => {
+            tracing::warn!(
+                event = "pwa_shell_read_error",
+                shell_kind,
+                error_kind = ?e.kind(),
+                "PWA shell is unavailable"
+            );
+            None
         }
     }
 }

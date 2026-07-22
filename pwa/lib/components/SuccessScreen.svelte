@@ -16,8 +16,8 @@
   }: {
     amountLabel: string
     rail: string | null
-    actionLabel: string
-    onaction: () => void
+    actionLabel?: string
+    onaction?: () => void
     secondaryLabel?: string
     onsecondary?: () => void
   } = $props()
@@ -79,5 +79,7 @@
   {#if secondaryLabel && onsecondary}
     <Button variant="secondary" onclick={onsecondary}>{secondaryLabel}</Button>
   {/if}
-  <Button onclick={onaction}>{actionLabel}</Button>
+  {#if actionLabel && onaction}
+    <Button onclick={onaction}>{actionLabel}</Button>
+  {/if}
 </div>
