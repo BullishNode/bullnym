@@ -93,10 +93,8 @@ export function formatCryptoAmount(amount: string, unit: 'sat' | 'btc'): string 
 
 /**
  * Maps a donation entry amount (in the unit's own major denomination) to
- * sats for the create-invoice request body. Mirrors
- * templates/store_amount.html:210-215's unit branch exactly: sat rounds to
- * the nearest whole sat (no fractional sat), btc multiplies by 1e8 then
- * rounds.
+ * sats for the create-invoice request body: sat rounds to the nearest whole
+ * sat (no fractional sat), while btc multiplies by 1e8 then rounds.
  */
 export function cryptoAmountSat(value: number, unit: 'sat' | 'btc'): number {
   return unit === 'sat' ? Math.round(value) : Math.round(value * 1e8)

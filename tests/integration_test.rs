@@ -389,7 +389,9 @@ fn test_state_with_provider_limits(
         bitcoin_lockup_witness_adapter: None,
         fee_runtime,
         pricer,
-        pwa_shells: Arc::new(PwaShells::default()),
+        pwa_shells: Arc::new(PwaShells::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pwa/dist"),
+        )),
         recovery_manifest_runtime_v1: None,
         swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
     }
@@ -1544,6 +1546,19 @@ async fn get_text_path(app: &Router, uri: &str) -> (StatusCode, String) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
     (status, body)
+}
+
+async fn get_text_with_headers(app: &Router, uri: &str) -> (StatusCode, HeaderMap, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    (status, headers, body)
 }
 
 async fn get_path_from(app: &Router, uri: &str, peer: SocketAddr) -> (StatusCode, Value) {
@@ -6830,6 +6845,65 @@ async fn donation_page_upsert_round_trips_independent_kinds() {
 }
 
 #[tokio::test]
+async fn live_payment_page_and_pos_fail_closed_when_pwa_shells_are_unavailable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "pwaunavailable").await;
+
+    for kind in [
+        pay_service::db::KIND_PAYMENT_PAGE,
+        pay_service::db::KIND_POS,
+    ] {
+        pay_service::db::upsert_donation_page(
+            &pool,
+            &pay_service::db::UpsertDonationPage {
+                nym: "pwaunavailable",
+                kind,
+                ct_descriptor: TEST_DESCRIPTOR,
+                header: "Private Merchant Header",
+                description: "Private merchant description",
+                display_currency: "USD",
+                website: None,
+                twitter: None,
+                instagram: None,
+                enabled: true,
+                generated_og_template_version: None,
+                alias: Some("pwa-down-alias"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut state = test_state(pool.clone());
+    state.pwa_shells = Arc::new(PwaShells::default());
+    let app = Router::new()
+        .route("/:nym/pos", get(donation_render::render_pos))
+        .route("/a/:slug", get(donation_render::render_alias))
+        .route("/a/:slug/pos", get(donation_render::render_alias_pos))
+        .fallback(donation_render::render_or_404)
+        .with_state(state);
+
+    for path in [
+        "/pwaunavailable",
+        "/pwaunavailable/pos",
+        "/a/pwa-down-alias",
+        "/a/pwa-down-alias/pos",
+    ] {
+        let (status, headers, body) = get_text_with_headers(&app, path).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store", "{path}");
+        assert!(!headers.contains_key("x-bullnym-pwa-shell"), "{path}");
+        assert_eq!(body, "Payment page temporarily unavailable", "{path}");
+        assert!(!body.contains("pwaunavailable"), "{path}");
+        assert!(!body.contains("pwa-down-alias"), "{path}");
+        assert!(!body.contains("Private Merchant"), "{path}");
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -7773,13 +7847,15 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         0
     );
 
-    let (status, page_html) = get_text_path(&app, "/a/shared-shop").await;
+    let (status, page_headers, page_html) = get_text_with_headers(&app, "/a/shared-shop").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page_html.contains(r#"const BASE = "/a/shared-shop""#));
+    assert_eq!(page_headers.get("x-bullnym-pwa-shell").unwrap(), "donation");
+    assert!(page_html.contains(r#""invoice_base":"/a/shared-shop""#));
     assert!(!page_html.contains(nym), "alias Page leaked its owning nym");
-    let (status, pos_html) = get_text_path(&app, "/a/shared-shop/pos").await;
+    let (status, pos_headers, pos_html) = get_text_with_headers(&app, "/a/shared-shop/pos").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(pos_html.contains(r#"const BASE = "/a/shared-shop/pos""#));
+    assert_eq!(pos_headers.get("x-bullnym-pwa-shell").unwrap(), "pos");
+    assert!(pos_html.contains(r#""invoice_base":"/a/shared-shop/pos""#));
     assert!(!pos_html.contains(nym), "alias POS leaked its owning nym");
 
     let (status, _, page_manifest) =

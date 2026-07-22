@@ -1,7 +1,7 @@
 // Donation sat/BTC entry (review item 7): formatCryptoAmount is the
 // dedicated path so 'sat'/'btc' never hit Intl.NumberFormat({style:
-// 'currency'}), which throws on non-ISO codes; cryptoAmountSat mirrors
-// templates/store_amount.html:210-215's unit -> amount_sat mapping exactly.
+// 'currency'}), which throws on non-ISO codes; cryptoAmountSat owns the
+// create-invoice unit -> amount_sat mapping.
 import { describe, expect, it } from 'vitest'
 import { formatCryptoAmount, cryptoAmountSat } from './money'
 

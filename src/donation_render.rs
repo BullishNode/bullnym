@@ -5,11 +5,12 @@
 //! that don't match any explicit route fall through here and are
 //! interpreted as donation-page slugs.
 //!
-//! Three render branches:
+//! Public render branches:
 //! 1. Path sanity / reserved-slug fail → 404 (`donation_404.html`).
 //! 2. Row absent → 404.
 //! 3. `archived_at IS NOT NULL` → 200 + `donation_archived.html`.
-//! 4. Live → 200 + `store_amount.html` with embedded Pricer rate.
+//! 4. Live → the matching Payment Page or POS PWA shell.
+//! 5. Missing or invalid PWA shell → fixed, non-cacheable 503.
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
@@ -22,7 +23,6 @@ use std::path::{Path, PathBuf};
 use crate::db;
 use crate::ip_whitelist;
 use crate::og_image;
-use crate::pricer::CurrencyView;
 use crate::reserved_nyms;
 use crate::AppState;
 
@@ -33,30 +33,6 @@ use crate::AppState;
 enum PublicBase<'a> {
     Nym { nym: &'a str, base_path: &'a str },
     Alias { slug: &'a str, base_path: &'a str },
-}
-
-#[derive(Template)]
-#[template(path = "store_amount.html")]
-struct DonationPageTpl<'a> {
-    /// Public base path the page's client-side JS appends `/invoice` and
-    /// `/i/<id>` to. `/<nym>` (or `/<nym>/pos`) on nym pages, `/a/<slug>` on
-    /// alias pages — so the alias page never embeds the nym.
-    invoice_base: String,
-    header: &'a str,
-    description: &'a str,
-    social_meta: String,
-    display_currency: &'a str,
-    website: Option<&'a str>,
-    twitter: Option<&'a str>,
-    instagram: Option<&'a str>,
-    /// Minor units per BTC. 0 means rate unavailable; the JS gates the
-    /// Continue button accordingly.
-    minor_per_btc: i64,
-    last_known_rate: bool,
-    /// All currencies the server supports for fiat-denominated invoices.
-    /// Rendered as `<option>` entries on the unit dropdown so the sender
-    /// is not constrained to the merchant's display preference.
-    supported_currencies: Vec<CurrencyView>,
 }
 
 #[derive(Template)]
@@ -139,7 +115,7 @@ impl PwaShells {
             tracing::warn!(
                 event = "pwa_shells_missing",
                 missing = ?missing,
-                "PWA shell(s) missing at startup; falling back to Askama donation render for unreadable modes"
+                "PWA shell(s) unavailable at startup; affected public surfaces will return 503"
             );
         }
         Self {
@@ -155,14 +131,15 @@ impl PwaShells {
             self.donation.as_ref()
         }?;
 
+        let shell_kind = if is_pos { "pos" } else { "donation" };
         match tokio::fs::read_to_string(path).await {
             Ok(shell) => Some(shell),
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     event = "pwa_shell_read_error",
-                    path = %path.display(),
-                    error = %e,
-                    "PWA shell not readable; falling back to Askama donation render"
+                    shell_kind,
+                    error_kind = ?e.kind(),
+                    "PWA shell is unavailable"
                 );
                 None
             }
@@ -256,6 +233,18 @@ fn mark_pwa_shell_response(resp: &mut Response, is_pos: bool) {
     let value = if is_pos { "pos" } else { "donation" };
     resp.headers_mut()
         .insert(PWA_SHELL_HEADER, HeaderValue::from_static(value));
+}
+
+fn pwa_unavailable_response(is_pos: bool) -> Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Payment page temporarily unavailable",
+    )
+        .into_response();
+    apply_security_headers(&mut resp, is_pos);
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 fn render_404(state: &AppState, nym: &str) -> Response {
@@ -433,8 +422,20 @@ fn inject_pwa_shell(
     public_url: &str,
     image_url: &str,
     manifest_href: &str,
-) -> Result<String, serde_json::Error> {
-    let json = serde_json::to_string(config)?;
+) -> Option<String> {
+    const REQUIRED_MARKERS: [&str; 3] = [
+        "<!-- BULLNYM_CONFIG -->",
+        "<!-- BULLNYM_MANIFEST -->",
+        "<!-- BULLNYM_OG -->",
+    ];
+    if REQUIRED_MARKERS
+        .iter()
+        .any(|marker| shell.matches(marker).count() != 1)
+    {
+        return None;
+    }
+
+    let json = serde_json::to_string(config).ok()?;
     let json = escape_json_for_script(&json);
     let config_script =
         format!(r#"<script id="bullnym-config" type="application/json">{json}</script>"#);
@@ -448,13 +449,15 @@ fn inject_pwa_shell(
     let shell = shell
         .replace("<title>bullnym</title>", "")
         .replace("<title>bullnym POS</title>", "");
-    Ok(shell
-        .replace("<!-- BULLNYM_CONFIG -->", &config_script)
-        .replace("<!-- BULLNYM_MANIFEST -->", &manifest_link)
-        .replace(
-            "<!-- BULLNYM_OG -->",
-            &social_meta_tags(config.header, config.description, public_url, image_url),
-        ))
+    Some(
+        shell
+            .replace("<!-- BULLNYM_CONFIG -->", &config_script)
+            .replace("<!-- BULLNYM_MANIFEST -->", &manifest_link)
+            .replace(
+                "<!-- BULLNYM_OG -->",
+                &social_meta_tags(config.header, config.description, public_url, image_url),
+            ),
+    )
 }
 
 /// Which per-source bucket a public donation-surface GET bills against.
@@ -724,8 +727,6 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
     } else {
         og_image::fallback_url(domain, false)
     };
-    let social_meta = social_meta_tags(&page.header, &page.description, &public_url, &og_url);
-
     // Public Page HTML must never wait on a live pricing HTTP request. Seed
     // the PWA from memory when available; its rate store immediately refreshes
     // through `/api/v1/rate` after the browser loads.
@@ -734,8 +735,6 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
         Some(r) => (r.minor_per_btc, r.last_known_rate),
         None => (0, false),
     };
-
-    let supported_currencies = state.pricer.supported_currencies().to_vec();
 
     if let Some(shell) = state.pwa_shells.shell_for(is_pos).await {
         let mode = if is_pos { "pos" } else { "donation" };
@@ -755,33 +754,22 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
             liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
             domain,
         };
-        let body = inject_pwa_shell(&shell, &config, &public_url, &og_url, &manifest_href)
-            .unwrap_or_else(|e| format!("template render failed: {e}"));
+        let Some(body) = inject_pwa_shell(&shell, &config, &public_url, &og_url, &manifest_href)
+        else {
+            tracing::warn!(
+                event = "pwa_shell_injection_error",
+                shell_kind = mode,
+                "PWA shell is missing its required injection markers"
+            );
+            return pwa_unavailable_response(is_pos);
+        };
         let mut resp = (StatusCode::OK, body).into_response();
         apply_security_headers(&mut resp, is_pos);
         mark_pwa_shell_response(&mut resp, is_pos);
         return resp;
     }
 
-    let body = DonationPageTpl {
-        invoice_base: base_path,
-        header: &page.header,
-        description: &page.description,
-        social_meta,
-        display_currency: &page.display_currency,
-        website: page.website.as_deref(),
-        twitter: page.twitter.as_deref(),
-        instagram: page.instagram.as_deref(),
-        minor_per_btc,
-        last_known_rate,
-        supported_currencies,
-    }
-    .render()
-    .unwrap_or_else(|e| format!("template render failed: {e}"));
-
-    let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp, is_pos);
-    resp
+    pwa_unavailable_response(is_pos)
 }
 
 /// `Router::fallback` handler. Matches any path that no explicit route
