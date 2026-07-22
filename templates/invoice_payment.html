@@ -508,19 +508,20 @@
             if (
                 TERMINAL_SETTLEMENT_INCIDENTS.has(initialSettlementStatus) ||
                 initialSettlementStatus === 'claim_stuck' ||
-                (KNOWN_PRESENTATION_STATUSES.has(initialPresentationStatus) &&
+                (
+                    KNOWN_PRESENTATION_STATUSES.has(initialPresentationStatus) &&
                     (
                         initialSettlementStatus === 'settled' && (
                             initialPresentationStatus !== 'partial' ||
                             initialStatus === 'underpaid'
                         )
-                    ) ||
-                    (
-                        initialPresentationStatus !== 'partial' &&
-                        TERMINAL_STATUSES.has(initialStatus) &&
-                        initialSettlementStatus === 'none'
+                        || (
+                            initialPresentationStatus !== 'partial' &&
+                            TERMINAL_STATUSES.has(initialStatus) &&
+                            initialSettlementStatus === 'none'
+                        )
                     )
-                ))
+                )
             ) {
                 // Already terminal — no polling needed.
                 return;
