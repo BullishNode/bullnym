@@ -995,15 +995,21 @@ pub async fn record_bull_bitcoin_observation(
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET order_status = $2, payin_status = $3, payout_status = $4, \
-                actual_received_sat = $5, credited_fiat_minor = $6, \
+                actual_received_sat = $5, \
+                credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 provider_final = $7, \
-                settlement_status = CASE WHEN $7 THEN 'settled' ELSE 'pending' END, \
+                settlement_status = CASE \
+                    WHEN $7 THEN 'settled' \
+                    WHEN $8 THEN 'unavailable' \
+                    ELSE 'pending' END, \
                 terminal_at = CASE WHEN $7 THEN now() ELSE NULL END, \
-                payer_instruction = CASE WHEN $7 THEN NULL ELSE payer_instruction END, \
-                instruction_kind = CASE WHEN $7 THEN NULL ELSE instruction_kind END, \
+                payer_instruction = CASE \
+                    WHEN $7 OR $8 THEN NULL ELSE payer_instruction END, \
+                instruction_kind = CASE \
+                    WHEN $7 OR $8 THEN NULL ELSE instruction_kind END, \
                 last_checked_at = now(), reconcile_attempts = 0, \
-                next_attempt_at = CASE WHEN $7 THEN NULL \
-                    ELSE now() + make_interval(secs => $8::DOUBLE PRECISION) END, \
+                next_attempt_at = CASE WHEN $7 OR $8 THEN NULL \
+                    ELSE now() + make_interval(secs => $9::DOUBLE PRECISION) END, \
                 updated_at = now() \
           WHERE id = $1 AND provider_state = 'bound' \
             AND funding_route = 'bull_bitcoin' \
@@ -1020,6 +1026,7 @@ pub async fn record_bull_bitcoin_observation(
             .map(|amount| amount.as_minor()),
     )
     .bind(observation.provider_final)
+    .bind(observation.provider_terminal)
     .bind(next_poll_secs)
     .execute(pool)
     .await?;

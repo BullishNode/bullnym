@@ -285,7 +285,9 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         None if payment_observed => Some(parse_bitcoin_field(order, "payinAmount")?.as_sat()),
         None => None,
     };
-    let credited_fiat_minor = if payout_status == "Completed" {
+    let provider_terminal =
+        is_terminal_provider_outcome(&order_status, &payin_status, &payout_status);
+    let credited_fiat_minor = if payout_status == "Completed" && !provider_terminal {
         Some(parse_fiat_field(order, "payoutAmount")?)
     } else {
         None
@@ -304,7 +306,20 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         actual_received_sat,
         credited_fiat_minor,
         provider_final,
+        provider_terminal,
     })
+}
+
+fn is_terminal_provider_outcome(
+    order_status: &str,
+    payin_status: &str,
+    payout_status: &str,
+) -> bool {
+    matches!(
+        order_status,
+        "Canceled" | "Expired" | "Payment deadline expired" | "Rejected"
+    ) || payin_status == "Rejected"
+        || matches!(payout_status, "Canceled" | "Failed")
 }
 
 fn parse_instruction(
@@ -751,6 +766,79 @@ mod tests {
         assert_eq!(observation.actual_received_sat, Some(100_001));
         assert_eq!(observation.credited_fiat_minor.unwrap().as_minor(), 6_123);
         assert!(observation.provider_final);
+        assert!(!observation.provider_terminal);
+    }
+
+    #[test]
+    fn observation_classifies_documented_terminal_provider_statuses() {
+        let cases = [
+            ("Canceled", "Not started", "Not started"),
+            ("Expired", "Not started", "Not started"),
+            ("Payment deadline expired", "Not started", "Not started"),
+            ("Rejected", "Not started", "Not started"),
+            ("In progress", "Rejected", "Not started"),
+            ("In progress", "Completed", "Canceled"),
+            ("In progress", "Completed", "Failed"),
+        ];
+
+        for (order_status, payin_status, payout_status) in cases {
+            let observation = parse_order_observation(&serde_json::json!({
+                "orderId": "11111111-1111-4111-8111-111111111111",
+                "payoutCurrency": "CAD",
+                "orderStatus": order_status,
+                "payinStatus": payin_status,
+                "payoutStatus": payout_status,
+                "payinAmount": 0.001,
+                "payinAmountChanged": {
+                    "requestedAmount": 0.001,
+                    "receivedAmount": 0.00100001
+                },
+                "payoutAmount": 61.23
+            }))
+            .unwrap();
+
+            assert!(
+                observation.provider_terminal,
+                "terminal outcome was not classified: {order_status}/{payin_status}/{payout_status}"
+            );
+            assert!(!observation.provider_final);
+            assert_eq!(observation.actual_received_sat, Some(100_001));
+            assert_eq!(observation.credited_fiat_minor, None);
+        }
+    }
+
+    #[test]
+    fn observation_keeps_documented_transitional_and_unknown_statuses_pending() {
+        let cases = [
+            ("In progress", "Not started", "Not started"),
+            ("Awaiting confirmation", "Awaiting payment", "Not started"),
+            ("In progress", "In progress", "In progress"),
+            ("In progress", "Under review", "Scheduled"),
+            ("In progress", "Awaiting confirmation", "Awaiting claim"),
+            ("Completed", "Completed", "In progress"),
+            ("Future order state", "Not started", "Not started"),
+            ("In progress", "Future payin state", "Not started"),
+            ("In progress", "Not started", "Future payout state"),
+        ];
+
+        for (order_status, payin_status, payout_status) in cases {
+            let observation = parse_order_observation(&serde_json::json!({
+                "orderId": "11111111-1111-4111-8111-111111111111",
+                "payoutCurrency": "CAD",
+                "orderStatus": order_status,
+                "payinStatus": payin_status,
+                "payoutStatus": payout_status,
+                "payinAmount": 0.001,
+                "payoutAmount": 61.23
+            }))
+            .unwrap();
+
+            assert!(
+                !observation.provider_terminal,
+                "nonterminal outcome was classified as terminal: {order_status}/{payin_status}/{payout_status}"
+            );
+            assert!(!observation.provider_final);
+        }
     }
 
     #[test]
