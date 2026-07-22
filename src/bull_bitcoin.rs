@@ -425,6 +425,7 @@ pub struct OrderObservation {
     pub actual_received_sat: Option<i64>,
     pub credited_fiat_minor: Option<FiatAmountMinor>,
     pub provider_final: bool,
+    pub provider_terminal: bool,
 }
 
 #[async_trait]
