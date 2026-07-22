@@ -2967,6 +2967,151 @@ async fn get_paid_history_never_labels_unprepared_mixed_payment_as_bitcoin() {
 }
 
 #[tokio::test]
+async fn get_paid_history_marks_terminal_mixed_fiat_outcome_as_problem() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_liquid_order(order_id, 40_000)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Rejected".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Failed".into(),
+        actual_received_sat: Some(40_100),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: false,
+        provider_terminal: true,
+    }))
+    .await;
+    let fixture =
+        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-terminal", 100_000, 40).await;
+    let settlement_id =
+        match pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+            &fixture.state,
+            fixture.reverse_swap_id,
+            mixed_claim_basis(100_000),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        {
+            MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. } => settlement_id,
+            _ => panic!("expected a funded mixed preparation"),
+        };
+
+    let claim_txid = "71".repeat(32);
+    let asset_hash = "72".repeat(32);
+    let value_hash = "73".repeat(32);
+    let nonce_hash = "74".repeat(32);
+    let surjection_hash = "75".repeat(32);
+    let rangeproof_hash = "76".repeat(32);
+    let merchant_script = "0014".to_owned() + &"77".repeat(20);
+    let provider_script = "0014".to_owned() + &"78".repeat(20);
+    let merchant = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "merchant",
+        txid: &claim_txid,
+        vout: 0,
+        script_pubkey_hex: &merchant_script,
+        authorized_amount_sat: 60_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let bull_bitcoin = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "bull_bitcoin",
+        txid: &claim_txid,
+        vout: 1,
+        script_pubkey_hex: &provider_script,
+        authorized_amount_sat: 40_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    pay_service::db::commit_mixed_bull_bitcoin_funding(
+        &mut tx,
+        settlement_id,
+        &merchant,
+        &bull_bitcoin,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE swap_records SET status = 'claimed', claim_txid = $2 WHERE id = $1")
+        .bind(fixture.reverse_swap_id)
+        .bind(&claim_txid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        invoice::record_reverse_claim_settlement(
+            &pool,
+            fixture.reverse_swap_id,
+            Some(fixture.invoice.id),
+            100_000,
+            &fixture.boltz_swap_id,
+            &claim_txid,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+    );
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&fixture.state)
+        .await
+        .unwrap();
+    let stored = sqlx::query_as::<_, (String, Option<i64>, bool)>(
+        "SELECT settlement_status, credited_fiat_minor, next_attempt_at IS NULL \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("unavailable".into(), None, true));
+
+    let app = test_app(fixture.state.clone());
+    let history_uri = get_paid_transaction_history_uri(
+        &fixture.keypair,
+        &fixture.owner_npub,
+        "",
+        10,
+        auth_timestamp(),
+    );
+    let (status, history) = get_path(&app, &history_uri).await;
+    assert_eq!(status, StatusCode::OK, "{history:?}");
+    let transactions = history["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(transactions[0]["settlement_state"], "problem");
+    assert_eq!(transactions[0]["settlement_kind"], "mixed");
+    assert_eq!(
+        transactions[0]["settlement_details"]["fiat"][0]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        transactions[0]["settlement_details"]["fiat"][0]["amount_minor"],
+        Value::Null
+    );
+    assert_eq!(
+        transactions[0]["settlement_details"]["bitcoin"][0]["status"],
+        "settled"
+    );
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&fixture.state)
+        .await
+        .unwrap();
+    assert_eq!(fake.read_call_count(), 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -2983,6 +3128,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         actual_received_sat: Some(40_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         provider_final: true,
+        provider_terminal: false,
     }))
     .await;
     let fixture = mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-exact", 100_000, 40).await;
@@ -3575,6 +3721,7 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         provider_final: true,
+        provider_terminal: false,
     }))
     .await;
     let (state, owner_npub, credential_id, _) =
@@ -3628,6 +3775,157 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
 }
 
 #[tokio::test]
+async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let (state, owner_npub, credential_id, keypair) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-terminal-outcomes").await;
+    let cases = [
+        ("Canceled", "Not started", "Not started"),
+        ("Expired", "Not started", "Not started"),
+        ("Payment deadline expired", "Not started", "Not started"),
+        ("Rejected", "Not started", "Not started"),
+        ("In progress", "Rejected", "Not started"),
+        ("In progress", "Completed", "Canceled"),
+        ("In progress", "Completed", "Failed"),
+    ];
+    let mut terminal_order_ids = Vec::new();
+
+    for (index, (order_status, payin_status, payout_status)) in cases.into_iter().enumerate() {
+        let order_id = Uuid::new_v4();
+        terminal_order_ids.push(order_id);
+        fake.push_create(Ok(scripted_created_order(order_id))).await;
+        fake.push_read(Ok(OrderObservation {
+            order_id,
+            currency: FiatCurrency::CAD,
+            order_status: order_status.into(),
+            payin_status: payin_status.into(),
+            payout_status: payout_status.into(),
+            actual_received_sat: Some(25_001),
+            // The persistence boundary must not trust an amount attached to a
+            // provider-declared terminal failure.
+            credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+            provider_final: false,
+            provider_terminal: true,
+        }))
+        .await;
+        let request_key = format!("payer-intent-terminal-{index}");
+        let request = fiat_only_test_request(&owner_npub, credential_id, &request_key);
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap();
+
+        pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+            .await
+            .unwrap();
+        let stored =
+            sqlx::query_as::<_, (String, Option<i64>, Option<i64>, bool, bool, bool, bool)>(
+                "SELECT settlement_status, actual_received_sat, credited_fiat_minor, \
+                    provider_final, payer_instruction IS NULL, \
+                    instruction_kind IS NULL, next_attempt_at IS NULL \
+               FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+            )
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "unavailable".into(),
+                Some(25_001),
+                None,
+                false,
+                true,
+                true,
+                true,
+            ),
+            "terminal outcome was not persisted safely: {order_status}/{payin_status}/{payout_status}"
+        );
+    }
+
+    let reads_after_terminal_observations = fake.read_call_count();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.read_call_count(),
+        reads_after_terminal_observations,
+        "terminal settlements must not be polled again"
+    );
+
+    let app = test_app(state.clone());
+    let timestamp = auth_timestamp();
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_LIST_SETTLEMENTS,
+        &owner_npub,
+        "",
+        &["1", "1", "10"],
+        timestamp,
+    );
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlements?version=1&npub={owner_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let settlements = body["settlements"].as_array().unwrap();
+    assert_eq!(settlements.len(), terminal_order_ids.len());
+    for settlement in settlements {
+        assert_eq!(settlement["kind"], "fiat");
+        assert_eq!(settlement["fiat"]["status"], "unavailable");
+        assert_eq!(settlement["fiat"]["amount_minor"], Value::Null);
+        let order_id = settlement["fiat"]["order_id"].as_str().unwrap();
+        assert!(terminal_order_ids
+            .iter()
+            .any(|expected| expected.to_string() == order_id));
+    }
+
+    let unknown_order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(unknown_order_id)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id: unknown_order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Future provider state".into(),
+        payin_status: "Not started".into(),
+        payout_status: "Not started".into(),
+        actual_received_sat: None,
+        credited_fiat_minor: None,
+        provider_final: false,
+        provider_terminal: false,
+    }))
+    .await;
+    let unknown_request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-unknown-provider-status",
+    );
+    pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &unknown_request)
+        .await
+        .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let unknown = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT settlement_status, payer_instruction IS NOT NULL, \
+                next_attempt_at IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(unknown_order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unknown, ("pending".into(), true, true));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_isolated() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -3643,6 +3941,7 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         provider_final: true,
+        provider_terminal: false,
     }))
     .await;
     let (state, owner_npub, credential_id, keypair) =
@@ -3897,6 +4196,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
             actual_received_sat: Some(27_500),
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
             provider_final: true,
+            provider_terminal: false,
         },
         1,
     )

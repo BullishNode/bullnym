@@ -157,6 +157,9 @@ pub async fn list_get_paid_transactions(
                     'lightning'::TEXT AS rail, \
                     CASE \
                         WHEN swap.status IN ('claim_stuck', 'lockup_refunded') THEN 'problem' \
+                        WHEN settlement.settlement_status IN ( \
+                            'unavailable', 'integrity_error' \
+                        ) THEN 'problem' \
                         WHEN settlement.id IS NOT NULL \
                          AND settlement.funding_route = 'bull_bitcoin' \
                          AND settlement.settlement_status <> 'settled' THEN 'pending' \
@@ -265,6 +268,9 @@ pub async fn list_get_paid_transactions(
                     event.received_at_unix_micros, event.rail, \
                     CASE \
                         WHEN event.settlement_state = 'problem' THEN 'problem' \
+                        WHEN settlement.settlement_status IN ( \
+                            'unavailable', 'integrity_error' \
+                        ) THEN 'problem' \
                         WHEN settlement.funding_route = 'bull_bitcoin' \
                          AND (event.settlement_state <> 'settled' \
                               OR settlement.settlement_status <> 'settled') THEN 'pending' \
