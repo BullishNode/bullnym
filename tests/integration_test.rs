@@ -16821,6 +16821,99 @@ async fn reverse_response_before_commit_restarts_into_hold_without_second_post()
 }
 
 #[tokio::test]
+async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let fake = ScriptedBullBitcoinApi::default();
+    let (_, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake, "mixed-sat-lightning-quote").await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        50,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let liquid_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let liquid_blinding_key_hex =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 30_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        2,
+    )
+    .await
+    .unwrap();
+
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "MIXED_SAT_LIGHTNING_QUOTE",
+        30_123,
+        first_key_index,
+    )
+    .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let app = test_app(test_state_with_config(pool.clone(), config));
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        post_json(&request_app, &path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["instruction"]["kind"], "lightning_current", "{body}");
+    assert_eq!(body["instruction"]["payer_amount_sat"], 30_123);
+
+    let captured: (i64, i16, String) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(policy.fiat_percentage), MIN(policy.fiat_currency) \
+           FROM swap_fiat_settlement_policies policy \
+           JOIN swap_records swap ON swap.id = policy.reverse_swap_id \
+          WHERE swap.invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(captured, (1, 50, "CAD".into()));
+
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn payer_demand_quote_rejects_sat_fixed_and_creates_no_fiat_version() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
