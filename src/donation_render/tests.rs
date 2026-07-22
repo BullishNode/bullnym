@@ -406,6 +406,28 @@ async fn pwa_shell_missing_file_falls_back_to_askama_path() {
 }
 
 #[test]
+fn pwa_shell_startup_check_reads_the_configured_file() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "bullnym-pwa-shell-startup-{unique}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create startup shell dir");
+    let shell_path = root.join("index.html");
+    std::fs::write(&shell_path, [0xff]).expect("write invalid UTF-8 shell");
+
+    let mut unavailable = Vec::new();
+    check_shell_readable(&shell_path, "donation", &mut unavailable);
+
+    assert_eq!(unavailable.len(), 1);
+    assert!(unavailable[0].contains("donation"));
+    std::fs::remove_dir_all(root).expect("remove startup shell dir");
+}
+
+#[test]
 fn pwa_shell_header_marks_donation_shells_only_when_requested() {
     let mut resp = StatusCode::OK.into_response();
 

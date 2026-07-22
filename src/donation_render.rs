@@ -133,8 +133,8 @@ impl PwaShells {
         let mut missing = Vec::new();
         let donation = shell_path(dist_dir, "donation");
         let pos = shell_path(dist_dir, "pos");
-        check_shell_exists(&donation, "donation", &mut missing);
-        check_shell_exists(&pos, "pos", &mut missing);
+        check_shell_readable(&donation, "donation", &mut missing);
+        check_shell_readable(&pos, "pos", &mut missing);
         if !missing.is_empty() {
             tracing::warn!(
                 event = "pwa_shells_missing",
@@ -174,8 +174,8 @@ fn shell_path(dist_dir: &Path, app: &str) -> PathBuf {
     dist_dir.join("apps").join(app).join("index.html")
 }
 
-fn check_shell_exists(path: &Path, app: &str, missing: &mut Vec<String>) {
-    if let Err(e) = std::fs::metadata(path) {
+fn check_shell_readable(path: &Path, app: &str, missing: &mut Vec<String>) {
+    if let Err(e) = std::fs::read_to_string(path) {
         missing.push(format!("{app}: {} ({e})", path.display()));
     }
 }
