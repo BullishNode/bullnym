@@ -2429,6 +2429,9 @@ async fn ensure_reusable_lightning_offer(
         connection.unlock().await?;
         return Ok(None);
     }
+    let capture_mixed_policy = db::invoice_fiat_settlement_policy(&mut *connection, current.id)
+        .await?
+        .is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage));
     let now = unix_now();
     if current.expires_at_unix <= now {
         connection.unlock().await?;
@@ -2502,7 +2505,7 @@ async fn ensure_reusable_lightning_offer(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    db::record_swap_in_tx_with_lineage(
+    let reverse_swap_id = db::record_swap_in_tx_with_lineage(
         &mut tx,
         &prepared.as_new_swap_record(
             lightning_swap_nym(&current),
@@ -2521,6 +2524,13 @@ async fn ensure_reusable_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
+    let captured =
+        db::capture_invoice_reverse_mixed_policy(&mut tx, reverse_swap_id, current.id).await?;
+    if captured != capture_mixed_policy {
+        return Err(AppError::DbError(
+            "reverse swap mixed-policy capture did not match its invoice snapshot".into(),
+        ));
+    }
 
     // Expiry/partial terminalization does not use this offer advisory lock.
     // Re-read after the remote call and after durable result persistence. A
