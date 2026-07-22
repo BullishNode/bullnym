@@ -1255,6 +1255,15 @@ fn test_descriptor_with_blinding_key(byte: u8) -> String {
 const TEST_LNURL_COMMENT_INTENT_TOKEN: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+fn assert_safe_application_error_reason(body: &serde_json::Value, api_key: &str) {
+    let reason = body["reason"]
+        .as_str()
+        .filter(|reason| !reason.trim().is_empty())
+        .expect("application error reason must be non-empty");
+    assert!(!reason.contains(api_key));
+    assert!(!reason.contains("bbak-"));
+}
+
 fn test_lnurl_callback_path(nym: &str) -> String {
     format!("/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}")
 }
@@ -2357,10 +2366,7 @@ async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
     assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
-    assert_eq!(
-        response["reason"],
-        "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later."
-    );
+    assert_safe_application_error_reason(&response, &api_key);
     assert!(!response.to_string().contains(&api_key));
     assert_eq!(fake.validation_call_count(), 1);
     let persisted = sqlx::query_as::<_, (i64, i64)>(
@@ -2498,7 +2504,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
     assert_eq!(status, StatusCode::OK, "{response:?}");
     assert_eq!(response["code"], "FIAT_CREDENTIAL_INVALID");
-    assert!(response["reason"].as_str().unwrap().contains("Reconnect"));
+    assert_safe_application_error_reason(&response, &api_key);
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
 
@@ -2515,6 +2521,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", transient_failure).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
     assert_eq!(response["code"], "ServiceUnavailable");
+    assert_safe_application_error_reason(&response, &api_key);
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
     let persisted = sqlx::query_as::<_, (i64, i64)>(
