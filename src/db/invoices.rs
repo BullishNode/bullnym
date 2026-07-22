@@ -91,6 +91,7 @@ const INVOICE_COLUMNS: &str =
      FLOOR(EXTRACT(EPOCH FROM paid_at))::BIGINT        AS paid_at_unix, \
      FLOOR(EXTRACT(EPOCH FROM cancelled_at))::BIGINT   AS cancelled_at_unix";
 
+#[derive(Clone, Copy)]
 pub struct NewInvoice<'a> {
     /// Merchant payment-page nym, or `None` for unlinked (wallet-only) invoices.
     pub nym_owner: Option<&'a str>,
@@ -121,15 +122,13 @@ pub struct NewInvoice<'a> {
     /// Wallet-supplied BTC mainnet address (NULL when accept_btc=FALSE).
     pub bitcoin_address: Option<&'a str>,
     /// Liquid mainnet CT address (NULL when both accept_ln=FALSE and
-    /// accept_liquid=FALSE). Two supply paths feed this field:
-    ///   - Wallet-origin (Get-paid): wallet supplies the address directly.
-    ///   - Checkout-origin: server eagerly allocates from the surface
-    ///     descriptor, or from the permanent-nym compatibility allocator,
-    ///     BEFORE this insert.
+    /// accept_liquid=FALSE). Checkout and descriptor-backed wallet Lightning
+    /// flows allocate this server-side. A wallet value is accepted only as a
+    /// compatibility input when no Bullnym descriptor destination is used.
     ///
-    /// In both cases `liquid_address_index` on the invoice row stays
-    /// NULL; the address is the chain watcher's lookup key, not the
-    /// descriptor index.
+    /// Descriptor-backed wallet invoices persist `liquid_address_index` so
+    /// claim preparation can prove that the destination came from Bullnym's
+    /// cursor. Compatibility addresses retain a NULL index.
     pub liquid_address: Option<&'a str>,
     pub liquid_blinding_key_hex: Option<&'a str>,
     /// Wall-clock seconds the invoice stays valid from `now()`.
@@ -151,6 +150,19 @@ pub enum WalletInvoiceCreateResolution {
     Reused(Invoice),
     Conflict,
 }
+
+/// Bullnym-owned Liquid destination material for a signed wallet invoice.
+/// The descriptor never leaves the transaction; callers receive only the
+/// derived address, its index, and the matching blinding key.
+pub(crate) struct WalletInvoiceLiquidDestination {
+    pub(crate) nym: String,
+    pub(crate) address: String,
+    pub(crate) address_index: i32,
+    pub(crate) blinding_key_hex: String,
+}
+
+type DeriveWalletInvoiceLiquidDestination<'a> =
+    dyn Fn(&str, u32) -> Result<(String, String), sqlx::Error> + Sync + 'a;
 
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct InvoiceFiatSettlementPolicy {
@@ -492,7 +504,7 @@ pub async fn invoice_presentation_received_sat<'e, E: sqlx::PgExecutor<'e>>(
 ///
 /// Lightning offers attach via a separate `record_swap` call that sets
 /// `swap_records.invoice_id`; the claimer routes the LN claim to the
-/// invoice's `liquid_address` via `resolve_claim_address` branch (B).
+/// descriptor-backed invoice destination.
 pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
@@ -591,6 +603,10 @@ async fn capture_invoice_fiat_policy(
     product: Product,
     allowed_rail_mask: i16,
 ) -> Result<(), sqlx::Error> {
+    let mixed_claim_ready = inserted.nym_owner.is_some()
+        && inserted.liquid_address.is_some()
+        && inserted.liquid_blinding_key_hex.is_some()
+        && (inserted.origin != "wallet" || inserted.liquid_address_index.is_some());
     sqlx::query(
         "INSERT INTO invoice_fiat_settlement_policies ( \
                  invoice_id, owner_npub, credential_id, product, \
@@ -610,12 +626,13 @@ async fn capture_invoice_fiat_policy(
                 AND credential.ciphertext IS NOT NULL \
                 AND credential.nonce IS NOT NULL \
                 AND (setting.fiat_percentage = 100 \
-                     OR ($4::SMALLINT & 3::SMALLINT) <> 0)",
+                     OR ($5::BOOLEAN AND ($4::SMALLINT & 3::SMALLINT) <> 0))",
     )
     .bind(inserted.id)
     .bind(invoice.npub_owner)
     .bind(product.as_str())
     .bind(allowed_rail_mask)
+    .bind(mixed_claim_ready)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -699,22 +716,32 @@ pub async fn insert_or_reuse_wallet_invoice(
     invoice: &NewInvoice<'_>,
     private: &PrivateInvoiceCreate<'_>,
 ) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
-    insert_or_reuse_wallet_invoice_inner(pool, invoice, private, None).await
+    insert_or_reuse_wallet_invoice_inner(pool, invoice, private, None, None).await
 }
 
 /// Create an idempotent private wallet invoice and atomically snapshot its
 /// admitted fiat-settlement policy. The opaque presentation contract remains
 /// mandatory; enabling fiat never reintroduces merchant metadata into the
 /// ordinary invoice projection.
-pub async fn insert_or_reuse_wallet_invoice_with_fiat_policy(
+pub async fn insert_or_reuse_wallet_invoice_with_fiat_policy<F>(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
     private: &PrivateInvoiceCreate<'_>,
     product: Product,
     allowed_rail_mask: i16,
-) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
-    insert_or_reuse_wallet_invoice_inner(pool, invoice, private, Some((product, allowed_rail_mask)))
-        .await
+    derive_liquid_destination: F,
+) -> Result<WalletInvoiceCreateResolution, sqlx::Error>
+where
+    F: Fn(&str, u32) -> Result<(String, String), sqlx::Error> + Sync,
+{
+    insert_or_reuse_wallet_invoice_inner(
+        pool,
+        invoice,
+        private,
+        Some((product, allowed_rail_mask)),
+        Some(&derive_liquid_destination),
+    )
+    .await
 }
 
 async fn insert_or_reuse_wallet_invoice_inner(
@@ -722,6 +749,7 @@ async fn insert_or_reuse_wallet_invoice_inner(
     invoice: &NewInvoice<'_>,
     private: &PrivateInvoiceCreate<'_>,
     fiat_policy: Option<(Product, i16)>,
+    derive_liquid_destination: Option<&DeriveWalletInvoiceLiquidDestination<'_>>,
 ) -> Result<WalletInvoiceCreateResolution, sqlx::Error> {
     if invoice.origin != "wallet" {
         return Err(sqlx::Error::Protocol(
@@ -757,15 +785,109 @@ async fn insert_or_reuse_wallet_invoice_inner(
         return Ok(WalletInvoiceCreateResolution::Reused(existing));
     }
 
-    let inserted = insert_invoice_row(&mut tx, invoice, Some(private)).await?;
-    if let Some((product, allowed_rail_mask)) = fiat_policy {
-        capture_invoice_fiat_policy(&mut tx, &inserted, invoice, product, allowed_rail_mask)
-            .await?;
+    // A wallet-created Lightning invoice settles through Bullnym, so its
+    // merchant output belongs to the descriptor already registered for the
+    // signing owner. Client-supplied Liquid material remains a compatibility
+    // input for Bitcoin-only/old-server flows, but it is never authoritative
+    // when this descriptor can be resolved. The allocation shares the owner
+    // and idempotency transaction with policy capture.
+    let descriptor_destination = if invoice.accept_ln {
+        match derive_liquid_destination {
+            Some(derive) => {
+                allocate_wallet_invoice_liquid_destination(&mut tx, invoice.npub_owner, derive)
+                    .await?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut effective_invoice = *invoice;
+    if let Some(destination) = descriptor_destination.as_ref() {
+        effective_invoice.nym_owner = Some(destination.nym.as_str());
+        effective_invoice.liquid_address = Some(destination.address.as_str());
+        effective_invoice.liquid_blinding_key_hex = Some(destination.blinding_key_hex.as_str());
     }
-    insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
+    let mut inserted = insert_invoice_row(&mut tx, &effective_invoice, Some(private)).await?;
+    if let Some(destination) = descriptor_destination.as_ref() {
+        sqlx::query("UPDATE invoices SET liquid_address_index = $2 WHERE id = $1")
+            .bind(inserted.id)
+            .bind(destination.address_index)
+            .execute(&mut *tx)
+            .await?;
+        inserted.liquid_address_index = Some(destination.address_index);
+    }
+    if let Some((product, allowed_rail_mask)) = fiat_policy {
+        capture_invoice_fiat_policy(
+            &mut tx,
+            &inserted,
+            &effective_invoice,
+            product,
+            allowed_rail_mask,
+        )
+        .await?;
+    }
+    insert_invoice_payment_addresses(&mut tx, &inserted, &effective_invoice).await?;
 
     tx.commit().await?;
     Ok(WalletInvoiceCreateResolution::Created(inserted))
+}
+
+pub(crate) async fn allocate_wallet_invoice_liquid_destination(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_npub: &str,
+    derive: &DeriveWalletInvoiceLiquidDestination<'_>,
+) -> Result<Option<WalletInvoiceLiquidDestination>, sqlx::Error> {
+    let row: Option<(String, String, i32)> = sqlx::query_as(
+        "SELECT users.nym, users.ct_descriptor, users.next_addr_idx \
+           FROM users \
+           JOIN public_names \
+             ON public_names.name = users.nym \
+            AND public_names.owner_npub = users.npub \
+            AND public_names.kind = 'nym' \
+          WHERE users.npub = $1 \
+          FOR UPDATE OF users",
+    )
+    .bind(owner_npub)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((nym, descriptor, mut address_index)) = row else {
+        return Ok(None);
+    };
+
+    for _ in 0..100 {
+        let index = u32::try_from(address_index).map_err(|_| {
+            sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+        })?;
+        let (address, blinding_key_hex) = derive(&descriptor, index)?;
+        let in_use: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM invoice_payment_addresses \
+                 WHERE rail = 'liquid' AND address = $1 \
+            )",
+        )
+        .bind(&address)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !in_use {
+            sqlx::query("UPDATE users SET next_addr_idx = $2 WHERE nym = $1")
+                .bind(&nym)
+                .bind(address_index + 1)
+                .execute(&mut **tx)
+                .await?;
+            return Ok(Some(WalletInvoiceLiquidDestination {
+                nym,
+                address,
+                address_index,
+                blinding_key_hex,
+            }));
+        }
+        address_index += 1;
+    }
+
+    Err(sqlx::Error::Protocol(
+        "unable to allocate a unique wallet-invoice Liquid address after 100 attempts".into(),
+    ))
 }
 
 /// Publicly retrievable ciphertext for the payer browser. The query projects

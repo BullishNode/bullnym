@@ -4760,9 +4760,11 @@ async fn create_invoice_inner(
             "accept_btc=true requires bitcoin_address".into(),
         ));
     }
-    if (req.accept_ln || req.accept_liquid) && req.liquid_address.is_none() {
+    if (req.accept_liquid || (req.accept_ln && !state.config.features.bull_bitcoin_fiat_settlement))
+        && req.liquid_address.is_none()
+    {
         return Err(AppError::InvalidAmount(
-            "accept_ln/accept_liquid=true requires liquid_address".into(),
+            "accept_liquid=true requires liquid_address; Lightning-only invoices require it only on servers without descriptor-backed settlement".into(),
         ));
     }
     let canonical_bitcoin_address = if let Some(addr) = req.bitcoin_address.as_deref() {
@@ -4890,6 +4892,15 @@ async fn create_invoice_inner(
             &private_create,
             Product::Invoice,
             fiat_rail_mask,
+            |ct_descriptor, index| {
+                let address = descriptor::derive_address(ct_descriptor, index)
+                    .map_err(|error| sqlx::Error::Protocol(format!("derive_address: {error}")))?;
+                let blinding_key_hex = descriptor::derive_blinding_key_hex(ct_descriptor, &address)
+                    .map_err(|error| {
+                        sqlx::Error::Protocol(format!("derive_blinding_key_hex: {error}"))
+                    })?;
+                Ok((address, blinding_key_hex))
+            },
         )
         .await?
     } else {

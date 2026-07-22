@@ -644,6 +644,171 @@ struct MixedReverseFixture {
     boltz_swap_id: String,
 }
 
+#[tokio::test]
+async fn mixed_wallet_lightning_invoice_uses_bullnym_descriptor_destination() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, owner_npub, credential_id, _) = fiat_lifecycle_test_state(
+        &pool,
+        ScriptedBullBitcoinApi::default(),
+        "mixeddescriptorinvoice",
+    )
+    .await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        50,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 30_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            bitcoin_address: None,
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        2,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(invoice.nym_owner.as_deref(), Some("mixeddescriptorinvoice"));
+    assert_eq!(invoice.liquid_address_index, Some(0));
+    let address = invoice.liquid_address.as_deref().unwrap();
+    assert_eq!(
+        address,
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap()
+    );
+    let expected_blinding_key =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, address).unwrap();
+    assert_eq!(
+        invoice.liquid_blinding_key_hex.as_deref(),
+        Some(expected_blinding_key.as_str())
+    );
+    assert!(
+        pay_service::db::invoice_fiat_settlement_policy(&pool, invoice.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn legacy_mixed_lightning_destination_is_repaired_once_before_claim_journaling() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = mixed_reverse_fixture(
+        &pool,
+        ScriptedBullBitcoinApi::default(),
+        "mixeddescriptorrepair",
+        30_000,
+        50,
+    )
+    .await;
+    let legacy_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 77).unwrap();
+    sqlx::query(
+        "UPDATE invoices SET nym_owner = NULL, liquid_address = $2, \
+             liquid_address_index = NULL, liquid_blinding_key_hex = NULL WHERE id = $1",
+    )
+    .bind(fixture.invoice.id)
+    .bind(&legacy_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_addresses SET address = $2 \
+          WHERE invoice_id = $1 AND rail = 'liquid'",
+    )
+    .bind(fixture.invoice.id)
+    .bind(&legacy_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE swap_records SET nym = NULL, address = $2, address_index = NULL WHERE id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .bind(&legacy_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repaired = pay_service::claimer::exercise_mixed_invoice_destination_preparation(
+        &pool,
+        fixture.reverse_swap_id,
+    )
+    .await
+    .unwrap();
+    let retried = pay_service::claimer::exercise_mixed_invoice_destination_preparation(
+        &pool,
+        fixture.reverse_swap_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retried, repaired);
+    assert_ne!(repaired, legacy_address);
+
+    let invoice = pay_service::db::get_invoice_by_id(&pool, fixture.invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice.nym_owner.as_deref(), Some("mixeddescriptorrepair"));
+    let address_index = invoice.liquid_address_index.unwrap();
+    assert_eq!(invoice.liquid_address.as_deref(), Some(repaired.as_str()));
+    assert_eq!(
+        invoice.liquid_blinding_key_hex,
+        Some(pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &repaired).unwrap())
+    );
+    let swap_destination: (Option<String>, Option<String>, Option<i32>) =
+        sqlx::query_as("SELECT nym, address, address_index FROM swap_records WHERE id = $1")
+            .bind(fixture.reverse_swap_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        swap_destination,
+        (
+            Some("mixeddescriptorrepair".into()),
+            Some(repaired),
+            Some(address_index),
+        )
+    );
+    let next_index: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE npub = $1")
+        .bind(&fixture.owner_npub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(next_index, address_index + 1);
+
+    cleanup_db(&pool).await;
+}
+
 async fn mixed_reverse_fixture(
     pool: &PgPool,
     fake: ScriptedBullBitcoinApi,
@@ -15091,6 +15256,15 @@ async fn insert_test_wallet_invoice_with_fiat_policy(
         &private,
         product,
         allowed_rail_mask,
+        |ct_descriptor, index| {
+            let address = pay_service::descriptor::derive_address(ct_descriptor, index)
+                .map_err(|error| sqlx::Error::Protocol(format!("derive_address: {error}")))?;
+            let blinding_key_hex =
+                pay_service::descriptor::derive_blinding_key_hex(ct_descriptor, &address).map_err(
+                    |error| sqlx::Error::Protocol(format!("derive_blinding_key_hex: {error}")),
+                )?;
+            Ok((address, blinding_key_hex))
+        },
     )
     .await?
     {

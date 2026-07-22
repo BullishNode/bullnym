@@ -2627,17 +2627,16 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
 
 /// Returns the claim destination for this swap. Three branches in order:
 ///
-///   (A) **Cached**: a previous attempt already wrote `swap_records.address`.
-///       Return it as-is. This makes claim retries fully idempotent — the
-///       same destination is used across attempts whether the address came
-///       from the descriptor allocator or a wallet-supplied invoice.
+///   (A) **Mixed invoice**: verify or prepare the Bullnym descriptor-backed
+///       destination before accepting any cached legacy value.
 ///
-///   (B) **Invoice-bound**: the swap was created for a Get-paid invoice.
-///       Read `invoices.liquid_address` (wallet-supplied at create time);
-///       persist it into `swap_records.address` (with `address_index = NULL`,
-///       since there is no descriptor index for wallet-supplied addresses).
+///   (B) **Cached**: a previous attempt already wrote `swap_records.address`.
+///       Return it as-is. This makes ordinary claim retries idempotent.
 ///
-///   (C) **Lightning Address**: the swap is for the LNURL flow. Bump
+///   (C) **Invoice-bound**: read the invoice's immutable Liquid destination
+///       and persist it into `swap_records.address`.
+///
+///   (D) **Lightning Address**: the swap is for the LNURL flow. Bump
 ///       `users.next_addr_idx` and derive a fresh CT address from the
 ///       user's descriptor.
 ///
@@ -2646,9 +2645,19 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
 /// transaction.mempool followed by transaction.confirmed) so they cannot
 /// double-allocate or split addresses, without checking out another pool
 /// connection while the advisory-lock connection is already held.
+#[derive(sqlx::FromRow)]
+struct MixedInvoiceDestinationRow {
+    owner_npub: String,
+    nym_owner: Option<String>,
+    liquid_address: Option<String>,
+    liquid_address_index: Option<i32>,
+    liquid_blinding_key_hex: Option<String>,
+}
+
 async fn resolve_claim_address(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &db::SwapRecord,
+    mixed_policy: bool,
 ) -> Result<String, AppError> {
     // Re-read the swap row under FOR UPDATE — `swap` may be stale (the
     // caller loaded it before this call, possibly on a previous attempt).
@@ -2663,16 +2672,142 @@ async fn resolve_claim_address(
     let (cached_addr, _cached_idx, invoice_id) =
         row.ok_or_else(|| AppError::ClaimError(format!("swap_records row gone: {}", swap.id)))?;
 
-    // (A) Cached destination — return as-is. Idempotent retries land on
+    // Mixed Lightning settlement is owned by Bullnym's registered descriptor,
+    // not by an address carried in the mobile request. Current invoices are
+    // prepared this way at creation. This guarded repair covers invoices
+    // captured by older builds: before any claim bytes exist, replace the
+    // legacy wallet address with a fresh descriptor destination and persist
+    // its matching blinding key atomically. Once claim bytes exist the output
+    // is immutable and repair must refuse.
+    if mixed_policy {
+        if let Some(inv_id) = invoice_id {
+            let invoice_row: Option<MixedInvoiceDestinationRow> = sqlx::query_as(
+                "SELECT policy.owner_npub, invoice.nym_owner, \
+                        invoice.liquid_address, invoice.liquid_address_index, \
+                        invoice.liquid_blinding_key_hex \
+                   FROM swap_fiat_settlement_policies policy \
+                   JOIN swap_records bound_swap ON bound_swap.id = policy.reverse_swap_id \
+                   JOIN invoices invoice ON invoice.id = bound_swap.invoice_id \
+                  WHERE policy.reverse_swap_id = $1 \
+                    AND invoice.id = $2 \
+                    AND policy.fiat_percentage BETWEEN 1 AND 99 \
+                  FOR UPDATE OF invoice",
+            )
+            .bind(swap.id)
+            .bind(inv_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+            if let Some(invoice_row) = invoice_row {
+                let descriptor_ready = invoice_row.nym_owner.is_some()
+                    && invoice_row.liquid_address.is_some()
+                    && invoice_row.liquid_address_index.is_some()
+                    && invoice_row.liquid_blinding_key_hex.is_some();
+                if descriptor_ready {
+                    let address = invoice_row
+                        .liquid_address
+                        .expect("checked descriptor address");
+                    if cached_addr.as_deref() != Some(address.as_str()) {
+                        sqlx::query(
+                            "UPDATE swap_records SET address = $2, address_index = $3, nym = $4 \
+                              WHERE id = $1",
+                        )
+                        .bind(swap.id)
+                        .bind(&address)
+                        .bind(invoice_row.liquid_address_index)
+                        .bind(invoice_row.nym_owner)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|error| AppError::DbError(error.to_string()))?;
+                    }
+                    return Ok(address);
+                }
+                if swap.claim_tx_hex.is_some() {
+                    return Err(AppError::ClaimError(format!(
+                        "mixed invoice {inv_id} lacks its descriptor destination after claim journaling"
+                    )));
+                }
+                let destination = db::allocate_wallet_invoice_liquid_destination(
+                    tx,
+                    &invoice_row.owner_npub,
+                    &|ct_descriptor, index| {
+                        let address =
+                            descriptor::derive_address(ct_descriptor, index).map_err(|error| {
+                                sqlx::Error::Protocol(format!("derive_address: {error}"))
+                            })?;
+                        let blinding_key = descriptor::derive_blinding_key_hex(
+                            ct_descriptor,
+                            &address,
+                        )
+                        .map_err(|error| {
+                            sqlx::Error::Protocol(format!("derive_blinding_key_hex: {error}"))
+                        })?;
+                        Ok((address, blinding_key))
+                    },
+                )
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::ClaimError(format!(
+                        "mixed invoice {inv_id} owner has no permanent Bullnym descriptor"
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE invoices \
+                        SET nym_owner = $2, liquid_address = $3, \
+                            liquid_address_index = $4, liquid_blinding_key_hex = $5 \
+                      WHERE id = $1",
+                )
+                .bind(inv_id)
+                .bind(&destination.nym)
+                .bind(&destination.address)
+                .bind(destination.address_index)
+                .bind(&destination.blinding_key_hex)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO invoice_payment_addresses (invoice_id, rail, address) \
+                     VALUES ($1, 'liquid', $2) \
+                     ON CONFLICT (invoice_id, rail) DO UPDATE SET address = EXCLUDED.address",
+                )
+                .bind(inv_id)
+                .bind(&destination.address)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+                sqlx::query(
+                    "UPDATE swap_records SET nym = $2, address = $3, address_index = $4 \
+                      WHERE id = $1 AND claim_tx_hex IS NULL",
+                )
+                .bind(swap.id)
+                .bind(&destination.nym)
+                .bind(&destination.address)
+                .bind(destination.address_index)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+                tracing::info!(
+                    event = "mixed_invoice_descriptor_destination_repaired",
+                    swap_id = %swap.id,
+                    invoice_id = %inv_id,
+                    address_index = destination.address_index,
+                    "legacy mixed Lightning destination replaced before claim journaling"
+                );
+                return Ok(destination.address);
+            }
+        }
+    }
+
+    // (B) Cached destination — return as-is. Idempotent retries land on
     //     the same address regardless of how it was first resolved.
     if let Some(addr) = cached_addr {
         return Ok(addr);
     }
 
-    // (B) Invoice-bound — wallet supplied the destination at create time.
-    //     `liquid_address_index` stays NULL: there's no descriptor cursor
-    //     to bump for wallet addresses. Persist into swap_records.address
-    //     so the cache branch wins on the next retry.
+    // (C) Invoice-bound. Persist into swap_records.address so the cache branch
+    //     wins on the next retry. Descriptor-backed invoices already carry an
+    //     index; compatibility invoices may not.
     if let Some(inv_id) = invoice_id {
         let inv_row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT liquid_address FROM invoices WHERE id = $1")
@@ -2696,12 +2831,12 @@ async fn resolve_claim_address(
             event = "lightning_swap_address_from_invoice_prepared",
             swap_id = %swap.id,
             invoice_id = %inv_id,
-            "claim destination prepared from invoice.liquid_address; pending claim transaction commit"
+            "claim destination prepared from the invoice's immutable Liquid destination; pending claim transaction commit"
         );
         return Ok(addr);
     }
 
-    // (C) Lightning Address descriptor allocator. Funds locked up against
+    // (D) Lightning Address descriptor allocator. Funds locked up against
     //     a swap we created belong to the receiver even if they deactivate
     //     the nym before funding. `purge_user` refuses to run while swaps
     //     are in flight; if a purged row ever reaches this path, the empty
@@ -2920,7 +3055,7 @@ async fn prepare_reverse_mixed_claim(
                 "mixed reverse claim changed during fee preparation".into(),
             ));
         }
-        let output_address = resolve_claim_address(&mut tx, &swap).await?;
+        let output_address = resolve_claim_address(&mut tx, &swap, true).await?;
         let response: CreateReverseResponse = serde_json::from_str(
             swap.boltz_response_json
                 .as_deref()
@@ -3204,6 +3339,29 @@ pub async fn exercise_reverse_claim_without_fee(
     .await
 }
 
+/// No-network regression seam for descriptor preparation. It exercises the
+/// same locked resolver used immediately before mixed reverse-claim fee
+/// estimation, then commits only the destination allocation.
+#[doc(hidden)]
+pub async fn exercise_mixed_invoice_destination_preparation(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+) -> Result<String, AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let swap = db::get_swap_by_id(&mut *tx, swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("swap not found: {swap_id}")))?;
+    let address = resolve_claim_address(&mut tx, &swap, true).await?;
+    tx.commit()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    Ok(address)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_swap_with_guard(
     pool: &sqlx::PgPool,
@@ -3473,7 +3631,7 @@ async fn claim_swap_inner(
     // Destination resolution uses this same transaction/connection. Returning
     // to the pool here would self-starve at max_connections=1 and can deadlock
     // a saturated pool when multiple claim preparations each hold one slot.
-    let output_address = resolve_claim_address(&mut tx, &swap).await?;
+    let output_address = resolve_claim_address(&mut tx, &swap, has_mixed_policy).await?;
 
     if let Some(preparation) = mixed_preparation.as_ref() {
         let settlement_id = match preparation {
