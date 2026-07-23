@@ -6,6 +6,7 @@
 
   let {
     variant = 'primary',
+    id,
     type = 'button',
     disabled = false,
     href,
@@ -13,6 +14,7 @@
     children,
   }: {
     variant?: 'primary' | 'secondary' | 'ghost' | 'danger'
+    id?: string
     type?: 'button' | 'submit'
     disabled?: boolean
     href?: string
@@ -37,5 +39,5 @@
 {#if href}
   <a class={classes} {href}>{@render children?.()}</a>
 {:else}
-  <button class={classes} {type} {disabled} {onclick}>{@render children?.()}</button>
+  <button {id} class={classes} {type} {disabled} {onclick}>{@render children?.()}</button>
 {/if}

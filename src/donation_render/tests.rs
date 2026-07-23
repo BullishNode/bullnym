@@ -88,51 +88,6 @@ fn security_headers_allow_https_connects_for_pos_csp() {
 }
 
 #[test]
-fn live_template_renders_social_preview_metadata() {
-    let og_url = "https://bullpay.ca/og/fallback-live-v1.jpg";
-    let tpl = DonationPageTpl {
-        invoice_base: "/alice".to_string(),
-        header: "Alice Store",
-        description: "Fresh coffee",
-        social_meta: social_meta_tags(
-            "Alice Store",
-            "Fresh coffee",
-            "https://bullpay.ca/alice",
-            og_url,
-        ),
-        display_currency: "CAD",
-        website: None,
-        twitter: None,
-        instagram: None,
-        minor_per_btc: 1_000_000_000,
-        last_known_rate: false,
-        supported_currencies: vec![CurrencyView {
-            code: "CAD".to_string(),
-            precision: 2,
-        }],
-    };
-
-    let html = tpl.render().expect("template renders");
-
-    assert!(html.contains(&format!(r#"<meta property="og:image" content="{og_url}">"#)));
-    assert!(html.contains(r#"<meta property="og:image:width" content="1200">"#));
-    assert!(html.contains(r#"<meta property="og:image:height" content="630">"#));
-    assert!(html.contains(r#"<meta property="og:image:type" content="image/jpeg">"#));
-    assert!(html.contains(
-        r#"<meta property="og:image:alt" content="Alice Store — Bull Bitcoin Payment Page">"#
-    ));
-    assert!(html.contains(&format!(
-        r#"<meta name="twitter:image" content="{og_url}">"#
-    )));
-    assert!(html.contains(r#"<meta property="og:site_name" content="Bull Bitcoin">"#));
-    assert!(html.contains(r#"<link rel="canonical" href="https://bullpay.ca/alice">"#));
-    assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
-    assert!(html.contains(
-        r#"<meta name="twitter:image:alt" content="Alice Store — Bull Bitcoin Payment Page">"#
-    ));
-}
-
-#[test]
 fn archived_template_renders_unavailable_social_preview_metadata() {
     let image_url = og_image::fallback_url("bullpay.ca", true);
     let tpl = DonationArchivedTpl {
@@ -288,6 +243,18 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     assert!(html.contains(
         r#"<meta property="og:image" content="https://bullpay.ca/og/fallback-live-v1.jpg?x=a&amp;b">"#
     ));
+    assert!(html.contains(r#"<meta property="og:image:width" content="1200">"#));
+    assert!(html.contains(r#"<meta property="og:image:height" content="630">"#));
+    assert!(html.contains(r#"<meta property="og:image:type" content="image/jpeg">"#));
+    assert!(html.contains(
+        r#"<meta property="og:image:alt" content="Alice &amp; Sons — Bull Bitcoin Payment Page">"#
+    ));
+    assert!(html.contains(r#"<meta property="og:site_name" content="Bull Bitcoin">"#));
+    assert!(html.contains(r#"<link rel="canonical" href="https://bullpay.ca/alice">"#));
+    assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
+    assert!(html.contains(
+        r#"<meta name="twitter:image" content="https://bullpay.ca/og/fallback-live-v1.jpg?x=a&amp;b">"#
+    ));
     assert!(
         html.find(r#"<meta property="og:image""#)
             .expect("OG image tag")
@@ -304,7 +271,7 @@ fn pwa_shell_escapes_manifest_href_attr() {
     // Defense-in-depth: the manifest href is HTML-attr-escaped before it lands
     // in the <link>. A valid slug can't contain quotes (is_valid_slug), so the
     // caller never passes one, but the escaping must hold regardless.
-    let shell = "<!-- BULLNYM_MANIFEST -->";
+    let shell = "<!-- BULLNYM_OG --><!-- BULLNYM_MANIFEST --><!-- BULLNYM_CONFIG -->";
     let config = PwaConfigView {
         nym: Some("alice"),
         invoice_base: "/alice",
@@ -336,7 +303,7 @@ fn pwa_shell_escapes_manifest_href_attr() {
 
 #[test]
 fn pwa_shell_escapes_script_breakout_in_json() {
-    let shell = "<!-- BULLNYM_CONFIG --><!-- BULLNYM_OG -->";
+    let shell = "<!-- BULLNYM_CONFIG --><!-- BULLNYM_OG --><!-- BULLNYM_MANIFEST -->";
     let config = PwaConfigView {
         nym: Some("alice"),
         invoice_base: "/alice",
@@ -377,9 +344,15 @@ async fn pwa_shell_reads_current_file_from_disk() {
     let root =
         std::env::temp_dir().join(format!("bullnym-pwa-shell-{unique}-{}", std::process::id()));
     let donation_dir = root.join("apps").join("donation");
+    let pos_dir = root.join("apps").join("pos");
+    let invoice_dir = root.join("apps").join("invoice");
     std::fs::create_dir_all(&donation_dir).expect("create donation shell dir");
+    std::fs::create_dir_all(&pos_dir).expect("create pos shell dir");
+    std::fs::create_dir_all(&invoice_dir).expect("create invoice shell dir");
     let donation_path = donation_dir.join("index.html");
     std::fs::write(&donation_path, "first shell").expect("write first shell");
+    std::fs::write(pos_dir.join("index.html"), "pos shell").expect("write pos shell");
+    std::fs::write(invoice_dir.join("index.html"), "invoice shell").expect("write invoice shell");
 
     let shells = PwaShells::load(&root);
 
@@ -394,15 +367,101 @@ async fn pwa_shell_reads_current_file_from_disk() {
         shells.shell_for(false).await.as_deref(),
         Some("rebuilt shell")
     );
+    assert_eq!(
+        shells.invoice_shell().await.as_deref(),
+        Some("invoice shell")
+    );
 
     std::fs::remove_dir_all(root).expect("remove temp shell dir");
 }
 
 #[tokio::test]
-async fn pwa_shell_missing_file_falls_back_to_askama_path() {
+async fn pwa_shell_missing_file_is_unavailable() {
     let shells = PwaShells::default();
 
     assert!(shells.shell_for(false).await.is_none());
+}
+
+#[test]
+fn pwa_shell_requires_each_injection_marker_exactly_once() {
+    let config = PwaConfigView {
+        nym: Some("alice"),
+        invoice_base: "/alice",
+        page_key: "alice",
+        mode: "donation",
+        currency: "USD",
+        header: "Alice",
+        description: "Coffee",
+        website: None,
+        twitter: None,
+        instagram: None,
+        minor_per_btc: 0,
+        last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
+        domain: "bullpay.ca",
+    };
+    let inject = |shell: &str| {
+        inject_pwa_shell(
+            shell,
+            &config,
+            "https://bullpay.ca/alice",
+            "https://bullpay.ca/og/fallback-live-v1.jpg",
+            "/alice/manifest.webmanifest",
+        )
+    };
+
+    assert!(inject("<!-- BULLNYM_CONFIG --><!-- BULLNYM_MANIFEST -->").is_none());
+    assert!(inject(
+        "<!-- BULLNYM_CONFIG --><!-- BULLNYM_CONFIG --><!-- BULLNYM_MANIFEST --><!-- BULLNYM_OG -->"
+    )
+    .is_none());
+    assert!(
+        inject("<!-- BULLNYM_CONFIG --><!-- BULLNYM_MANIFEST --><!-- BULLNYM_OG -->").is_some()
+    );
+}
+
+#[tokio::test]
+async fn pwa_unavailable_response_is_fixed_and_not_cacheable() {
+    use http_body_util::BodyExt;
+
+    let resp = pwa_unavailable_response(true);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert!(!resp.headers().contains_key(PWA_SHELL_HEADER));
+    assert_eq!(resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    assert_eq!(&body[..], b"Payment page temporarily unavailable");
+}
+
+#[test]
+fn pwa_shell_startup_check_reads_the_configured_file() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "bullnym-pwa-shell-startup-{unique}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create startup shell dir");
+    let shell_path = root.join("index.html");
+    std::fs::write(&shell_path, [0xff]).expect("write invalid UTF-8 shell");
+
+    let mut unavailable = Vec::new();
+    check_shell_readable(&shell_path, "donation", &mut unavailable);
+
+    assert_eq!(unavailable.len(), 1);
+    assert!(unavailable[0].contains("donation"));
+    std::fs::remove_dir_all(root).expect("remove startup shell dir");
 }
 
 #[test]
@@ -444,7 +503,7 @@ fn pwa_shell_header_marks_pos_shells() {
 
 #[test]
 fn alias_config_omits_nym_and_carries_invoice_base() {
-    let shell = "<!-- BULLNYM_CONFIG -->";
+    let shell = "<!-- BULLNYM_CONFIG --><!-- BULLNYM_MANIFEST --><!-- BULLNYM_OG -->";
     let config = PwaConfigView {
         nym: None,
         invoice_base: "/a/alices-shop",
@@ -481,7 +540,7 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
 #[test]
 fn nym_config_still_carries_nym_and_invoice_base() {
     // Regression: nym pages keep sending `nym` (installed-PWA back-compat).
-    let shell = "<!-- BULLNYM_CONFIG -->";
+    let shell = "<!-- BULLNYM_CONFIG --><!-- BULLNYM_MANIFEST --><!-- BULLNYM_OG -->";
     let config = PwaConfigView {
         nym: Some("alice"),
         invoice_base: "/alice",

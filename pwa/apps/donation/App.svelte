@@ -17,9 +17,8 @@
   // The payment/success screens are now PayFlow.svelte (shared with POS)
   // instead of this file's own hand-rolled payment/success branches.
   //
-  // review item 7: sat/BTC entry (templates/store_amount.html:134-146,
-  // :210-215) — a pricer outage must not block donations, so sat/BTC never
-  // touch the rate store and are always payable regardless of rate.available.
+  // Sat/BTC entry must remain available during a pricer outage, so these units
+  // never touch the rate store and are payable regardless of rate.available.
   import { Globe, Instagram, X } from 'lucide-svelte'
   import { config } from '$lib/config'
   import { createInvoice, getSupportedCurrencies, ApiError, type CurrencyView } from '$lib/api/client'

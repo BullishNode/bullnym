@@ -157,7 +157,9 @@ PY
 
         self.pwa = self.artifacts / "pwa"
         self.pwa.mkdir()
+        self.pwa.chmod(0o755)
         (self.pwa / "index.html").write_text("<p>certification fixture</p>\n")
+        (self.pwa / "index.html").chmod(0o644)
         self.pwa_digest = subprocess.check_output(
             [CONTENT_HASHER, self.pwa], text=True
         ).strip()
@@ -390,6 +392,28 @@ class CertifyDeploymentTests(unittest.TestCase):
         result = self.run_certification()
         self.assert_failed(result, "duplicate JSON field")
         self.fixture.write_document()
+
+    def test_pwa_permission_policy_rejects_deployment_regression(self) -> None:
+        index = self.fixture.pwa / "index.html"
+        index.chmod(0o600)
+        result = self.run_certification()
+        self.assert_failed(result, "mode 0600")
+        self.assertIn("readable independently of its owner", result.stderr)
+
+        index.chmod(0o644)
+        self.fixture.pwa.chmod(0o700)
+        result = self.run_certification()
+        self.assert_failed(result, "mode 0700")
+        self.assertIn("traversable independently of its owner", result.stderr)
+
+        self.fixture.pwa.chmod(0o755)
+        result = self.run_certification()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        index.chmod(0o664)
+        self.fixture.pwa.chmod(0o775)
+        result = self.run_certification()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_http_is_fixture_only_and_report_writes_need_explicit_authority(self) -> None:
         command = self.command()

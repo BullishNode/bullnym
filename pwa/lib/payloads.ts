@@ -1,5 +1,5 @@
 // Payment-rail payload builders. Mirrors the server-rendered page's inline
-// JS exactly (templates/invoice_payment.html:338-350) — same function
+// legacy invoice JS exactly — same function
 // names, same string shapes, so the QR payloads PaymentScreen renders are
 // byte-for-byte what the old server-side page produced. liquidUri's shape
 // is also asserted against the server's own test fixture

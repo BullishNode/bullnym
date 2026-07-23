@@ -11,7 +11,7 @@
   //
   // Full rewrite for PR #5 review remediation (items 1,4,5,6,10). The
   // reference for ALL payment semantics is the inline JS state machine in
-  // templates/invoice_payment.html:290-618 — the branching below is a
+  // the former standalone invoice renderer — the branching below is a
   // close 1:1 port of it (via lib/status.ts's pure derivePayView /
   // shouldRefreshLightning helpers), not a from-scratch redesign. Visual
   // chrome (tab bar, QrCard, Bolt Card panel) is unchanged from the prior
@@ -493,7 +493,7 @@
 
   // ---------------------------------------------------------------------
   // Lightning offer refresh (review item 6), mirroring
-  // invoice_payment.html:562-576 + the old setRail lightning branch: adopt
+  // the former invoice poller + the old setRail lightning branch: adopt
   // a fresh offer as soon as polling reports one, else request one
   // (throttled — see lib/status.ts's shouldRefreshLightning) whenever
   // there's no current offer and the invoice is still payable.
@@ -1000,7 +1000,7 @@
 
   // After a partial payment the original amount is misleading, so the primary
   // display switches to the remaining amount due (finding #5 / review item 5,
-  // mirroring invoice_payment.html:597-600's "{remaining} sat remaining").
+  // mirroring the prior invoice renderer's "{remaining} sat remaining".
   const mainAmount = $derived(
     !isFiatFixed &&
       (view.kind === 'partially_paid' || view.kind === 'partially_paid_pending') &&

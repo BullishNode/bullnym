@@ -143,12 +143,46 @@ fn npub_log_tag_truncates() {
 }
 
 #[test]
-fn invoice_html_response_does_not_mark_pwa_shell() {
+fn invoice_html_response_is_private_and_not_offline_cacheable() {
     let resp = html_response("<!doctype html><title>invoice</title>".to_string());
 
     assert!(!resp.headers().contains_key("x-bullnym-pwa-shell"));
     assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
     assert_eq!(resp.headers()[header::REFERRER_POLICY], "no-referrer");
+    assert!(resp.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+}
+
+#[test]
+fn invoice_pwa_shell_injection_is_exact_and_private() {
+    let id = Uuid::new_v4();
+    let config = InvoicePwaConfig {
+        invoice_id: id,
+        private_presentation: true,
+    };
+    let shell = "<html><!-- BULLNYM_INVOICE_CONFIG --><main></main></html>";
+    let html = inject_invoice_pwa_shell(shell, &config).expect("single marker is valid");
+
+    assert!(!html.contains("BULLNYM_INVOICE_CONFIG"));
+    assert!(html.contains("id=\"bullnym-invoice-config\""));
+    assert!(html.contains(&id.to_string()));
+    assert!(html.contains("\"private_presentation\":true"));
+    assert!(!html.contains("merchant_nym"));
+
+    assert!(inject_invoice_pwa_shell("<html></html>", &config).is_none());
+    assert!(inject_invoice_pwa_shell(
+        "<!-- BULLNYM_INVOICE_CONFIG --><!-- BULLNYM_INVOICE_CONFIG -->",
+        &config,
+    )
+    .is_none());
+}
+
+#[test]
+fn missing_invoice_pwa_is_a_fixed_non_cacheable_503() {
+    let resp = invoice_pwa_unavailable_response();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert!(!resp.headers().contains_key("x-bullnym-pwa-shell"));
 }
 
 #[test]
@@ -286,322 +320,7 @@ fn permit_release_failure_keeps_the_persisted_chain_offer_visible() {
     );
 }
 
-#[test]
-fn partially_paid_template_remains_payable_for_remaining_amount() {
-    let mut tpl = InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "partially_paid",
-        presentation_status: "partial",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 2_500,
-        fiat_display: None,
-        accept_btc: true,
-        accept_ln: true,
-        accept_liquid: true,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: Some(2_500),
-        bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    let html = tpl.render().expect("template renders");
-    assert!(html.contains("Partially paid"));
-    assert!(html.contains("2500 sat remaining"));
-    assert!(html.contains("id=\"rail-lightning\""));
-    assert!(html.contains("let currentAmountSat = 2500;"));
-
-    tpl.settlement_status = "settled";
-    let settled_html = tpl.render().expect("settled partial template renders");
-    assert!(settled_html.contains("id=\"rail-lightning\""));
-    assert!(settled_html.contains("initialStatus === 'underpaid'"));
-    assert!(settled_html
-        .contains("return data.presentation_status !== 'partial' || data.status === 'underpaid';"));
-    assert!(settled_html.contains("setRail(currentRail)"));
-
-    tpl.status = "underpaid";
-    tpl.rails_payable = false;
-    let underpaid_html = tpl
-        .render()
-        .expect("settled terminal partial template renders");
-    assert!(underpaid_html.contains(">Underpaid</div>"));
-    assert!(!underpaid_html.contains("id=\"rail-lightning\""));
-    assert!(underpaid_html.contains("initialStatus === 'underpaid'"));
-}
-
-#[test]
-fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
-    let tpl = InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "unpaid",
-        presentation_status: "unpaid",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 10_000,
-        fiat_display: None,
-        accept_btc: false,
-        accept_ln: true,
-        accept_liquid: true,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: Some(10_000),
-        bitcoin_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    let html = tpl.render().expect("template renders");
-    assert!(html.contains("Refreshing Lightning offer"));
-    assert!(html.contains("fetchLightning();"));
-    assert!(html.contains("method: 'POST'"));
-    assert!(html.contains("/lightning"));
-}
-
-#[test]
-fn template_qr_loading_failure_does_not_block_the_payment_state_machine() {
-    let html = payment_template_fixture("unpaid", "unpaid", "none", true)
-        .render()
-        .expect("template renders");
-
-    assert!(html.contains("const paymentQrRenderer = import('/pwa-assets/invoice-qr.js')"));
-    assert!(html.contains(".catch(() => null);"));
-    assert!(html.contains("const renderQr = await paymentQrRenderer;"));
-    assert!(html.contains("if (!renderQr) throw new Error('payment QR renderer unavailable');"));
-    assert!(!html.contains("import { paymentQrDataUrl } from"));
-    assert!(html.contains("fetchLightning();"));
-    assert!(html.contains("copyBtn.addEventListener('click'"));
-}
-
-#[test]
-fn private_presentation_is_wallet_only_and_cannot_hide_payment_instructions() {
-    let mut template = payment_template_fixture("unpaid", "unpaid", "none", true);
-    let private_html = template.render().expect("private template renders");
-    assert!(private_html.contains("id=\"private-invoice-presentation\""));
-    assert!(private_html.contains("/pwa-assets/private-invoice.js"));
-    assert!(private_html.contains("Copy private link"));
-    assert!(private_html.contains("Share private link"));
-    assert!(private_html.contains("You can still pay using the instructions below."));
-    assert!(private_html.contains("id=\"rail-lightning\""));
-    assert!(private_html.contains("copyBtn.addEventListener('click'"));
-
-    template.private_presentation = false;
-    let checkout_html = template.render().expect("checkout template renders");
-    assert!(!checkout_html.contains("id=\"private-invoice-presentation\""));
-    assert!(!checkout_html.contains("/pwa-assets/private-invoice.js"));
-    assert!(!checkout_html.contains("Copy private link"));
-    assert!(checkout_html.contains("id=\"rail-lightning\""));
-}
-
-#[test]
-fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
-    let tpl = InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "unpaid",
-        presentation_status: "unpaid",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 10_000,
-        fiat_display: None,
-        accept_btc: false,
-        accept_ln: true,
-        accept_liquid: true,
-        bitcoin_chain_address: Some("bc1qboltzlockup"),
-        bitcoin_chain_amount_sat: Some(10_100),
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: Some(10_000),
-        bitcoin_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(Some("bc1qboltzlockup")).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(Some(
-            "bitcoin:bc1qboltzlockup?amount=0.00010100&label=Send%20to%20L-BTC%20address",
-        ))
-        .unwrap(),
-        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    let html = tpl.render().expect("template renders");
-    assert!(html.contains("id=\"rail-btc\""));
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010100\\u0026label=Send%20to%20L-BTC%20address\""));
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_AMOUNT_SAT = 10100"));
-    assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
-    assert!(html.contains("currentBitcoinChainAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || null"));
-    assert!(html.contains("return currentBitcoinChainAddress || currentBitcoinDirectAddress;"));
-    assert!(html.contains("? currentBitcoinChainAmountSat\n                    : currentAmountSat"));
-    assert!(
-        html.contains("Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs")
-    );
-    let lightning = html.find("id=\"rail-lightning\"").unwrap();
-    let liquid = html.find("id=\"rail-liquid\"").unwrap();
-    let bitcoin = html.find("id=\"rail-btc\"").unwrap();
-    assert!(lightning < liquid && liquid < bitcoin);
-}
-
-#[test]
-fn template_liquid_uri_pins_lbtc_asset() {
-    let tpl = InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "unpaid",
-        presentation_status: "unpaid",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 10_000,
-        fiat_display: None,
-        accept_btc: false,
-        accept_ln: false,
-        accept_liquid: true,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: Some(10_000),
-        bitcoin_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    let html = tpl.render().expect("template renders");
-
-    assert!(html.contains(
-            "liquidnetwork:${address}?amount=${btc}&assetid=6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
-        ));
-}
-
-#[test]
-fn invoice_template_escapes_payment_js_literals() {
-    let attack = r#"</script><img src=x onerror=alert(1)>&"#;
-    let tpl = InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "unpaid",
-        presentation_status: "unpaid",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 10_000,
-        fiat_display: None,
-        accept_btc: true,
-        accept_ln: false,
-        accept_liquid: false,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: None,
-        bitcoin_address_js: js_string_literal(Some(attack)).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(None).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    let html = tpl.render().expect("template renders");
-    assert!(!html.contains("</script><img"));
-    assert!(!html.contains("<img src=x"));
-    assert!(html.contains("\\u003c/script\\u003e"));
-    assert!(html.contains("\\u0026"));
-}
-
-#[test]
-fn hide_owner_suppresses_nym_in_rendered_header() {
-    let base = InvoicePaymentTpl {
-        nym: "secretnym",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status: "unpaid",
-        presentation_status: "unpaid",
-        presentation_known: true,
-        settlement_status: "none",
-        rails_payable: true,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 10_000,
-        fiat_display: None,
-        accept_btc: false,
-        accept_ln: true,
-        accept_liquid: false,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: None,
-        bitcoin_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(None).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    };
-
-    // Nym path: the header names the merchant.
-    let shown = base.render().expect("template renders");
-    assert!(shown.contains("secretnym"));
-    assert!(shown.contains("Pay <span"));
-
-    // Alias path (hide_owner): generic header, nym scrubbed everywhere.
-    let hidden = InvoicePaymentTpl {
-        nym: "",
-        hide_owner: true,
-        ..base
-    }
-    .render()
-    .expect("template renders");
-    assert!(hidden.contains("Pay invoice"));
-    assert!(!hidden.contains("secretnym"));
-}
+// Legacy standalone invoice-template rendering tests were removed with the template.
 
 #[test]
 fn presentation_projection_controls_new_payment_instructions() {
@@ -670,85 +389,7 @@ fn public_direct_addresses_require_explicit_direct_rail_acceptance() {
     );
 }
 
-#[test]
-fn template_presentation_precedes_accounting_terminality() {
-    let html = payment_template_fixture("paid", "payment_received", "pending", false)
-        .render()
-        .expect("template renders");
-    assert!(html.contains(">Payment received</div>"));
-    assert!(html.contains(">Settlement pending</div>"));
-
-    let partial = payment_template_fixture("in_progress", "partial", "pending", true)
-        .render()
-        .expect("template renders");
-    assert!(partial.contains("Partially paid — remaining amount due"));
-    assert!(partial.contains("id=\"rail-lightning\""));
-    assert!(partial.contains("id=\"settlement-support\">Settlement pending"));
-}
-
-#[test]
-fn template_renders_resolution_and_existing_swap_incidents() {
-    let resolution = payment_template_fixture(
-        "in_progress",
-        "payment_received",
-        "resolution_pending",
-        false,
-    )
-    .render()
-    .expect("template renders");
-    assert!(resolution.contains(">Payment issue</div>"));
-    assert!(resolution.contains(">Settlement problem — being checked</div>"));
-
-    for incident in ["refunded", "failed"] {
-        let html = payment_template_fixture("in_progress", "payment_received", incident, false)
-            .render()
-            .expect("template renders");
-        assert!(html.contains(">Settlement failed</div>"), "{incident}");
-    }
-    let stuck = payment_template_fixture("in_progress", "payment_received", "claim_stuck", false)
-        .render()
-        .expect("template renders");
-    assert!(stuck.contains(">Payment needs review</div>"));
-}
-
-#[test]
-fn template_status_poll_replaces_nullable_bitcoin_offer_state() {
-    let html = payment_template_fixture("in_progress", "partial", "pending", true)
-        .render()
-        .expect("template renders");
-
-    assert!(html.contains("currentBitcoinDirectAddress = data.bitcoin_address || null;"));
-    assert!(html.contains("Number.isSafeInteger(data.bitcoin_chain_amount_sat)"));
-    assert!(html.contains("nextBitcoinChainAddress && nextBitcoinChainAmountSat !== null"));
-    assert!(html.contains("currentBitcoinChainAmountSat = currentBitcoinChainAddress"));
-    assert!(html.contains("currentBitcoinChainBip21 = currentBitcoinChainAddress"));
-    assert!(html
-        .contains("const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null;"));
-    assert!(!html.contains("const nextBitcoinAddress ="));
-    let adopt = html
-        .find("adoptStatusPayloads(data);")
-        .expect("status payloads are adopted");
-    let pending_branch = html
-        .find("if (data.settlement_status === 'pending')")
-        .expect("pending branch exists");
-    assert!(
-        adopt < pending_branch,
-        "nullable offers must be replaced before partial+pending returns"
-    );
-    assert!(html.contains(
-        "if (data.presentation_status === 'partial') {\n                            if (statusAllowsPaymentRails(data))"
-    ));
-    assert!(html.contains("renderUnknownState();"));
-}
-
-#[test]
-fn template_never_maps_unknown_presentation_to_paid_or_unpaid() {
-    let mut template = payment_template_fixture("paid", "", "none", false);
-    template.presentation_known = false;
-    let html = template.render().expect("template renders");
-    assert!(html.contains(">Checking payment status</div>"));
-    assert!(html.contains(">Payment status is being checked</div>"));
-}
+// Payment-state rendering is covered by the shared PWA component tests.
 
 #[test]
 fn api_tolerance_uses_configured_values() {
@@ -773,51 +414,6 @@ fn api_tolerance_uses_configured_values() {
         3,
         "the API must advertise the strictest accepted-rail tolerance"
     );
-}
-
-fn payment_template_fixture(
-    status: &'static str,
-    presentation_status: &'static str,
-    settlement_status: &'static str,
-    rails_payable: bool,
-) -> InvoicePaymentTpl<'static> {
-    InvoicePaymentTpl {
-        nym: "alice",
-        is_unlinked: false,
-        hide_owner: false,
-        private_presentation: true,
-        invoice_id: Uuid::nil().to_string(),
-        domain: "bullpay.ca",
-        status,
-        presentation_status,
-        presentation_known: true,
-        settlement_status,
-        rails_payable,
-        payer_demand_required: false,
-        amount_sat: 10_000,
-        remaining_amount_sat: 2_500,
-        fiat_display: None,
-        accept_btc: true,
-        accept_ln: true,
-        accept_liquid: true,
-        bitcoin_chain_address: None,
-        bitcoin_chain_amount_sat: None,
-        lightning_pr_js: js_string_literal(None).unwrap(),
-        lightning_amount_sat: None,
-        liquid_amount_sat: Some(2_500),
-        bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
-        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
-        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
-        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
-        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
-    }
-}
-
-#[test]
-fn fiat_display_uses_zero_decimal_crc() {
-    assert_eq!(format_fiat_major(12_345, "CRC"), "12345 CRC");
-    assert_eq!(format_fiat_major(12_345, "COP"), "12345 COP");
-    assert_eq!(format_fiat_major(12_345, "USD"), "123.45 USD");
 }
 
 #[test]
