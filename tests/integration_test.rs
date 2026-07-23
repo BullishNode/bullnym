@@ -3790,6 +3790,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
         fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-terminal-outcomes").await;
     let cases = [
         ("Canceled", "Not started", "Not started"),
+        ("Expired", "Not started", "Not started"),
         ("Rejected", "Not started", "Not started"),
         ("In progress", "Rejected", "Not started"),
         ("In progress", "Completed", "Canceled"),
