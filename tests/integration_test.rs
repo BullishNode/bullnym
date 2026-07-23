@@ -3790,8 +3790,6 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
         fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-terminal-outcomes").await;
     let cases = [
         ("Canceled", "Not started", "Not started"),
-        ("Expired", "Not started", "Not started"),
-        ("Payment deadline expired", "Not started", "Not started"),
         ("Rejected", "Not started", "Not started"),
         ("In progress", "Rejected", "Not started"),
         ("In progress", "Completed", "Canceled"),
@@ -3928,6 +3926,90 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
     .await
     .unwrap();
     assert_eq!(unknown, ("pending".into(), true, true));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-rate-expired").await;
+
+    let rate_expired_order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(rate_expired_order_id)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id: rate_expired_order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Payment deadline expired".into(),
+        payin_status: "Not started".into(),
+        payout_status: "Not started".into(),
+        actual_received_sat: None,
+        credited_fiat_minor: None,
+        provider_final: false,
+        provider_terminal: false,
+    }))
+    .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id: rate_expired_order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(25_001),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        provider_final: true,
+        provider_terminal: false,
+    }))
+    .await;
+    let rate_expired_request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-rate-expired-provider-status",
+    );
+    pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
+        &state,
+        &rate_expired_request,
+    )
+    .await
+    .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let rate_expired_pending = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT settlement_status, payer_instruction IS NOT NULL, \
+                next_attempt_at IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(rate_expired_order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rate_expired_pending, ("pending".into(), true, true));
+
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements SET next_attempt_at = now() \
+          WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(rate_expired_order_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let rate_expired_settled = sqlx::query_as::<_, (String, Option<i64>, bool)>(
+        "SELECT settlement_status, credited_fiat_minor, provider_final \
+           FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(rate_expired_order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rate_expired_settled, ("settled".into(), Some(12_345), true));
 
     cleanup_db(&pool).await;
 }

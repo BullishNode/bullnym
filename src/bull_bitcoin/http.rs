@@ -315,10 +315,12 @@ fn is_terminal_provider_outcome(
     payin_status: &str,
     payout_status: &str,
 ) -> bool {
-    matches!(
-        order_status,
-        "Canceled" | "Expired" | "Payment deadline expired" | "Rejected"
-    ) || payin_status == "Rejected"
+    // API-Orders uses "Expired" and "Payment deadline expired" for quoted-rate
+    // expiry (the latter for SELL). The deposit instruction remains payable
+    // and a late payment is valued at the applicable rate, so Bullnym must
+    // keep polling.
+    matches!(order_status, "Canceled" | "Rejected")
+        || payin_status == "Rejected"
         || matches!(payout_status, "Canceled" | "Failed")
 }
 
@@ -773,8 +775,6 @@ mod tests {
     fn observation_classifies_documented_terminal_provider_statuses() {
         let cases = [
             ("Canceled", "Not started", "Not started"),
-            ("Expired", "Not started", "Not started"),
-            ("Payment deadline expired", "Not started", "Not started"),
             ("Rejected", "Not started", "Not started"),
             ("In progress", "Rejected", "Not started"),
             ("In progress", "Completed", "Canceled"),
@@ -811,6 +811,8 @@ mod tests {
     fn observation_keeps_documented_transitional_and_unknown_statuses_pending() {
         let cases = [
             ("In progress", "Not started", "Not started"),
+            ("Expired", "Not started", "Not started"),
+            ("Payment deadline expired", "Not started", "Not started"),
             ("Awaiting confirmation", "Awaiting payment", "Not started"),
             ("In progress", "In progress", "In progress"),
             ("In progress", "Under review", "Scheduled"),
