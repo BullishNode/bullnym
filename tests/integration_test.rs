@@ -21866,8 +21866,10 @@ async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible(
 
     let (status, html) = get_text_path(&app, &format!("/cancellatedirect/i/{}", invoice.id)).await;
     assert_eq!(status, StatusCode::OK);
+    // The invoice PWA shell must render and must never embed the Liquid
+    // destination; payer money presentation is fetched client-side from the
+    // status API asserted above.
     assert!(!html.contains("lq1cancellatedirect"));
-    assert!(html.contains("const INITIAL_LIQUID_ADDRESS = \"\";"));
 
     let (status, body) = post_json(
         &app,
@@ -37681,13 +37683,11 @@ async fn invoice_chain_offer_returns_only_after_manifest_delivery() {
     assert_eq!(status_body["remaining_amount_sat"], 25_000);
     assert!(status_body["lightning_amount_sat"].is_null());
     assert_eq!(status_body["liquid_amount_sat"], 25_000);
+    // The invoice PWA shell renders; the Bitcoin chain offer amount and swap
+    // costs are served client-side from the status API asserted above, not
+    // embedded in the server response.
     let (render_status, html) = get_text_path(&app, &format!("/{nym}/i/{invoice_id}")).await;
     assert_eq!(render_status, StatusCode::OK, "{html}");
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_AMOUNT_SAT = 25431"));
-    assert!(html.contains("currentBitcoinChainAmountSat"));
-    assert!(
-        html.contains("Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs")
-    );
 
     let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestDelivered1")
         .await
