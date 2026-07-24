@@ -21,10 +21,10 @@ and submit transactions to the intended destination.
 | Swap provider | Its side of Boltz swaps and cooperative signing | Swap execution and provider state |
 
 Wallet-backup clients additionally rely on Bullnym only for best-effort opaque
-blob availability. Separate seed-derived signing and encryption keys identify
-each backup stream. Bullnym observes the source IP, pseudonymous stream key,
-timing, and ciphertext size, but it does not receive the seed, encryption key,
-or plaintext metadata.
+blob availability. One seed-derived signing key and one independent encryption
+key identify the unified backup object. Bullnym observes the source IP,
+pseudonymous signing key, timing, and ciphertext size, but it does not receive
+the seed, encryption key, or plaintext metadata.
 
 Compromise of the swap provider is outside Bullnym's chosen threat model. Its
 responses are nevertheless not sufficient proof of chain state; operators and
@@ -48,7 +48,8 @@ workers should correlate them with independent chain evidence.
 - misuse swap-specific private keys or destroy recovery artifacts;
 - allocate addresses incorrectly, causing reuse or missed wallet discovery.
 - delete, withhold, replay, or selectively make opaque wallet-backup objects
-  unavailable, and correlate stream keys with source/timing/size observations.
+  unavailable, and correlate the signing key with source/timing/size
+  observations.
 
 For direct payments, the payer's wallet displays the destination but cannot
 know whether it belongs to the merchant. For swap payments, the payer sees a
@@ -73,7 +74,7 @@ model.
   payloads. Public invoice URLs remain bearer-readable by design.
 - Operators preserve artifacts and reconcile database, provider, and chain
   evidence before changing state.
-- Opaque backup writes use signed, stream-separated compare-and-swap heads;
+- Opaque backup writes use one signed compare-and-swap head;
   short tombstones outlive the signed-request replay window, and responses are
   marked private/no-store. Clients authenticate and decrypt before applying.
 

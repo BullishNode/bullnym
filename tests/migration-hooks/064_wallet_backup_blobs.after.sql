@@ -61,7 +61,7 @@ BEGIN
         stream, author_pubkey, generation, etag,
         ciphertext, ciphertext_sha256, ciphertext_bytes
     ) VALUES (
-        'wallet_metadata', decode(repeat('11', 32), 'hex'), 1,
+        'wallet_backup', decode(repeat('11', 32), 'hex'), 1,
         decode(repeat('22', 32), 'hex'), decode('00010203', 'hex'),
         decode(repeat('33', 32), 'hex'), 4
     );
@@ -85,7 +85,7 @@ BEGIN
             stream, author_pubkey, generation, etag,
             ciphertext, ciphertext_sha256, ciphertext_bytes
         ) VALUES (
-            'wallet_metadata', decode(repeat('77', 32), 'hex'), 0,
+        'wallet_backup', decode(repeat('77', 32), 'hex'), 0,
             decode(repeat('88', 32), 'hex'), decode('00', 'hex'),
             decode(repeat('99', 32), 'hex'), 1
         );

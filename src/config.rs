@@ -1271,10 +1271,10 @@ pub struct RateLimitConfig {
     /// Store and delete attempts combined per source per hour. 0 disables.
     #[serde(default = "default_wallet_backup_mutation_per_source_per_hour")]
     pub wallet_backup_mutation_per_source_per_hour: u32,
-    /// Store and delete attempts per authenticated stream key per hour. 0 disables.
+    /// Store and delete attempts per authenticated signing key per hour. 0 disables.
     #[serde(default = "default_wallet_backup_mutation_per_key_per_hour")]
     pub wallet_backup_mutation_per_key_per_hour: u32,
-    /// Distinct stream keys mutated by one source per day. 0 disables.
+    /// Distinct signing keys mutated by one source per day. 0 disables.
     #[serde(default = "default_wallet_backup_distinct_keys_per_source_per_day")]
     pub wallet_backup_distinct_keys_per_source_per_day: u32,
     /// Total live decoded ciphertext bytes. 0 disables the capacity ceiling.

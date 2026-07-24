@@ -1,5 +1,5 @@
 -- ============================================================================
--- 064: opaque wallet-backup current objects
+-- 064: opaque unified wallet-backup current object
 -- ============================================================================
 
 BEGIN;
@@ -68,7 +68,7 @@ CREATE TABLE wallet_backup_blobs (
     CONSTRAINT wallet_backup_blobs_generation_positive_chk
         CHECK (generation > 0),
     CONSTRAINT wallet_backup_blobs_stream_chk
-        CHECK (stream IN ('keychain_manifest', 'wallet_metadata')),
+        CHECK (stream = 'wallet_backup'),
     CONSTRAINT wallet_backup_blobs_author_pubkey_len_chk
         CHECK (octet_length(author_pubkey) = 32),
     CONSTRAINT wallet_backup_blobs_etag_len_chk
@@ -93,9 +93,9 @@ CREATE INDEX wallet_backup_blobs_tombstone_cleanup_idx
     WHERE deleted_at IS NOT NULL;
 
 COMMENT ON TABLE wallet_backup_blobs IS
-    'Current opaque encrypted keychain or wallet-metadata backup per stream-specific signing key.';
+    'Current opaque encrypted unified wallet backup per signing key.';
 COMMENT ON COLUMN wallet_backup_blobs.author_pubkey IS
-    'Raw 32-byte x-only BIP340 public key; distinct backup streams use distinct keys.';
+    'Raw 32-byte x-only BIP340 public key for the wallet-backup signing identity.';
 COMMENT ON COLUMN wallet_backup_blobs.ciphertext IS
     'Client-encrypted opaque bytes. NULL only for a short-lived conditional-delete tombstone.';
 
