@@ -4979,6 +4979,7 @@ pub struct InvoiceListItem {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct MerchantFiatSettlementEntry {
     pub amount_minor: Option<i64>,
+    pub quoted_amount_minor: Option<i64>,
     pub currency: String,
     pub order_id: Uuid,
     pub status: String,
@@ -4995,9 +4996,11 @@ pub struct MerchantBitcoinSettlementEntry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MerchantSettlementDetails {
     Fiat {
+        fiat_percentage: Option<i16>,
         fiat: Vec<MerchantFiatSettlementEntry>,
     },
     Mixed {
+        fiat_percentage: Option<i16>,
         bitcoin: Vec<MerchantBitcoinSettlementEntry>,
         fiat: Vec<MerchantFiatSettlementEntry>,
     },
@@ -5014,6 +5017,9 @@ struct MerchantInvoiceSettlementProjection {
     fiat_only: Vec<MerchantFiatSettlementEntry>,
     mixed_bitcoin: Vec<MerchantBitcoinSettlementEntry>,
     mixed_fiat: Vec<MerchantFiatSettlementEntry>,
+    /// The split captured on the settlement row at payment time. Reused, never
+    /// re-read from current product config; null for rows predating the column.
+    fiat_percentage: Option<i16>,
     fallback_reasons: Vec<String>,
 }
 
@@ -5047,10 +5053,14 @@ fn merchant_invoice_settlement_projections(
             "unavailable" | "integrity_error" => "unavailable",
             _ => continue,
         };
+        projection.fiat_percentage = projection.fiat_percentage.or(row
+            .fiat_percentage
+            .filter(|percentage| (1..=100).contains(percentage)));
         let fiat = MerchantFiatSettlementEntry {
             amount_minor: (status == "settled")
                 .then_some(row.credited_fiat_minor)
                 .flatten(),
+            quoted_amount_minor: row.quoted_fiat_minor.filter(|amount| *amount > 0),
             currency: row.fiat_currency,
             order_id,
             status: status.to_owned(),
@@ -5201,11 +5211,13 @@ pub async fn list_signed(
             let settlement_details =
                 if !projection.mixed_bitcoin.is_empty() && !projection.mixed_fiat.is_empty() {
                     Some(MerchantSettlementDetails::Mixed {
+                        fiat_percentage: projection.fiat_percentage,
                         bitcoin: projection.mixed_bitcoin,
                         fiat: projection.mixed_fiat,
                     })
                 } else if !projection.fiat_only.is_empty() {
                     Some(MerchantSettlementDetails::Fiat {
+                        fiat_percentage: projection.fiat_percentage,
                         fiat: projection.fiat_only,
                     })
                 } else {

@@ -254,6 +254,7 @@ fn parse_created_order(
     if expires_at_unix <= chrono::Utc::now().timestamp() {
         return Err(BullBitcoinError::Integrity);
     }
+    let quoted_fiat = parse_optional_fiat_field(order, "payoutAmount")?;
     Ok(CreatedSellOrder {
         order_id,
         currency,
@@ -261,6 +262,7 @@ fn parse_created_order(
         requested_bitcoin,
         instruction,
         expires_at_unix: Some(expires_at_unix),
+        quoted_fiat,
     })
 }
 
@@ -287,6 +289,10 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
     };
     let provider_terminal =
         is_terminal_provider_outcome(&order_status, &payin_status, &payout_status);
+    // The locked fiat quote is present at any payout status, including a
+    // repriced late payment. It is captured independently of the settled
+    // credit so a pending leg can already show its amount.
+    let quoted_fiat_minor = parse_optional_fiat_field(order, "payoutAmount")?;
     let credited_fiat_minor = if payout_status == "Completed" && !provider_terminal {
         Some(parse_fiat_field(order, "payoutAmount")?)
     } else {
@@ -305,6 +311,7 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         payout_status,
         actual_received_sat,
         credited_fiat_minor,
+        quoted_fiat_minor,
         provider_final,
         provider_terminal,
     })
@@ -457,6 +464,20 @@ fn parse_fiat_field(value: &Value, field: &str) -> Result<FiatAmountMinor, BullB
         .map_err(|_| BullBitcoinError::MalformedResponse)
 }
 
+/// Parse a fiat field that may be absent. A missing or JSON-null field yields
+/// `None`; a present field must still be a well-formed positive amount, so a
+/// malformed value fails closed rather than silently dropping the quote.
+fn parse_optional_fiat_field(
+    value: &Value,
+    field: &str,
+) -> Result<Option<FiatAmountMinor>, BullBitcoinError> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(field_value) if field_value.is_null() => Ok(None),
+        Some(_) => parse_fiat_field(value, field).map(Some),
+    }
+}
+
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, BullBitcoinError> {
     value
         .get(field)
@@ -574,6 +595,9 @@ mod tests {
             created.instruction,
             PayerInstruction::Bitcoin { .. }
         ));
+        // The create response's payoutAmount is the locked quote, captured even
+        // though the order is not yet paid.
+        assert_eq!(created.quoted_fiat.unwrap().as_minor(), 5_025);
 
         let (headers, body) = capture.0.lock().await.take().unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
@@ -766,6 +790,7 @@ mod tests {
         .unwrap();
         assert_eq!(observation.actual_received_sat, Some(100_001));
         assert_eq!(observation.credited_fiat_minor.unwrap().as_minor(), 6_123);
+        assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 6_123);
         assert!(observation.provider_final);
         assert!(!observation.provider_terminal);
     }
@@ -804,6 +829,9 @@ mod tests {
             assert!(!observation.provider_final);
             assert_eq!(observation.actual_received_sat, Some(100_001));
             assert_eq!(observation.credited_fiat_minor, None);
+            // The locked quote is captured even at a terminal payout, where no
+            // amount is ever credited.
+            assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 6_123);
         }
     }
 
@@ -839,7 +867,26 @@ mod tests {
                 "nonterminal outcome was classified as terminal: {order_status}/{payin_status}/{payout_status}"
             );
             assert!(!observation.provider_final);
+            // The quote is parsed at any non-Completed payout status, so a
+            // pending fiat leg can already display its locked amount.
+            assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 6_123);
+            assert_eq!(observation.credited_fiat_minor, None);
         }
+    }
+
+    #[test]
+    fn observation_without_payout_amount_has_no_quote() {
+        let observation = parse_order_observation(&serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payoutCurrency": "CAD",
+            "orderStatus": "In progress",
+            "payinStatus": "Awaiting payment",
+            "payoutStatus": "Not started",
+            "payinAmount": 0.001
+        }))
+        .unwrap();
+        assert_eq!(observation.quoted_fiat_minor, None);
+        assert_eq!(observation.credited_fiat_minor, None);
     }
 
     #[test]

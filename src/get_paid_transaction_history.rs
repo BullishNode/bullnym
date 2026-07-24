@@ -66,6 +66,7 @@ pub enum GetPaidSettlementKind {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct GetPaidFiatSettlementLeg {
     pub amount_minor: Option<i64>,
+    pub quoted_amount_minor: Option<i64>,
     pub currency: String,
     pub order_id: Uuid,
     pub status: String,
@@ -82,9 +83,11 @@ pub struct GetPaidBitcoinSettlementLeg {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GetPaidSettlementDetails {
     Fiat {
+        fiat_percentage: Option<i16>,
         fiat: Vec<GetPaidFiatSettlementLeg>,
     },
     Mixed {
+        fiat_percentage: Option<i16>,
         bitcoin: Vec<GetPaidBitcoinSettlementLeg>,
         fiat: Vec<GetPaidFiatSettlementLeg>,
     },
@@ -382,8 +385,20 @@ fn project_merchant_settlement(
         "pending" | "unavailable" => None,
         _ => return (GetPaidSettlementKind::Unavailable, None, None),
     };
+    // The locked quote is shown while pending and after settlement alike. It is
+    // never fabricated: a missing or nonpositive stored value collapses to null
+    // rather than to a guessed amount.
+    let quoted_amount_minor = transaction
+        .settlement_quoted_fiat_minor
+        .filter(|amount| *amount > 0);
+    // The split percentage captured at payment time. Out-of-range values are
+    // treated as unknown (null); the current product config is never consulted.
+    let fiat_percentage = transaction
+        .settlement_fiat_percentage
+        .filter(|percentage| (1..=100).contains(percentage));
     let fiat = GetPaidFiatSettlementLeg {
         amount_minor,
+        quoted_amount_minor,
         currency: currency.to_owned(),
         order_id,
         status: status.to_owned(),
@@ -392,7 +407,10 @@ fn project_merchant_settlement(
     match transaction.settlement_purpose.as_deref() {
         Some("fiat_only") => (
             GetPaidSettlementKind::Fiat,
-            Some(GetPaidSettlementDetails::Fiat { fiat: vec![fiat] }),
+            Some(GetPaidSettlementDetails::Fiat {
+                fiat_percentage,
+                fiat: vec![fiat],
+            }),
             None,
         ),
         Some("mixed") => {
@@ -412,6 +430,7 @@ fn project_merchant_settlement(
             (
                 GetPaidSettlementKind::Mixed,
                 Some(GetPaidSettlementDetails::Mixed {
+                    fiat_percentage,
                     bitcoin: vec![GetPaidBitcoinSettlementLeg {
                         amount_sat,
                         network: "liquid",
@@ -461,6 +480,8 @@ mod tests {
             settlement_currency: Some("CAD".into()),
             settlement_status_detail: Some("settled".into()),
             settlement_credited_fiat_minor: Some(12_345),
+            settlement_quoted_fiat_minor: Some(12_345),
+            settlement_fiat_percentage: Some(100),
             settlement_funding_route: Some("bull_bitcoin".into()),
             settlement_fallback_category: None,
             settlement_bitcoin_amount_sat: None,
@@ -496,6 +517,8 @@ mod tests {
             settlement_currency: None,
             settlement_status_detail: None,
             settlement_credited_fiat_minor: None,
+            settlement_quoted_fiat_minor: None,
+            settlement_fiat_percentage: None,
             settlement_funding_route: None,
             settlement_fallback_category: None,
             settlement_bitcoin_amount_sat: None,
@@ -539,6 +562,8 @@ mod tests {
             settlement_currency: None,
             settlement_status_detail: None,
             settlement_credited_fiat_minor: None,
+            settlement_quoted_fiat_minor: None,
+            settlement_fiat_percentage: None,
             settlement_funding_route: None,
             settlement_fallback_category: None,
             settlement_bitcoin_amount_sat: None,
@@ -623,14 +648,21 @@ mod tests {
             fiat["settlement_details"]["fiat"][0]["amount_minor"],
             12_345
         );
+        assert_eq!(
+            fiat["settlement_details"]["fiat"][0]["quoted_amount_minor"],
+            12_345
+        );
+        assert_eq!(fiat["settlement_details"]["fiat_percentage"], 100);
 
         let mut mixed = settlement_transaction();
         mixed.settlement_purpose = Some("mixed".into());
+        mixed.settlement_fiat_percentage = Some(40);
         mixed.settlement_bitcoin_amount_sat = Some(60_000);
         mixed.settlement_bitcoin_status = Some("settled".into());
         let mixed = serde_json::to_value(project_transaction(mixed).unwrap()).unwrap();
         assert_eq!(mixed["settlement_kind"], "mixed");
         assert_eq!(mixed["settlement_details"]["kind"], "mixed");
+        assert_eq!(mixed["settlement_details"]["fiat_percentage"], 40);
         assert_eq!(
             mixed["settlement_details"]["bitcoin"][0]["amount_sat"],
             60_000
@@ -655,9 +687,15 @@ mod tests {
         let pending =
             serde_json::to_value(project_transaction(pending_with_amount).unwrap()).unwrap();
         assert_eq!(pending["settlement_kind"], "fiat");
+        // v2: the credited amount stays null while pending, but the locked quote
+        // is exposed so the merchant sees the fiat value immediately.
         assert_eq!(
             pending["settlement_details"]["fiat"][0]["amount_minor"],
             Value::Null
+        );
+        assert_eq!(
+            pending["settlement_details"]["fiat"][0]["quoted_amount_minor"],
+            12_345
         );
 
         let mut mixed_without_bitcoin = settlement_transaction();
@@ -668,21 +706,77 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fixture_pins_all_version_one_shapes() {
+    fn projection_v2_nulls_missing_quote_and_percentage_without_fabricating() {
+        // A legacy row predating the quote/percentage columns, or an anomalous
+        // nonpositive/out-of-range stored value, projects JSON null rather than
+        // a guessed amount or percentage.
+        let mut legacy = settlement_transaction();
+        legacy.settlement_quoted_fiat_minor = None;
+        legacy.settlement_fiat_percentage = None;
+        let legacy = serde_json::to_value(project_transaction(legacy).unwrap()).unwrap();
+        assert_eq!(legacy["settlement_kind"], "fiat");
+        assert_eq!(
+            legacy["settlement_details"]["fiat"][0]["amount_minor"],
+            12_345
+        );
+        assert_eq!(
+            legacy["settlement_details"]["fiat"][0]["quoted_amount_minor"],
+            Value::Null
+        );
+        assert_eq!(legacy["settlement_details"]["fiat_percentage"], Value::Null);
+
+        let mut anomalous = settlement_transaction();
+        anomalous.settlement_status_detail = Some("pending".into());
+        anomalous.settlement_quoted_fiat_minor = Some(0);
+        anomalous.settlement_fiat_percentage = Some(0);
+        let anomalous = serde_json::to_value(project_transaction(anomalous).unwrap()).unwrap();
+        assert_eq!(
+            anomalous["settlement_details"]["fiat"][0]["quoted_amount_minor"],
+            Value::Null
+        );
+        assert_eq!(
+            anomalous["settlement_details"]["fiat_percentage"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn canonical_fixture_pins_all_version_two_shapes() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../docs/api/fixtures/get-paid-transactions-settlement-v1.json"
+            "../docs/api/fixtures/get-paid-transactions-settlement-v2.json"
         ))
         .unwrap();
         let transactions = fixture["transactions"].as_array().unwrap();
-        assert_eq!(transactions.len(), 6);
+        assert_eq!(transactions.len(), 7);
         assert_eq!(transactions[0]["settlement_kind"], "bitcoin");
         assert_eq!(transactions[1]["fiat_conversion"]["status"], "overridden");
-        assert_eq!(
-            transactions[2]["settlement_details"]["fiat"][0]["amount_minor"],
-            Value::Null
-        );
-        assert_eq!(transactions[3]["settlement_details"]["kind"], "fiat");
-        assert_eq!(transactions[4]["settlement_details"]["kind"], "mixed");
-        assert_eq!(transactions[5]["settlement_kind"], "unavailable");
+
+        // Pending fiat leg: no credited amount yet, but the locked quote and the
+        // captured split percentage are already exposed.
+        let pending = &transactions[2]["settlement_details"];
+        assert_eq!(pending["kind"], "fiat");
+        assert_eq!(pending["fiat_percentage"], 100);
+        assert_eq!(pending["fiat"][0]["amount_minor"], Value::Null);
+        assert_eq!(pending["fiat"][0]["quoted_amount_minor"], 5000);
+
+        // Settled fiat leg valued late: credited differs from the earlier quote.
+        let settled = &transactions[3]["settlement_details"];
+        assert_eq!(settled["kind"], "fiat");
+        assert_eq!(settled["fiat"][0]["amount_minor"], 12345);
+        assert_eq!(settled["fiat"][0]["quoted_amount_minor"], 12000);
+
+        // Mixed settlement exposes the captured split at the details level.
+        let mixed = &transactions[4]["settlement_details"];
+        assert_eq!(mixed["kind"], "mixed");
+        assert_eq!(mixed["fiat_percentage"], 40);
+        assert_eq!(mixed["fiat"][0]["quoted_amount_minor"], 12345);
+
+        // Legacy row predating the columns: quote and percentage are JSON null.
+        let legacy = &transactions[5]["settlement_details"];
+        assert_eq!(legacy["fiat_percentage"], Value::Null);
+        assert_eq!(legacy["fiat"][0]["quoted_amount_minor"], Value::Null);
+        assert_eq!(legacy["fiat"][0]["amount_minor"], 12345);
+
+        assert_eq!(transactions[6]["settlement_kind"], "unavailable");
     }
 }

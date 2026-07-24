@@ -413,6 +413,8 @@ pub struct CreatedSellOrder {
     pub requested_bitcoin: BitcoinAmountSat,
     pub instruction: PayerInstruction,
     pub expires_at_unix: Option<i64>,
+    /// The fiat amount locked (quoted) at order creation, when present.
+    pub quoted_fiat: Option<FiatAmountMinor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,6 +426,10 @@ pub struct OrderObservation {
     pub payout_status: String,
     pub actual_received_sat: Option<i64>,
     pub credited_fiat_minor: Option<FiatAmountMinor>,
+    /// The locked fiat quote (payoutAmount) observed for this order at any
+    /// payout status. Distinct from `credited_fiat_minor`, which is only the
+    /// settled amount at a final payout.
+    pub quoted_fiat_minor: Option<FiatAmountMinor>,
     pub provider_final: bool,
     pub provider_terminal: bool,
 }

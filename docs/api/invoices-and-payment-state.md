@@ -323,6 +323,41 @@ defaults to three Bitcoin and two Liquid confirmations. Zero-confirmation
 evidence changes only presentation and settlement. Bitcoin observation details
 expose txid/vout, amount, confirmations, block height, state, and timestamps.
 
+### Fiat settlement details
+
+The signed, npub-verified merchant invoice list additionally exposes
+`settlement_details` when the invoice has a Bull Bitcoin fiat settlement. It is
+never present on public invoice, LNURL, or Page/POS reads. Its shape mirrors the
+Get Paid transaction-history projection, so the field semantics — including
+quoted-vs-credited amounts and the late-payment repricing caveat — are the ones
+documented in [`get-paid-transaction-history.md`](get-paid-transaction-history.md):
+
+```json
+{
+  "kind": "fiat",
+  "fiat_percentage": 100,
+  "fiat": [
+    {
+      "amount_minor": null,
+      "quoted_amount_minor": 5000,
+      "currency": "CAD",
+      "order_id": "40000000-0000-4000-8000-000000000001",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+- `kind` is `fiat` or `mixed`; a `mixed` object also carries a `bitcoin` array.
+- `fiat_percentage` is the split that applied **at payment time**, captured on
+  the settlement and reused — never re-read from the merchant's current product
+  config. It is an integer `1..=100` (`100` for `fiat`, `1..=99` for `mixed`),
+  or `null` for a settlement predating the captured column.
+- Each fiat leg's `amount_minor` is the credited amount (present only once
+  `settled`); `quoted_amount_minor` is the fiat amount locked at order creation
+  and is present while `pending` as well as `settled`. Both are `null` rather
+  than fabricated when unknown.
+
 ## `POST /api/v1/invoices/:id/lightning`
 
 Returns `{ "pr": "lnbc...", "lightning_amount_sat": 10050 }`. The two

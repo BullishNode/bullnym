@@ -398,6 +398,7 @@ async fn create_fiat_only_instruction_locked(
                 instruction,
                 order.expires_at_unix,
                 retention_secs,
+                order.quoted_fiat.map(|quote| quote.as_minor()),
             )
             .await
             .map_err(|_| SettlementServiceError::Database)?;
@@ -811,6 +812,7 @@ async fn prepare_mixed_settlement_locked(
                     confidential_address,
                 },
             expires_at_unix,
+            quoted_fiat,
         }) if order_currency == currency && requested_bitcoin == amount => {
             if liquid_script_pubkey_len(&confidential_address)
                 != Some(basis.additional_output_script_len)
@@ -838,6 +840,7 @@ async fn prepare_mixed_settlement_locked(
                 &confidential_address,
                 expires_at_unix,
                 retention_secs,
+                quoted_fiat.map(|quote| quote.as_minor()),
             )
             .await
             .map_err(|_| SettlementServiceError::Database)?;
