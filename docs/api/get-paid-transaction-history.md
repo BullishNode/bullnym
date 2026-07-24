@@ -72,6 +72,7 @@ unavailable presentation.
 ```json
 {
   "kind": "mixed",
+  "fiat_percentage": 40,
   "bitcoin": [
     {
       "amount_sat": 60000,
@@ -82,6 +83,7 @@ unavailable presentation.
   "fiat": [
     {
       "amount_minor": 12345,
+      "quoted_amount_minor": 12345,
       "currency": "CAD",
       "order_id": "40000000-0000-4000-8000-000000000001",
       "status": "settled"
@@ -99,10 +101,33 @@ The detail invariants are:
 - `currency` is an uppercase supported fiat currency and `order_id` is a
   non-nil UUID on every fiat leg.
 - Fiat-leg `status` is `pending`, `settled`, or `unavailable`.
-  `amount_minor` is a strictly positive integer only for `settled`; it is JSON
-  `null` for `pending` and `unavailable`. Zero is never a pending sentinel.
+  `amount_minor` is the merchant-authoritative **credited** amount: a strictly
+  positive integer only for `settled`; it is JSON `null` for `pending` and
+  `unavailable`. Zero is never a pending sentinel.
+- `quoted_amount_minor` is the fiat amount **locked (quoted)** at order
+  creation, at zero-conf. It is a strictly positive integer whenever a quote is
+  known — for `pending` legs as well as `settled` ones — so a merchant sees the
+  fiat value immediately. It is JSON `null` when no quote is known (a legacy row
+  predating the quote column, or an unavailable leg). It is never fabricated.
+- `settlement_details.fiat_percentage` is the configured split percentage that
+  applied at payment time, captured on the settlement — never re-read from the
+  merchant's current product config. It is an integer `1..=100` (`100` for a
+  `fiat` kind, `1..=99` for `mixed`) and applies to both `fiat` and `mixed`
+  kinds. It is JSON `null` for a legacy row predating the captured column.
 - An invalid or internally inconsistent set of legs produces the top-level
   `unavailable` classification without partial details.
+
+### Quoted vs credited, and late payments
+
+`quoted_amount_minor` and `amount_minor` are deliberately distinct. The quote is
+authoritative within its quote window. API-Orders keeps a deposit payable after
+its "Payment deadline expired" state and values a **late** payment at the then
+applicable (new) rate, so the eventually credited amount can differ from the
+originally locked quote. Bullnym re-observes the quote on every poll, so the
+exposed `quoted_amount_minor` tracks any repricing; the `settled`
+`amount_minor` remains the exact credited amount. Clients should show
+`quoted_amount_minor` while a leg is `pending` and the credited `amount_minor`
+once it is `settled`.
 
 `fiat_conversion` is present only with `settlement_kind: "bitcoin"` when an
 attempted conversion was overridden before a Bull Bitcoin destination became
@@ -144,10 +169,26 @@ Corruption in optional settlement evidence fails closed on that transaction as
 time, or payment state fails the entire request instead of silently omitting a
 payment from the merchant's history.
 
-The canonical version-one response fixtures are in
-[`fixtures/get-paid-transactions-settlement-v1.json`](fixtures/get-paid-transactions-settlement-v1.json).
+The canonical response fixtures are in
+[`fixtures/get-paid-transactions-settlement-v2.json`](fixtures/get-paid-transactions-settlement-v2.json).
 Server and client contract tests must parse those values without rewriting the
-field names, enum strings, nulls, or array shapes.
+field names, enum strings, nulls, or array shapes. The superseded version-one
+fixtures remain at
+[`fixtures/get-paid-transactions-settlement-v1.json`](fixtures/get-paid-transactions-settlement-v1.json)
+for historical reference only.
+
+## Changelog
+
+### v2 (bullnym release 0.2) — contract-breaking
+
+This revises the v1 fiat-leg invariant. v1 exposed a fiat amount only once a
+settlement was final (`amount_minor` for `settled`, `null` otherwise) and had no
+split field. v2 adds `quoted_amount_minor` on every fiat leg (the locked quote,
+present while `pending`) and `fiat_percentage` on `settlement_details` (the
+captured split). `amount_minor` keeps its exact v1 meaning: the credited amount,
+present only for `settled`. Because v1 clients fail closed on unknown or
+violated shapes, a v1 client treats a v2 response's added fields as an
+inconsistent shape and must upgrade to read the quote and split.
 
 `transaction_id` is a stable server-selected identity for the user payment.
 Ordinary Lightning Address rows use `swap_records.id`, and ordinary

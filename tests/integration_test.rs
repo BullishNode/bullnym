@@ -546,6 +546,7 @@ fn scripted_created_order(order_id: Uuid) -> CreatedSellOrder {
                 .into(),
         },
         expires_at_unix: Some(2_000_000_000),
+        quoted_fiat: None,
     }
 }
 
@@ -624,6 +625,7 @@ fn scripted_liquid_order_at(
             confidential_address,
         },
         expires_at_unix: Some(2_000_000_000),
+        quoted_fiat: None,
     }
 }
 
@@ -3004,6 +3006,7 @@ async fn get_paid_history_marks_terminal_mixed_fiat_outcome_as_problem() {
         payout_status: "Failed".into(),
         actual_received_sat: Some(40_100),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
         provider_final: false,
         provider_terminal: true,
     }))
@@ -3149,6 +3152,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         payout_status: "Completed".into(),
         actual_received_sat: Some(40_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -3484,6 +3488,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         transactions[0]["settlement_details"],
         json!({
             "kind": "mixed",
+            "fiat_percentage": 40,
             "bitcoin": [{
                 "amount_sat": 60_000,
                 "network": "liquid",
@@ -3491,6 +3496,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
             }],
             "fiat": [{
                 "amount_minor": 12_345,
+                "quoted_amount_minor": null,
                 "currency": "CAD",
                 "order_id": order_id,
                 "status": "settled",
@@ -3742,6 +3748,7 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
         payout_status: "Completed".into(),
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -3827,6 +3834,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
             // The persistence boundary must not trust an amount attached to a
             // provider-declared terminal failure.
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+            quoted_fiat_minor: None,
             provider_final: false,
             provider_terminal: true,
         }))
@@ -3917,6 +3925,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
         payout_status: "Not started".into(),
         actual_received_sat: None,
         credited_fiat_minor: None,
+        quoted_fiat_minor: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -3965,6 +3974,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         payout_status: "Not started".into(),
         actual_received_sat: None,
         credited_fiat_minor: None,
+        quoted_fiat_minor: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -3977,6 +3987,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         payout_status: "Completed".into(),
         actual_received_sat: Some(25_001),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -4045,6 +4056,7 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         payout_status: "Completed".into(),
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -4134,8 +4146,10 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         transactions[0]["settlement_details"],
         json!({
             "kind": "fiat",
+            "fiat_percentage": 100,
             "fiat": [{
                 "amount_minor": 12_345,
+                "quoted_amount_minor": null,
                 "currency": "CAD",
                 "order_id": order_id,
                 "status": "settled",
@@ -4300,6 +4314,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
             payout_status: "Completed".into(),
             actual_received_sat: Some(27_500),
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+            quoted_fiat_minor: None,
             provider_final: true,
             provider_terminal: false,
         },
@@ -4406,8 +4421,10 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
         transactions[0]["settlement_details"],
         json!({
             "kind": "fiat",
+            "fiat_percentage": 100,
             "fiat": [{
                 "amount_minor": 12_345,
+                "quoted_amount_minor": null,
                 "currency": "CAD",
                 "order_id": order_id,
                 "status": "settled",
@@ -4477,7 +4494,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "069_bull_bitcoin_mixed_settlement"
+        "070_bull_bitcoin_quoted_fiat"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -4718,7 +4735,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "069_bull_bitcoin_mixed_settlement"
+        "070_bull_bitcoin_quoted_fiat"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")

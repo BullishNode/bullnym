@@ -686,6 +686,7 @@ pub async fn load_bull_bitcoin_credential(
     .transpose()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn bind_bull_bitcoin_order(
     connection: &mut PgConnection,
     settlement_id: Uuid,
@@ -694,6 +695,7 @@ pub async fn bind_bull_bitcoin_order(
     payer_instruction: &str,
     instruction_expires_at_unix: Option<i64>,
     retention_secs: i64,
+    quoted_fiat_minor: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE bull_bitcoin_settlements \
@@ -709,6 +711,7 @@ pub async fn bind_bull_bitcoin_order(
                 instruction_expires_at = CASE WHEN $5::BIGINT IS NULL \
                     THEN NULL ELSE to_timestamp($5) END, \
                 retention_until = now() + make_interval(secs => $6::DOUBLE PRECISION), \
+                quoted_fiat_minor = $7, \
                 next_attempt_at = now(), updated_at = now() \
           WHERE id = $1 AND provider_state = 'dispatch_started' \
             AND funding_route IS NULL",
@@ -719,6 +722,7 @@ pub async fn bind_bull_bitcoin_order(
     .bind(payer_instruction)
     .bind(instruction_expires_at_unix)
     .bind(retention_secs)
+    .bind(quoted_fiat_minor)
     .execute(connection)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -997,6 +1001,7 @@ pub async fn record_bull_bitcoin_observation(
             SET order_status = $2, payin_status = $3, payout_status = $4, \
                 actual_received_sat = $5, \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
+                quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
                 provider_final = $7, \
                 settlement_status = CASE \
                     WHEN $7 THEN 'settled' \
@@ -1028,6 +1033,11 @@ pub async fn record_bull_bitcoin_observation(
     .bind(observation.provider_final)
     .bind(observation.provider_terminal)
     .bind(next_poll_secs)
+    .bind(
+        observation
+            .quoted_fiat_minor
+            .map(|amount| amount.as_minor()),
+    )
     .execute(pool)
     .await?;
     Ok(())
