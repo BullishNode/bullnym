@@ -10,7 +10,7 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // Bumped v1 -> v2 to purge invoice/private pages cached by older builds.
 // Only responses marked with x-bullnym-pwa-shell are cached now.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
-const PRECACHE_URLS = ["/pwa-assets/assets/invoice-D2pcay6w.css","/pwa-assets/assets/BullFooter-CcRwK329.css","/pwa-assets/assets/PayFlow-Pi4NITgY.css","/pwa-assets/assets/donation-BdbeURwr.js","/pwa-assets/assets/invoice-CpJYAhnS.js","/pwa-assets/assets/pos-BJqmJ7t5.js","/pwa-assets/assets/BullFooter-BNTRX5b3.js","/pwa-assets/assets/PayFlow-DuASDAV-.js","/pwa-assets/assets/browser-CjSdxGTc.js"]
+const PRECACHE_URLS = ["/pwa-assets/assets/invoice-D2pcay6w.css","/pwa-assets/assets/BullFooter-CcRwK329.css","/pwa-assets/assets/PayFlow-N4GQsatj.css","/pwa-assets/assets/donation-BIGhlacI.js","/pwa-assets/assets/invoice-DT1pGvgV.js","/pwa-assets/assets/pos-BaCivk0o.js","/pwa-assets/assets/BullFooter-aiBaqL7X.js","/pwa-assets/assets/PayFlow-CaLwOsxN.js","/pwa-assets/assets/browser-CjSdxGTc.js"]
 // Synthetic cache entry recording the PREVIOUS deploy's precache list. Never
 // requested by a page (not under /pwa-assets/), so no fetch handler serves it.
 const PREV_PRECACHE_SENTINEL = '/__bullnym/prev-precache'

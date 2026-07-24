@@ -34,7 +34,7 @@
     onSuccessAction,
     successSecondaryLabel,
     onSuccessSecondary,
-    onPaid,
+    onRecord,
     onExit,
     autoExitExpired = true,
     paymentContextKey = config.page_key,
@@ -47,13 +47,16 @@
     successSecondaryLabel?: string
     onSuccessSecondary?: () => void
     /**
-     * POS: history.add(...) — fires for BOTH paid and overpaid (money WAS
-     * received). Donation: omitted. Receives the full loaded context (note/
-     * precision/currency/fiatAmountMinor) alongside the terminal status
-     * since HistoryRecord needs fields InvoiceStatus alone can't always
-     * supply (precision, the merchant note) — see PayScreen.svelte's onPaid.
+     * POS: history.add(...) — records a completed sale (B2). Fires as soon as
+     * payment evidence appears and again on each recorded-status transition
+     * (partial → settling → paid, plus incidents), NOT only at terminal paid,
+     * so the sales list carries every sale with money received. Donation:
+     * omitted. Receives the full loaded context (note/precision/currency/
+     * fiatAmountMinor) alongside the current status since HistoryRecord needs
+     * fields InvoiceStatus alone can't supply (precision, the merchant note) —
+     * see PayScreen.svelte's onRecord.
      */
-    onPaid?: (status: InvoiceStatus, ctx: CachedInvoice) => void
+    onRecord?: (status: InvoiceStatus, ctx: CachedInvoice) => void
     /** Navigate back to the entry screen ('/'). Called automatically ~1.8s after an 'expired' terminal state (matching the pre-rewrite POS grace period), and by every other terminal panel's action button. */
     onExit: () => void
     /** POS/Donation return to their entry screen after expiry; standalone
@@ -115,9 +118,10 @@
   function handleTerminal(t: TerminalState) {
     canCancel = false
     terminal = t
-    if ((t.kind === 'paid' || t.kind === 'overpaid') && loaded) {
-      onPaid?.(t.status, loaded)
-    }
+  }
+
+  function handleEvidence(status: InvoiceStatus) {
+    if (loaded) onRecord?.(status, loaded)
   }
 
   // ---------------------------------------------------------------------
@@ -300,6 +304,7 @@
           nym={paymentContextKey}
           {amountLabel}
           onTerminal={handleTerminal}
+          onEvidence={handleEvidence}
           onCancelableChange={(value) => (canCancel = value)}
         />
       {/if}

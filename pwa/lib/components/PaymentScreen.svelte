@@ -7,7 +7,7 @@
   // polling and reports exactly once via onTerminal; PayFlow.svelte owns
   // the terminal panels (paid/overpaid/underpaid/expired/cancelled/
   // refunded/not_found), since it also owns the per-mode success actions
-  // and the onPaid side effect (history.add for POS).
+  // and the onRecord side effect (history.add for POS, B2).
   //
   // Full rewrite for PR #5 review remediation (items 1,4,5,6,10). The
   // reference for ALL payment semantics is the inline JS state machine in
@@ -39,6 +39,8 @@
   import {
     bitcoinPaymentPayloadFromStatus,
     derivePayView,
+    hasPaymentEvidence,
+    payViewRecordStatus,
     isTerminalView,
     isCancelableStatus,
     shouldPollDetail,
@@ -94,6 +96,7 @@
     nym,
     amountLabel,
     onTerminal,
+    onEvidence,
     onCancelableChange,
   }: {
     invoice: CreateInvoiceResponse
@@ -101,6 +104,12 @@
     amountLabel: string
     /** Fires exactly once, the first time the invoice reaches a terminal PayView (see lib/status.ts's TerminalState / CONTRACT 5). */
     onTerminal: (t: TerminalState) => void
+    /** POS completed-sales recording (B2). Fires the first time the invoice
+     * shows payment evidence and again whenever the recorded status token
+     * changes (partial → settling → paid, incidents), so the history list can
+     * carry every partially/pending/settling sale, not only terminal paid.
+     * Deduplication by invoice id lives in the history store. */
+    onEvidence?: (status: InvoiceStatus) => void
     /** Enables the outer Cancel/Back affordance only for a positively known
      * no-evidence state. */
     onCancelableChange?: (cancelable: boolean) => void
@@ -695,6 +704,9 @@
   let tickHandle: ReturnType<typeof setInterval> | undefined
   let stopped = false
   let notFoundStreak = 0
+  // Last record-status token reported to onEvidence, so we record on the first
+  // evidence transition and only re-record when the token actually changes.
+  let lastEvidenceStatus: string | null = null
   let remainingMs = $state(Math.max(0, untrack(() => invoice.expires_at_unix) * 1000 - Date.now()))
 
   const countdown = $derived.by(() => {
@@ -792,6 +804,13 @@
       void maybeRefreshLightning()
 
       const v = derivePayView(status)
+      if (hasPaymentEvidence(v)) {
+        const recordStatus = payViewRecordStatus(v)
+        if (recordStatus !== lastEvidenceStatus) {
+          lastEvidenceStatus = recordStatus
+          onEvidence?.(status)
+        }
+      }
       if (!showsRails(v)) stopCardScan()
       if (isTerminalView(v)) {
         stopPolling()
@@ -1042,6 +1061,19 @@
   </div>
 
   {#if showsRails(view)}
+    {#if usesPayerDemand && tabs.length === 0}
+      <!-- No rail can be quoted right now (all quote_rail_availability false /
+           server 503 "invoice quote is changing"). This is NOT a
+           Lightning-specific outage, so show a rail-neutral message rather than
+           "Lightning is temporarily unavailable". -->
+      <div
+        class="mx-auto grid w-full max-w-sm place-items-center gap-3 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-8 text-center text-sm text-[#776b5a] shadow-sm dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
+        role="status"
+      >
+        <span>Payment temporarily unavailable — the rate quote is being prepared. Try again shortly.</span>
+        <Button variant="secondary" onclick={refreshNow} disabled={refreshing}>Try again</Button>
+      </div>
+    {:else}
     <div
       class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]"
       role="tablist"
@@ -1162,6 +1194,7 @@
     <p class="text-center text-xs text-[#776b5a] tabular-nums dark:text-[#b9aa91]">
       {isFiatFixed ? 'Quote' : 'Invoice'} expires in {isFiatFixed ? fiatQuoteCountdown : (isSatPayerDemand ? satInstructionCountdown : countdown)}
     </p>
+    {/if}
   {:else}
     <div class="flex flex-col items-center gap-3 py-10 text-center">
       <div

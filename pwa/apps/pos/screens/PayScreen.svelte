@@ -1,22 +1,24 @@
 <script lang="ts">
   // Thin wrapper over PayFlow.svelte (review item 3): supplies POS's header
   // row (Cancel sale + History/Settings icons), success actions (New Sale +
-  // Print Receipt), the onPaid history.add side effect (fires for BOTH paid
-  // and overpaid — money WAS received either way, so history/receipt still
-  // record it even though the discrepancy is visible), and exit navigation
-  // (back to the keypad). All invoice-loading, polling, and terminal-panel
-  // rendering now lives in PayFlow.svelte + PaymentScreen.svelte —
-  // PaymentScreen is no longer imported directly here.
+  // Print Receipt), the onRecord history.add side effect (B2: records the sale
+  // as soon as payment evidence appears and updates it on each status
+  // transition — partial/settling/pending included — so the completed-sales
+  // list carries every sale with money received, not only terminal paid), and
+  // exit navigation (back to the keypad). All invoice-loading, polling, and
+  // terminal-panel rendering now lives in PayFlow.svelte + PaymentScreen.svelte
+  // — PaymentScreen is no longer imported directly here.
   import { History, Settings } from 'lucide-svelte'
   import type { InvoiceStatus } from '$lib/api/client'
   import type { CachedInvoice } from '$lib/stores/invoiceCache'
   import { history } from '$lib/stores/history.svelte'
+  import { derivePayView, payViewRecordStatus } from '$lib/status'
   import { router } from '$lib/router.svelte'
   import PayFlow from '$lib/components/PayFlow.svelte'
 
   let { id }: { id: string } = $props()
 
-  function onPaid(status: InvoiceStatus, ctx: CachedInvoice) {
+  function onRecord(status: InvoiceStatus, ctx: CachedInvoice) {
     history.add({
       id,
       amount_fiat_minor: status.fiat_amount_minor ?? ctx.fiatAmountMinor ?? null,
@@ -24,7 +26,9 @@
       precision: ctx.precision,
       amount_sat: status.paid_amount_sat ?? status.amount_sat,
       rail: status.paid_via,
-      status: status.status,
+      // Derived from the live view, not raw status.status: a partial can report
+      // status.status==='unpaid', which would mislabel the row as waiting.
+      status: payViewRecordStatus(derivePayView(status)),
       paid_at_unix: status.paid_at_unix,
       note: ctx.note,
       rate_minor_per_btc: status.rate_minor_per_btc,
@@ -73,7 +77,7 @@
 <PayFlow
   {id}
   {header}
-  {onPaid}
+  {onRecord}
   successActionLabel="New Sale"
   onSuccessAction={newSale}
   successSecondaryLabel="Print Receipt"
