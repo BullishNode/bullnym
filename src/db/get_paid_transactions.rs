@@ -24,6 +24,8 @@ pub struct GetPaidTransaction {
     pub settlement_currency: Option<String>,
     pub settlement_status_detail: Option<String>,
     pub settlement_credited_fiat_minor: Option<i64>,
+    pub settlement_quoted_fiat_minor: Option<i64>,
+    pub settlement_fiat_percentage: Option<i16>,
     pub settlement_funding_route: Option<String>,
     pub settlement_fallback_category: Option<String>,
     pub settlement_bitcoin_amount_sat: Option<i64>,
@@ -174,6 +176,8 @@ pub async fn list_get_paid_transactions(
                     settlement.fiat_currency AS settlement_currency, \
                     settlement.settlement_status AS settlement_status_detail, \
                     settlement.credited_fiat_minor AS settlement_credited_fiat_minor, \
+                    settlement.quoted_fiat_minor AS settlement_quoted_fiat_minor, \
+                    settlement.fiat_percentage AS settlement_fiat_percentage, \
                     settlement.funding_route AS settlement_funding_route, \
                     settlement.fallback_category AS settlement_fallback_category, \
                     outputs.merchant_amount_sat AS settlement_bitcoin_amount_sat, \
@@ -211,7 +215,8 @@ pub async fn list_get_paid_transactions(
                     settlement.payer_rail, 'settled'::TEXT, FALSE, NULL::TEXT, \
                     TRUE, TRUE, settlement.purpose, settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
-                    settlement.credited_fiat_minor, settlement.funding_route, \
+                    settlement.credited_fiat_minor, settlement.quoted_fiat_minor, \
+                    settlement.fiat_percentage, settlement.funding_route, \
                     settlement.fallback_category, NULL::BIGINT, NULL::TEXT \
                FROM bull_bitcoin_settlements settlement \
               WHERE settlement.owner_npub = $1 \
@@ -227,7 +232,8 @@ pub async fn list_get_paid_transactions(
                     event.rail, event.settlement_state, event.late, event.comment, \
                     FALSE, event.fiat_policy_present, NULL::TEXT, NULL::UUID, \
                     NULL::TEXT, NULL::TEXT, \
-                    NULL::BIGINT, NULL::TEXT, NULL::TEXT, NULL::BIGINT, NULL::TEXT \
+                    NULL::BIGINT, NULL::BIGINT, NULL::SMALLINT, NULL::TEXT, \
+                    NULL::TEXT, NULL::BIGINT, NULL::TEXT \
                FROM invoice_events event \
               WHERE event.bull_bitcoin_settlement_id IS NULL \
                 AND NOT EXISTS ( \
@@ -253,7 +259,8 @@ pub async fn list_get_paid_transactions(
                     event.settlement_state, event.late, event.comment, TRUE, TRUE, \
                     settlement.purpose, settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
-                    settlement.credited_fiat_minor, settlement.funding_route, \
+                    settlement.credited_fiat_minor, settlement.quoted_fiat_minor, \
+                    settlement.fiat_percentage, settlement.funding_route, \
                     settlement.fallback_category, NULL::BIGINT, NULL::TEXT \
                FROM bull_bitcoin_settlements settlement \
                JOIN invoice_events event \
@@ -279,6 +286,7 @@ pub async fn list_get_paid_transactions(
                     event.late, event.comment, TRUE, TRUE, settlement.purpose, \
                     settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
                     settlement.settlement_status, settlement.credited_fiat_minor, \
+                    settlement.quoted_fiat_minor, settlement.fiat_percentage, \
                     settlement.funding_route, settlement.fallback_category, \
                     outputs.merchant_amount_sat, event.settlement_state \
                FROM bull_bitcoin_settlements settlement \
@@ -302,7 +310,8 @@ pub async fn list_get_paid_transactions(
                 settlement_present, fiat_policy_present, settlement_purpose, \
                 settlement_order_id, \
                 settlement_currency, settlement_status_detail, \
-                settlement_credited_fiat_minor, settlement_funding_route, \
+                settlement_credited_fiat_minor, settlement_quoted_fiat_minor, \
+                settlement_fiat_percentage, settlement_funding_route, \
                 settlement_fallback_category, settlement_bitcoin_amount_sat, \
                 settlement_bitcoin_status \
            FROM history \
