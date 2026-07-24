@@ -3452,6 +3452,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         merchant_view["invoices"][0]["settlement_details"],
         json!({
             "kind": "mixed",
+            "fiat_percentage": 40,
             "bitcoin": [{
                 "amount_sat": 60_000,
                 "network": "liquid",
@@ -3459,6 +3460,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
             }],
             "fiat": [{
                 "amount_minor": 12_345,
+                "quoted_amount_minor": null,
                 "currency": "CAD",
                 "order_id": order_id,
                 "status": "settled",
@@ -4395,8 +4397,10 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
         merchant["invoices"][0]["settlement_details"],
         json!({
             "kind": "fiat",
+            "fiat_percentage": 100,
             "fiat": [{
                 "amount_minor": 12_345,
+                "quoted_amount_minor": null,
                 "currency": "CAD",
                 "order_id": order_id,
                 "status": "settled",

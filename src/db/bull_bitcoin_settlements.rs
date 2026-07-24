@@ -157,6 +157,8 @@ pub struct InvoiceBullBitcoinSettlementProjection {
     pub fiat_currency: String,
     pub settlement_status: String,
     pub credited_fiat_minor: Option<i64>,
+    pub quoted_fiat_minor: Option<i64>,
+    pub fiat_percentage: Option<i16>,
     pub funding_route: Option<String>,
     pub fallback_category: Option<String>,
     pub merchant_bitcoin_sat: Option<i64>,
@@ -431,6 +433,7 @@ where
         "SELECT settlement.invoice_id, settlement.purpose, \
                 settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
                 settlement.settlement_status, settlement.credited_fiat_minor, \
+                settlement.quoted_fiat_minor, settlement.fiat_percentage, \
                 settlement.funding_route, settlement.fallback_category, \
                 merchant.authorized_amount_sat AS merchant_bitcoin_sat, \
                 EXISTS ( \

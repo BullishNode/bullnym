@@ -71,6 +71,8 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
             fiat_currency: "CAD".into(),
             settlement_status: "pending".into(),
             credited_fiat_minor: None,
+            quoted_fiat_minor: Some(5_000),
+            fiat_percentage: Some(100),
             funding_route: Some("bull_bitcoin".into()),
             fallback_category: None,
             merchant_bitcoin_sat: None,
@@ -83,6 +85,8 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
             fiat_currency: "CAD".into(),
             settlement_status: "none".into(),
             credited_fiat_minor: None,
+            quoted_fiat_minor: None,
+            fiat_percentage: None,
             funding_route: Some("bitcoin_fallback".into()),
             fallback_category: Some("ambiguous_create".into()),
             merchant_bitcoin_sat: None,
@@ -95,11 +99,15 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
         projection.fiat_only,
         vec![MerchantFiatSettlementEntry {
             amount_minor: None,
+            // The locked quote is exposed while the leg is still pending.
+            quoted_amount_minor: Some(5_000),
             currency: "CAD".into(),
             order_id,
             status: "pending".into(),
         }]
     );
+    // The captured split is surfaced from the settlement row.
+    assert_eq!(projection.fiat_percentage, Some(100));
     assert_eq!(projection.fallback_reasons, vec!["conversion_unavailable"]);
 }
 
