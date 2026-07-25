@@ -447,6 +447,8 @@ where
                        AND event.accounting_state = 'active' \
                 ) AS merchant_bitcoin_settled \
            FROM bull_bitcoin_settlements settlement \
+           JOIN invoices invoice ON invoice.id = settlement.invoice_id \
+            AND invoice.npub_owner = settlement.owner_npub \
            LEFT JOIN bull_bitcoin_claim_outputs merchant \
              ON merchant.settlement_id = settlement.id \
             AND merchant.role = 'merchant' \
@@ -456,6 +458,18 @@ where
                  AND settlement.funding_route = 'bull_bitcoin' \
                  AND settlement.funding_committed_at IS NOT NULL) \
                 OR settlement.funding_route = 'bitcoin_fallback' \
+            ) \
+            AND NOT ( \
+                invoice.status IN ('expired', 'cancelled') \
+                AND COALESCE(invoice.presentation_status, invoice.status) = 'unpaid' \
+                AND settlement.purpose = 'fiat_only' \
+                AND settlement.actual_received_sat IS NULL \
+                AND NOT settlement.provider_final \
+                AND settlement.settlement_status IN ('pending', 'unavailable') \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events event \
+                     WHERE event.invoice_id = invoice.id \
+                ) \
             ) \
           ORDER BY settlement.created_at, settlement.id",
     )

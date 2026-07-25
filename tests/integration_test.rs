@@ -4315,6 +4315,17 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
     assert_eq!(expired.presentation_status.as_deref(), Some("unpaid"));
     assert_eq!(expired.fiat_settlement_status, "none");
     assert_eq!(expired.settlement_status, "none");
+    assert!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[invoice.id],
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "an unfunded provider watch must not remain active merchant work"
+    );
 
     fake.push_read(Ok(OrderObservation {
         order_id,
@@ -4388,6 +4399,18 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
     assert_eq!(funded.status, "expired");
     assert_eq!(funded.fiat_settlement_status, "pending");
     assert_eq!(funded.settlement_status, "pending");
+    assert_eq!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[invoice.id],
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "late money evidence must restore the merchant settlement projection"
+    );
 
     sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = NOW() WHERE id = $1")
         .bind(settlement_id)
@@ -4483,6 +4506,17 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
     assert_eq!(cancelled.presentation_status.as_deref(), Some("unpaid"));
     assert_eq!(cancelled.fiat_settlement_status, "none");
     assert_eq!(cancelled.settlement_status, "none");
+    assert!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[cancellable.id],
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "a cancelled never-funded order is audit-only merchant history"
+    );
 
     cleanup_db(&pool).await;
 }
