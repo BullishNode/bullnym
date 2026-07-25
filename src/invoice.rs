@@ -2765,9 +2765,11 @@ async fn ensure_versioned_lightning_offer(
         .await
         .map_err(|error| AppError::DbError(error.to_string()))?;
     if !acquired {
-        return Err(AppError::ServiceUnavailable(
-            "invoice quote is changing; retry the payer quote request".into(),
-        ));
+        return Err(AppError::QuoteBusy {
+            invoice_id: invoice.id.to_string(),
+            quote_version_id: requested_quote.id.to_string(),
+            rail: "lightning",
+        });
     }
     let mut connection = InvoiceOfferAdvisoryLock::new(pooled_connection, lock_key);
 
@@ -3208,9 +3210,11 @@ async fn ensure_versioned_bitcoin_chain_offer(
             .await
             .map_err(|error| AppError::DbError(error.to_string()))?;
     if !invoice_lock_acquired {
-        return Err(AppError::ServiceUnavailable(
-            "invoice quote is changing; retry the Bitcoin offer request".into(),
-        ));
+        return Err(AppError::QuoteBusy {
+            invoice_id: invoice.id.to_string(),
+            quote_version_id: requested_quote.id.to_string(),
+            rail: "bitcoin",
+        });
     }
 
     let current = db::get_invoice_by_id(permit.connection_mut(), invoice.id)

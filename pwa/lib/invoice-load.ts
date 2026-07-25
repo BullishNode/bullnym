@@ -28,10 +28,9 @@ export type ReconstructResult = { ok: true; data: ReconstructedInvoice } | { ok:
 export async function reconstructInvoice(id: string): Promise<ReconstructResult> {
   try {
     const [status, currencies] = await Promise.all([getInvoiceStatus(id), getSupportedCurrencies().catch(() => null)])
-    // True root cause of the "/#/pay/undefined polls forever with a bare
-    // ERROR state" bug: the server deliberately returns HTTP 200 with an
-    // LNURL-style (LUD-06) error envelope for most failures (src/error.rs).
-    // request() already converts that into a thrown ApiError (caught below).
+    // request() converts both 0.3's truthful non-2xx envelope and the legacy
+    // HTTP-200 envelope into a thrown ApiError (caught below), preventing the
+    // historical "/#/pay/undefined" reconstruction loop.
     // Future status/presentation tokens remain reconstructable; the live
     // state machine treats them conservatively instead of inventing a 404.
 

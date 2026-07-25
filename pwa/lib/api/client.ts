@@ -6,6 +6,7 @@ export class ApiError extends Error {
     public status: number,
     message: string,
     public code?: string,
+    public retryAfterSeconds?: number,
   ) {
     super(message)
   }
@@ -210,18 +211,9 @@ export interface SupportedCurrenciesResponse {
   currencies: CurrencyView[]
 }
 
-// Per src/error.rs: the server deliberately returns HTTP 200 with an
-// LNURL-style (LUD-06) error envelope — {"status":"ERROR","code":"...",
-// "reason":"..."} — for nearly all error conditions, across nearly every
-// endpoint (POST /:nym/invoice and the status endpoint included). Only
-// AuthError (401), the two address-already-used variants (409), and
-// ServiceUnavailable (503) get a real non-2xx status; everything else is a
-// 200 whose body needs to be inspected to detect failure. Before this fix,
-// request() only checked res.ok, so every such envelope parsed as success
-// — this was the true origin of the "createInvoice succeeds with
-// invoice_id undefined, app navigates to /#/pay/undefined and polls
-// forever" bug: the envelope has no invoice_id, so CreateInvoiceResponse
-// came back with invoice_id === undefined.
+// Bullnym 0.3 returns truthful HTTP statuses on JSON APIs. Keep recognizing a
+// 200 error envelope for rolling-deploy compatibility and for protocol routes
+// that deliberately use the LNURL/LUD-06 transport contract.
 const NOT_FOUND_CODES = new Set(['InvoiceNotFound', 'DonationPageNotFound', 'NymNotFound'])
 const RATE_LIMITED_CODES = new Set(['RateLimitedSender', 'RateLimitedRecipient', 'RateLimitedNetwork'])
 
@@ -241,27 +233,64 @@ function envelopeHttpStatus(code: string | undefined): number {
   return 400
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+interface RequestPolicy {
+  retryQuoteBusy?: boolean
+}
+
+function retryAfterSeconds(res: Response): number | undefined {
+  const raw = res.headers?.get('Retry-After')
+  if (raw == null) return undefined
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+async function responseBody(res: Response): Promise<unknown> {
+  const text = await res.text()
+  if (!text) return null
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    return text
+  }
+}
+
+async function requestOnce<T>(url: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
     res = await fetch(url, init)
   } catch {
     throw new ApiError(0, 'Server unreachable')
   }
+  const body = await responseBody(res)
   if (!res.ok) {
-    let msg = res.statusText
-    try {
-      msg = await res.text()
-    } catch {
-      /* keep statusText */
+    if (isErrorEnvelope(body)) {
+      throw new ApiError(
+        res.status,
+        body.reason ?? body.code ?? 'Request failed',
+        body.code,
+        retryAfterSeconds(res),
+      )
     }
-    throw new ApiError(res.status, msg)
+    throw new ApiError(res.status, typeof body === 'string' ? body : res.statusText)
   }
-  const body = (await res.json()) as unknown
   if (isErrorEnvelope(body)) {
     throw new ApiError(envelopeHttpStatus(body.code), body.reason ?? body.code ?? 'Request failed', body.code)
   }
   return body as T
+}
+
+async function request<T>(url: string, init?: RequestInit, policy: RequestPolicy = {}): Promise<T> {
+  try {
+    return await requestOnce<T>(url, init)
+  } catch (error) {
+    if (!(policy.retryQuoteBusy && error instanceof ApiError && error.code === 'QUOTE_BUSY')) {
+      throw error
+    }
+    const baseDelayMs = Math.min(1_250, Math.max(250, (error.retryAfterSeconds ?? 1) * 1_000))
+    const jitterMs = Math.floor(Math.random() * 200)
+    await new Promise((resolve) => setTimeout(resolve, baseDelayMs + jitterMs))
+    return requestOnce<T>(url, init)
+  }
 }
 
 export function createInvoice(
@@ -302,7 +331,7 @@ export function fetchPayerQuote(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(rail ? { rail } : {}),
-  })
+  }, { retryQuoteBusy: true })
 }
 
 /**
