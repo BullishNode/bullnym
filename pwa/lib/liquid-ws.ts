@@ -1,9 +1,7 @@
-// Zero-conf Liquid payment detection (§8). Bull Bitcoin runs a
-// mempool.space-style Esplora WebSocket for Liquid at
-// wss://liquid.bullbitcoin.com/liquid/api/v1/ws (confirmed: replies to the
-// mempool `want`/`track-address` protocol; returns 101 on upgrade). We
-// subscribe to the invoice's Liquid settlement address; any address-tx push
-// triggers an immediate status poll.
+// Zero-conf direct-chain payment detection (§8). Bull Bitcoin runs
+// mempool.space-style Esplora WebSockets for Bitcoin and Liquid. We subscribe
+// to the invoice address; any address-tx push triggers an immediate status
+// poll, which in turn wakes Bullnym's authoritative recent watcher lane.
 //
 // The server stays AUTHORITATIVE — this watcher NEVER flips UI state itself.
 // It only collapses the up-to-3s polling latency to ~instant. On any failure
@@ -12,6 +10,7 @@
 // kiosk networks block WS often, so degradation must be invisible.
 
 const LIQUID_WS_URL = 'wss://liquid.bullbitcoin.com/liquid/api/v1/ws'
+const BITCOIN_WS_URL = 'wss://mempool.bullbitcoin.com/api/v1/ws'
 const INITIAL_RECONNECT_MS = 1000
 const MAX_RECONNECT_MS = 30_000
 
@@ -40,7 +39,7 @@ function isAddressActivity(data: unknown): boolean {
  * cancels any pending reconnect. Safe to call in non-browser/SSR contexts —
  * it no-ops if WebSocket is unavailable.
  */
-export function watchLiquidAddress(address: string, onActivity: () => void): LiquidWatcher {
+function watchAddress(wsUrl: string, address: string, onActivity: () => void): LiquidWatcher {
   if (typeof WebSocket === 'undefined') {
     return { close() {} }
   }
@@ -61,7 +60,7 @@ export function watchLiquidAddress(address: string, onActivity: () => void): Liq
     if (closed) return
     let socket: WebSocket
     try {
-      socket = new WebSocket(LIQUID_WS_URL)
+      socket = new WebSocket(wsUrl)
     } catch {
       scheduleReconnect()
       return
@@ -121,4 +120,12 @@ export function watchLiquidAddress(address: string, onActivity: () => void): Liq
       }
     },
   }
+}
+
+export function watchLiquidAddress(address: string, onActivity: () => void): LiquidWatcher {
+  return watchAddress(LIQUID_WS_URL, address, onActivity)
+}
+
+export function watchBitcoinAddress(address: string, onActivity: () => void): LiquidWatcher {
+  return watchAddress(BITCOIN_WS_URL, address, onActivity)
 }
