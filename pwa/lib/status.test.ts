@@ -3,16 +3,20 @@ import type { InvoiceStatus } from './api/client'
 import {
   bitcoinPaymentPayloadFromStatus,
   derivePayView,
+  hasPaymentEvidence,
   isCancelableStatus,
   isTerminalView,
   LN_REFRESH_COOLDOWN_MS,
   nextLightningPr,
   payViewBeforeFirstStatus,
   payViewLabel,
+  payViewRecordStatus,
   payViewSupport,
   shouldPollDetail,
   shouldRefreshLightning,
   showsRails,
+  statusLabel,
+  type PayView,
 } from './status'
 
 function makeStatus(overrides: Partial<InvoiceStatus> = {}): InvoiceStatus {
@@ -189,6 +193,161 @@ describe('derivePayView combined server projection', () => {
     expect(view).toEqual({ kind: 'partially_paid' })
     expect(showsRails(view)).toBe(true)
     expect(isTerminalView(view)).toBe(false)
+  })
+})
+
+describe('B1 — fiat pending settlement must not render unpaid as settling', () => {
+  // Fiat-priced invoices carry settlement_status='pending' from creation (the
+  // captured fiat policy) before any payment. Live repro
+  // 04d1bd92-5036-457f-9e80-a4268d44637a: status unpaid, presentation unpaid,
+  // settlement pending, zero payment evidence — was showing "paid, settlement
+  // pending". It must render the WAITING view with instructions still visible.
+  it('renders unpaid + pending as waiting with rails, never settling', () => {
+    const view = derivePayView(
+      makeStatus({ status: 'unpaid', presentation_status: 'unpaid', settlement_status: 'pending' }),
+    )
+    expect(view).toEqual({ kind: 'waiting' })
+    expect(showsRails(view)).toBe(true)
+    expect(isTerminalView(view)).toBe(false)
+    expect(payViewLabel(view, null)).toBe('Waiting for payment')
+    // It keeps polling (server stays authoritative for the settlement outcome).
+    expect(shouldPollDetail(makeStatus({ settlement_status: 'pending' }))).toBe(true)
+  })
+
+  it('does not turn an expired/cancelled unpaid+pending invoice into settling', () => {
+    expect(
+      derivePayView(makeStatus({ status: 'expired', presentation_status: 'unpaid', settlement_status: 'pending' })),
+    ).toEqual({ kind: 'expired' })
+    expect(
+      derivePayView(makeStatus({ status: 'cancelled', presentation_status: 'unpaid', settlement_status: 'pending' })),
+    ).toEqual({ kind: 'cancelled' })
+  })
+
+  it('still maps a genuinely received payment (payment_received) with pending settlement to settling', () => {
+    // The one pending+non-partial/non-overpaid case that IS paid must be
+    // preserved; only the unpaid presentation was the bug.
+    expect(
+      derivePayView(
+        makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'pending' }),
+      ),
+    ).toEqual({ kind: 'settling' })
+    // Even with a lagging accounting status, payment_received is settling.
+    expect(
+      derivePayView(
+        makeStatus({ status: 'unpaid', presentation_status: 'payment_received', settlement_status: 'pending' }),
+      ),
+    ).toEqual({ kind: 'settling' })
+  })
+
+  it('OWNER REPRO (rail switch): the view derives only from server status, never from the selected rail', () => {
+    // Switching the payer page to Liquid fetches a per-rail quote and opens the
+    // Liquid zero-conf watch socket; neither mutates the polled InvoiceStatus,
+    // so derivePayView is rail-independent. Under the fixed logic the fiat
+    // unpaid+pending invoice stays 'waiting' (rails visible) no matter which
+    // rail is active — the "liquid switch flips to paid" symptom was exactly the
+    // pending fall-through, not a separate liquid-path bug.
+    const unpaidPending = makeStatus({
+      status: 'unpaid',
+      presentation_status: 'unpaid',
+      settlement_status: 'pending',
+    })
+    const view = derivePayView(unpaidPending)
+    expect(view).toEqual({ kind: 'waiting' })
+    expect(showsRails(view)).toBe(true)
+    // The Liquid rail being available/selected changes nothing about the view.
+    const withLiquidOffer = makeStatus({
+      status: 'unpaid',
+      presentation_status: 'unpaid',
+      settlement_status: 'pending',
+      liquid_address: 'lq1qexampleaddress',
+      liquid_amount_sat: 10_800,
+    })
+    expect(derivePayView(withLiquidOffer)).toEqual({ kind: 'waiting' })
+  })
+})
+
+describe('B2 — POS completed-sales evidence recording', () => {
+  it('requires positive server evidence rather than a settlement incident', () => {
+    for (const presentation_status of ['partial', 'payment_received', 'overpaid']) {
+      expect(hasPaymentEvidence(makeStatus({ presentation_status }))).toBe(true)
+    }
+    expect(
+      hasPaymentEvidence(
+        makeStatus({
+          status: 'unpaid',
+          presentation_status: 'unpaid',
+          settlement_status: 'failed',
+        }),
+      ),
+    ).toBe(false)
+    expect(
+      hasPaymentEvidence(
+        makeStatus({
+          status: 'unpaid',
+          presentation_status: 'unpaid',
+          settlement_status: 'resolution_pending',
+        }),
+      ),
+    ).toBe(false)
+  })
+
+  it('uses positive received amount/timestamp as conservative rollout evidence', () => {
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, paid_amount_sat: 1 }))).toBe(true)
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, paid_at_unix: 1_000 }))).toBe(true)
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, amount_sat: 10_800 }))).toBe(false)
+  })
+
+  it('records a partial sale even when the accounting status still reads unpaid', () => {
+    // A partial can carry status.status==='unpaid'; recording the raw status
+    // would mislabel the row "Waiting for payment". The view-derived token
+    // labels it correctly.
+    const status = makeStatus({ status: 'unpaid', presentation_status: 'partial', settlement_status: 'none' })
+    const view = derivePayView(status)
+    expect(view).toEqual({ kind: 'partially_paid' })
+    expect(hasPaymentEvidence(status)).toBe(true)
+    expect(payViewRecordStatus(view)).toBe('partially_paid')
+    expect(statusLabel(payViewRecordStatus(view))).toBe('Partial payment')
+  })
+
+  it('maps each recorded status token to a readable label', () => {
+    const cases: Array<[PayView['kind'], string, string]> = [
+      ['settling', 'settling', 'Payment received'],
+      ['partially_paid_pending', 'partially_paid', 'Partial payment'],
+      ['overpaid_pending', 'overpaid_pending', 'Overpaid'],
+      ['underpaid', 'underpaid', 'Underpaid'],
+      ['needs_review', 'needs_review', 'Payment needs review'],
+      ['resolution_pending', 'resolution_pending', 'Payment issue'],
+      ['refunded', 'refunded', 'Settlement failed'],
+      ['failed', 'failed', 'Settlement failed'],
+      ['paid', 'paid', 'Paid'],
+      ['overpaid', 'overpaid', 'Paid'],
+    ]
+    for (const [kind, token, label] of cases) {
+      expect(payViewRecordStatus({ kind } as PayView)).toBe(token)
+      expect(statusLabel(token)).toBe(label)
+    }
+  })
+
+  it('reports the recorded-status transition path a settling sale walks', () => {
+    // partial payment → full received (settling) → settled paid: each step
+    // yields a distinct token so the POS row updates as it progresses.
+    const partial = derivePayView(
+      makeStatus({ status: 'partially_paid', presentation_status: 'partial', settlement_status: 'none' }),
+    )
+    const settling = derivePayView(
+      makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'pending' }),
+    )
+    const paid = derivePayView(
+      makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'settled' }),
+    )
+    expect([partial, settling, paid].map(payViewRecordStatus)).toEqual(['partially_paid', 'settling', 'paid'])
+    expect(
+      [
+        makeStatus({ status: 'partially_paid', presentation_status: 'partial' }),
+        makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'pending' }),
+        makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'settled' }),
+      ].every(hasPaymentEvidence),
+    ).toBe(true)
   })
 })
 

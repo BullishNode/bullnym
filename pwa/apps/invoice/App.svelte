@@ -13,10 +13,7 @@
 {#if page}
   {#snippet header(_canCancel: boolean)}
     <header class="mb-6 text-center">
-      <p class="text-xs font-semibold uppercase tracking-[0.14em] text-[#776b5a] dark:text-[#b9aa91]">
-        Bull Bitcoin payment request
-      </p>
-      <h1 class="mt-1 font-display text-4xl uppercase tracking-display leading-none">Pay invoice</h1>
+      <h1 class="font-display text-4xl uppercase tracking-display leading-none">Please pay this payment request</h1>
     </header>
     {#if page.private_presentation}
       <PrivateInvoiceCard invoiceId={page.invoice_id} />

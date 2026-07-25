@@ -38,6 +38,22 @@ export function statusLabel(status: string): string {
     case 'paid':
     case 'overpaid':
       return 'Paid'
+    // The tokens below are recorded by POS history for non-terminal sales that
+    // already have payment evidence (see payViewRecordStatus); they previously
+    // fell through to the raw string. Terminal history rows never used them.
+    case 'settling':
+      return 'Payment received'
+    case 'overpaid_pending':
+      return 'Overpaid'
+    case 'underpaid':
+      return 'Underpaid'
+    case 'resolution_pending':
+      return 'Payment issue'
+    case 'needs_review':
+      return 'Payment needs review'
+    case 'refunded':
+    case 'failed':
+      return 'Settlement failed'
     case 'expired':
       return 'Expired'
     case 'cancelled':
@@ -150,6 +166,18 @@ export function derivePayView(status: InvoiceStatus): PayView {
       return { kind: 'unknown' }
     }
     if (presentation === 'overpaid') return { kind: 'overpaid_pending' }
+    // Fiat-priced invoices carry settlement_status='pending' from CREATION (the
+    // captured fiat policy), before any payment. An 'unpaid' presentation here
+    // is NOT settling — no payment evidence exists yet, so keep the waiting view
+    // with instructions live (mirroring the settlement_status==='none' tail for
+    // expired/cancelled). Only a 'payment_received' presentation is genuinely
+    // paid-and-settling.
+    if (presentation === 'unpaid') {
+      if (status.status === 'expired') return { kind: 'expired' }
+      if (status.status === 'cancelled') return { kind: 'cancelled' }
+      if (status.status === 'unpaid' || status.status === 'pending') return { kind: 'waiting' }
+      return { kind: 'unknown' }
+    }
     return { kind: 'settling' }
   }
 
@@ -351,6 +379,75 @@ export function payViewToTerminal(view: PayView, status: InvoiceStatus): Termina
       return { kind: 'failed' }
     default:
       return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POS completed-sales recording (B2). The history list must show every sale
+// where at least some payment has been received — not only terminal paid —
+// with a live-ish status that updates as the invoice progresses. These two
+// pure helpers let the payment screen record on the first evidence transition
+// and re-record (dedup keeps newest) on later ones, and stay unit-testable.
+// ---------------------------------------------------------------------------
+
+/**
+ * True once the server exposes positive payment evidence. Settlement state is
+ * deliberately excluded: a provider attempt can fail or require attention
+ * before the payer sends money, so an incident-shaped PayView is not itself
+ * proof of a sale.
+ */
+export function hasPaymentEvidence(status: InvoiceStatus): boolean {
+  switch (status.presentation_status) {
+    case 'partial':
+    case 'payment_received':
+    case 'overpaid':
+      return true
+    default:
+      // The explicit amounts/timestamp are conservative rollout fallbacks for
+      // an older or temporarily unknown presentation projection. A zero or
+      // absent quote amount is never evidence.
+      return (status.paid_amount_sat ?? 0) > 0 || status.paid_at_unix != null
+  }
+}
+
+/**
+ * The status token stored on a POS HistoryRecord, derived from the live PayView
+ * rather than the raw accounting status (a partial can carry
+ * status.status==='unpaid', which would mislabel the row). Every token returned
+ * here is understood by statusLabel/statusBorderTone/isTerminalPaid.
+ */
+export function payViewRecordStatus(v: PayView): string {
+  switch (v.kind) {
+    case 'paid':
+      return 'paid'
+    case 'overpaid':
+      return 'overpaid'
+    case 'underpaid':
+      return 'underpaid'
+    case 'partially_paid':
+    case 'partially_paid_pending':
+      return 'partially_paid'
+    case 'in_progress':
+    case 'settling':
+      return 'settling'
+    case 'overpaid_pending':
+      return 'overpaid_pending'
+    case 'resolution_pending':
+      return 'resolution_pending'
+    case 'needs_review':
+      return 'needs_review'
+    case 'refunded':
+      return 'refunded'
+    case 'failed':
+      return 'failed'
+    case 'expired':
+      return 'expired'
+    case 'cancelled':
+      return 'cancelled'
+    case 'waiting':
+      return 'unpaid'
+    case 'unknown':
+      return 'pending'
   }
 }
 
