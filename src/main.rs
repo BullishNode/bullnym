@@ -27,7 +27,7 @@ use pay_service::{
     og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
     registration, startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
-    version, wallet_backup, AppState,
+    version, wallet_backup, watcher_wakeup, AppState,
 };
 
 #[tokio::main]
@@ -619,6 +619,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admission.apply_provider_recovery_reconciliation_v1(result);
     }
 
+    let direct_watcher_wakeups = Arc::new(watcher_wakeup::DirectWatcherWakeups::default());
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
@@ -635,6 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fee_runtime: fee_runtime.clone(),
         pricer: pricer_client,
         pwa_shells,
+        direct_watcher_wakeups: direct_watcher_wakeups.clone(),
         recovery_manifest_runtime_v1,
         swap_key_root_fingerprint: swap_key_root_fingerprint.clone(),
     };
@@ -912,6 +914,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let accounting_tolerances =
                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
             let liquid_reporter = state.admission.reporter(admission::Worker::LiquidWatcher);
+            let liquid_wakeup = direct_watcher_wakeups.liquid.clone();
             let active = watcher_cfg.active_tick_secs;
             let idle = watcher_cfg.idle_tick_secs;
             tokio::spawn(async move {
@@ -924,6 +927,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     watcher_cfg,
                     accounting_tolerances,
                     liquid_reporter,
+                    liquid_wakeup,
                 )
                 .await;
             });
@@ -942,8 +946,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(watcher) = initialized_bitcoin_watcher {
             let cancel_btc = cancel.clone();
             let bitcoin_reporter = state.admission.reporter(admission::Worker::BitcoinWatcher);
+            let bitcoin_wakeup = direct_watcher_wakeups.bitcoin.clone();
             tokio::spawn(async move {
-                watcher.run(cancel_btc, bitcoin_reporter).await;
+                watcher
+                    .run(cancel_btc, bitcoin_reporter, bitcoin_wakeup)
+                    .await;
             });
         } else {
             tracing::info!("bitcoin watcher disabled or its client failed to initialize");

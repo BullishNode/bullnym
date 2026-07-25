@@ -383,7 +383,12 @@ impl BitcoinWatcher {
     }
 
     /// Top-level loop. Returns when `cancel` fires.
-    pub async fn run(self, cancel: CancellationToken, mut reporter: WorkerReporter) {
+    pub async fn run(
+        self,
+        cancel: CancellationToken,
+        mut reporter: WorkerReporter,
+        wakeup: Arc<crate::watcher_wakeup::WatcherWakeup>,
+    ) {
         let mut tier_health = TierHealth::default();
         let mut active_epoch = BitcoinTierScanEpoch::default();
         let mut idle_epoch = BitcoinTierScanEpoch::default();
@@ -403,6 +408,7 @@ impl BitcoinWatcher {
             reporter.intentional_shutdown();
             return;
         }
+        let _wakeup_registration = wakeup.register();
 
         for (tier, epoch) in [
             (WatchTier::Recent, &mut active_epoch),
@@ -471,6 +477,32 @@ impl BitcoinWatcher {
                     }
                     report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
                     resume_schedule.observe(tier.lane(), turn.resume);
+                }
+                generation = wakeup.wait_for_request() => {
+                    let started = std::time::Instant::now();
+                    let turn = self
+                        .poll_tier(WatchTier::Recent, &cancel, &reporter, &mut active_epoch)
+                        .await;
+                    if cancel.is_cancelled() {
+                        reporter.intentional_shutdown();
+                        return;
+                    }
+                    report_outcome(
+                        &reporter,
+                        &mut tier_health,
+                        WatchTier::Recent,
+                        turn.outcome,
+                    );
+                    resume_schedule.observe(db::WatcherLane::Recent, turn.resume);
+                    wakeup.complete_through(generation);
+                    tracing::info!(
+                        event = "bitcoin_watcher_payer_wakeup_completed",
+                        generation,
+                        latency_ms = started.elapsed().as_millis() as u64,
+                        outcome = ?turn.outcome,
+                        resume = ?turn.resume,
+                        "payer-triggered authoritative Bitcoin watcher turn completed"
+                    );
                 }
                 _ = idle.tick() => {
                     let turn = self
@@ -2081,7 +2113,13 @@ pub async fn run(
             return;
         }
     };
-    watcher.run(cancel, reporter).await;
+    watcher
+        .run(
+            cancel,
+            reporter,
+            Arc::new(crate::watcher_wakeup::WatcherWakeup::default()),
+        )
+        .await;
 }
 
 #[cfg(test)]

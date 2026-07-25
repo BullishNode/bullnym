@@ -103,6 +103,15 @@ Provider webhooks are latency hints, not the only recovery trigger. Reconciler
 queries and chain evidence allow progress after webhook loss. Provider status
 is also not independent proof that a transaction confirmed.
 
+An open invoice status read may request one coalesced recent-lane turn from
+each applicable direct watcher and wait for at most two seconds before reading
+a fresh database snapshot. This is a latency hint, not evidence: Bitcoin and
+Liquid still re-query their configured authorities and use the same generation
+reducers. Disabled workers never delay the read, concurrent payer requests
+share a generation, regular cadence remains the restart/drop fallback, and
+existing recent/historical continuation work retains scheduling priority over
+wake traffic.
+
 ## Worker liveness and admission
 
 Money-moving workers report progress and cycle outcomes to an in-process,

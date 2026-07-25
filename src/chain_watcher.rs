@@ -625,6 +625,7 @@ pub async fn run(
     cfg: ChainWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
     mut reporter: WorkerReporter,
+    wakeup: Arc<crate::watcher_wakeup::WatcherWakeup>,
 ) {
     let mut tier_health = TierHealth::default();
     let mut active_epoch = LiquidTierScanEpoch::default();
@@ -634,6 +635,7 @@ pub async fn run(
         reporter.intentional_shutdown();
         return;
     }
+    let _wakeup_registration = wakeup.register();
 
     for (tier, epoch) in [
         (WatchTier::Recent, &mut active_epoch),
@@ -749,6 +751,39 @@ pub async fn run(
                 }
                 report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
                 resume_schedule.observe(tier.lane(), turn.resume);
+            }
+            generation = wakeup.wait_for_request() => {
+                let started = std::time::Instant::now();
+                let turn = poll_cycle(
+                    ChainWatcherPollCtx {
+                        pool: &pool,
+                        backend: backend.as_ref(),
+                        rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
+                        cancel: &cancel,
+                    },
+                    &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch, false,
+                ).await;
+                if cancel.is_cancelled() {
+                    reporter.intentional_shutdown();
+                    return;
+                }
+                report_outcome(
+                    &reporter,
+                    &mut tier_health,
+                    WatchTier::Recent,
+                    turn.outcome,
+                );
+                resume_schedule.observe(db::WatcherLane::Recent, turn.resume);
+                wakeup.complete_through(generation);
+                tracing::info!(
+                    event = "liquid_watcher_payer_wakeup_completed",
+                    generation,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    outcome = ?turn.outcome,
+                    resume = ?turn.resume,
+                    "payer-triggered authoritative Liquid watcher turn completed"
+                );
             }
             _ = idle_tick.tick() => {
                 let turn = poll_cycle(

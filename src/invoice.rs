@@ -1634,6 +1634,19 @@ pub struct InvoiceStatusResponse {
     pub quote_rail_availability: Option<PayerQuoteRailAvailability>,
 }
 
+const DIRECT_WATCHER_STATUS_WAIT: Duration = Duration::from_secs(2);
+
+async fn wait_for_direct_watcher(
+    enabled: bool,
+    wakeup: &crate::watcher_wakeup::WatcherWakeup,
+) -> crate::watcher_wakeup::WakeWaitOutcome {
+    if enabled {
+        wakeup.request_and_wait(DIRECT_WATCHER_STATUS_WAIT).await
+    } else {
+        crate::watcher_wakeup::WakeWaitOutcome::Unavailable
+    }
+}
+
 pub async fn status(
     State(state): State<AppState>,
     Path(id_str): Path<String>,
@@ -1674,9 +1687,38 @@ pub async fn status(
     )
     .await?;
     let mut snapshot = begin_invoice_read_snapshot(&state.db).await?;
-    let inv = db::get_invoice_by_id(&mut *snapshot, id)
+    let mut inv = db::get_invoice_by_id(&mut *snapshot, id)
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
+    let payment_open = matches!(
+        inv.status.as_str(),
+        "unpaid" | "in_progress" | "partially_paid"
+    );
+    let wake_bitcoin = payment_open && inv.accept_btc && inv.bitcoin_address.is_some();
+    let wake_liquid = payment_open && inv.accept_liquid && inv.liquid_address.is_some();
+    if wake_bitcoin || wake_liquid {
+        // Do not hold a repeatable-read snapshot while the watcher applies its
+        // authoritative generation. The refreshed snapshot below is the only
+        // response authority; wake completion itself never proves payment.
+        drop(snapshot);
+        let started = std::time::Instant::now();
+        let (bitcoin, liquid) = tokio::join!(
+            wait_for_direct_watcher(wake_bitcoin, state.direct_watcher_wakeups.bitcoin.as_ref(),),
+            wait_for_direct_watcher(wake_liquid, state.direct_watcher_wakeups.liquid.as_ref(),),
+        );
+        tracing::info!(
+            event = "invoice_status_direct_watcher_wakeup",
+            invoice_id = %id,
+            bitcoin = ?bitcoin,
+            liquid = ?liquid,
+            latency_ms = started.elapsed().as_millis() as u64,
+            "invoice status refreshed after bounded direct-watcher handoff"
+        );
+        snapshot = begin_invoice_read_snapshot(&state.db).await?;
+        inv = db::get_invoice_by_id(&mut *snapshot, id)
+            .await?
+            .ok_or_else(|| AppError::InvoiceNotFound(id.to_string()))?;
+    }
     let fiat_settlement_policy = db::invoice_fiat_settlement_policy(&mut *snapshot, inv.id).await?;
     pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::StatusAfterInvoiceRead)
         .await;
