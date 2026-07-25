@@ -267,25 +267,34 @@ describe('B1 — fiat pending settlement must not render unpaid as settling', ()
 })
 
 describe('B2 — POS completed-sales evidence recording', () => {
-  const evidenceViews: PayView['kind'][] = [
-    'in_progress',
-    'partially_paid',
-    'partially_paid_pending',
-    'settling',
-    'overpaid_pending',
-    'resolution_pending',
-    'needs_review',
-    'refunded',
-    'failed',
-    'paid',
-    'overpaid',
-    'underpaid',
-  ]
-  const noEvidenceViews: PayView['kind'][] = ['waiting', 'unknown', 'expired', 'cancelled']
+  it('requires positive server evidence rather than a settlement incident', () => {
+    for (const presentation_status of ['partial', 'payment_received', 'overpaid']) {
+      expect(hasPaymentEvidence(makeStatus({ presentation_status }))).toBe(true)
+    }
+    expect(
+      hasPaymentEvidence(
+        makeStatus({
+          status: 'unpaid',
+          presentation_status: 'unpaid',
+          settlement_status: 'failed',
+        }),
+      ),
+    ).toBe(false)
+    expect(
+      hasPaymentEvidence(
+        makeStatus({
+          status: 'unpaid',
+          presentation_status: 'unpaid',
+          settlement_status: 'resolution_pending',
+        }),
+      ),
+    ).toBe(false)
+  })
 
-  it('flags every received-payment view as evidence and the empty ones as none', () => {
-    for (const kind of evidenceViews) expect(hasPaymentEvidence({ kind } as PayView)).toBe(true)
-    for (const kind of noEvidenceViews) expect(hasPaymentEvidence({ kind } as PayView)).toBe(false)
+  it('uses positive received amount/timestamp as conservative rollout evidence', () => {
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, paid_amount_sat: 1 }))).toBe(true)
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, paid_at_unix: 1_000 }))).toBe(true)
+    expect(hasPaymentEvidence(makeStatus({ presentation_status: null, amount_sat: 10_800 }))).toBe(false)
   })
 
   it('records a partial sale even when the accounting status still reads unpaid', () => {
@@ -295,7 +304,7 @@ describe('B2 — POS completed-sales evidence recording', () => {
     const status = makeStatus({ status: 'unpaid', presentation_status: 'partial', settlement_status: 'none' })
     const view = derivePayView(status)
     expect(view).toEqual({ kind: 'partially_paid' })
-    expect(hasPaymentEvidence(view)).toBe(true)
+    expect(hasPaymentEvidence(status)).toBe(true)
     expect(payViewRecordStatus(view)).toBe('partially_paid')
     expect(statusLabel(payViewRecordStatus(view))).toBe('Partial payment')
   })
@@ -332,7 +341,13 @@ describe('B2 — POS completed-sales evidence recording', () => {
       makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'settled' }),
     )
     expect([partial, settling, paid].map(payViewRecordStatus)).toEqual(['partially_paid', 'settling', 'paid'])
-    expect([partial, settling, paid].every(hasPaymentEvidence)).toBe(true)
+    expect(
+      [
+        makeStatus({ status: 'partially_paid', presentation_status: 'partial' }),
+        makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'pending' }),
+        makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'settled' }),
+      ].every(hasPaymentEvidence),
+    ).toBe(true)
   })
 })
 

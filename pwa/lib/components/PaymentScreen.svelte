@@ -704,9 +704,10 @@
   let tickHandle: ReturnType<typeof setInterval> | undefined
   let stopped = false
   let notFoundStreak = 0
-  // Last record-status token reported to onEvidence, so we record on the first
-  // evidence transition and only re-record when the token actually changes.
-  let lastEvidenceStatus: string | null = null
+  // Last evidence snapshot reported to onEvidence. Include the amount and rail,
+  // not just the display token: two partial payments can keep the same status
+  // while the history row still needs its received amount refreshed.
+  let lastEvidenceSnapshot: string | null = null
   let remainingMs = $state(Math.max(0, untrack(() => invoice.expires_at_unix) * 1000 - Date.now()))
 
   const countdown = $derived.by(() => {
@@ -804,10 +805,16 @@
       void maybeRefreshLightning()
 
       const v = derivePayView(status)
-      if (hasPaymentEvidence(v)) {
+      if (hasPaymentEvidence(status)) {
         const recordStatus = payViewRecordStatus(v)
-        if (recordStatus !== lastEvidenceStatus) {
-          lastEvidenceStatus = recordStatus
+        const evidenceSnapshot = JSON.stringify([
+          recordStatus,
+          status.paid_amount_sat,
+          status.paid_at_unix,
+          status.paid_via,
+        ])
+        if (evidenceSnapshot !== lastEvidenceSnapshot) {
+          lastEvidenceSnapshot = evidenceSnapshot
           onEvidence?.(status)
         }
       }

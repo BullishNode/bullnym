@@ -391,32 +391,22 @@ export function payViewToTerminal(view: PayView, status: InvoiceStatus): Termina
 // ---------------------------------------------------------------------------
 
 /**
- * True once the invoice shows any received payment. 'waiting'/'unknown' have no
- * evidence yet; a plain 'expired'/'cancelled' (no partial) never reaches an
- * evidence view, so those sales are correctly never recorded. Provisional and
- * incident states (settling/pending/refunded/failed/needs_review) all imply a
- * payment was received and must appear in the list.
+ * True once the server exposes positive payment evidence. Settlement state is
+ * deliberately excluded: a provider attempt can fail or require attention
+ * before the payer sends money, so an incident-shaped PayView is not itself
+ * proof of a sale.
  */
-export function hasPaymentEvidence(v: PayView): boolean {
-  switch (v.kind) {
-    case 'in_progress':
-    case 'partially_paid':
-    case 'partially_paid_pending':
-    case 'settling':
-    case 'overpaid_pending':
-    case 'resolution_pending':
-    case 'needs_review':
-    case 'refunded':
-    case 'failed':
-    case 'paid':
+export function hasPaymentEvidence(status: InvoiceStatus): boolean {
+  switch (status.presentation_status) {
+    case 'partial':
+    case 'payment_received':
     case 'overpaid':
-    case 'underpaid':
       return true
-    case 'waiting':
-    case 'unknown':
-    case 'expired':
-    case 'cancelled':
-      return false
+    default:
+      // The explicit amounts/timestamp are conservative rollout fallbacks for
+      // an older or temporarily unknown presentation projection. A zero or
+      // absent quote amount is never evidence.
+      return (status.paid_amount_sat ?? 0) > 0 || status.paid_at_unix != null
   }
 }
 
