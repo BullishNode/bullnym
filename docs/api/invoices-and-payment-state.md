@@ -373,12 +373,13 @@ does not create a new invoice.
 
 Offer creation uses a non-blocking per-invoice advisory lock. If another request
 or a payment-state reducer currently owns that lock, this endpoint returns HTTP
-`503` with the normal error envelope and code `ServiceUnavailable`. Treat this
-as transient: refresh status, then retry with a short backoff only if the fresh
-projection remains payable and local time is before `expires_at_unix`.
+`503` with the normal error envelope, code `QUOTE_BUSY`, and `Retry-After: 1`.
+Treat this as transient: retry this exact mutation once after the bounded hint,
+then refresh status before any further attempt. Do not automatically retry other
+5xx mutations.
 
 A non-payable invoice or one whose deadline has passed instead returns the
-normal HTTP `200` `InvalidAmount` error envelope. Do not treat lock contention
+normal HTTP `400` `InvalidAmount` error envelope. Do not treat lock contention
 as invoice expiry, and do not retry either response from cached state alone.
 The integration suite exercises the offer-lock contention response.
 
