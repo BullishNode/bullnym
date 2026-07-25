@@ -4460,7 +4460,7 @@ async fn retired_liquid_offer_route_is_absent_while_status_remains_current() {
 
     let (status_status, status_body) =
         get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
-    assert_eq!(status_status, StatusCode::OK);
+    assert_eq!(status_status, StatusCode::NOT_FOUND);
     assert_eq!(status_body["status"], "ERROR");
     assert_eq!(status_body["code"], "InvoiceNotFound");
 
@@ -8459,11 +8459,11 @@ async fn register_without_verification_npub_has_no_nip05() {
     let (status, _) = get_path(&app, "/.well-known/lnurlp/legacyreg").await;
     assert_eq!(status, StatusCode::OK);
 
-    // No verification key supplied => no NIP-05 record. The server returns the
-    // LNURL-style error envelope (HTTP 200 + status=ERROR) rather than
-    // publishing the auth key, so `names` is absent.
+    // No verification key supplied => no NIP-05 record. This is an ordinary
+    // JSON endpoint, so the error envelope carries a truthful 404 rather than
+    // LNURL's protocol-specific HTTP 200 exception.
     let (status, body) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "NymNotFound");
     assert!(body.get("names").is_none());
