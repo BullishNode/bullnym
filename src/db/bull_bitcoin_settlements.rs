@@ -998,11 +998,12 @@ pub async fn record_bull_bitcoin_observation(
     settlement_id: Uuid,
     observation: &OrderObservation,
     next_poll_secs: i64,
+    late_watch_poll_secs: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET order_status = $2, payin_status = $3, payout_status = $4, \
-                actual_received_sat = $5, \
+                actual_received_sat = COALESCE($5, actual_received_sat), \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
                 provider_final = $7, \
@@ -1017,7 +1018,21 @@ pub async fn record_bull_bitcoin_observation(
                     WHEN $7 OR $8 THEN NULL ELSE instruction_kind END, \
                 last_checked_at = now(), reconcile_attempts = 0, \
                 next_attempt_at = CASE WHEN $7 OR $8 THEN NULL \
-                    ELSE now() + make_interval(secs => $9::DOUBLE PRECISION) END, \
+                    ELSE now() + make_interval(secs => (CASE \
+                        WHEN purpose = 'fiat_only' \
+                         AND COALESCE($5, actual_received_sat) IS NULL \
+                         AND invoice_id IS NOT NULL \
+                         AND EXISTS ( \
+                             SELECT 1 FROM invoices invoice \
+                              WHERE invoice.id = bull_bitcoin_settlements.invoice_id \
+                                AND invoice.status IN ('expired', 'cancelled') \
+                                AND COALESCE(invoice.presentation_status, invoice.status) = 'unpaid' \
+                                AND NOT EXISTS ( \
+                                    SELECT 1 FROM invoice_payment_events event \
+                                     WHERE event.invoice_id = invoice.id \
+                                ) \
+                         ) THEN GREATEST($9, $11) \
+                        ELSE $9 END)::DOUBLE PRECISION) END, \
                 updated_at = now() \
           WHERE id = $1 AND provider_state = 'bound' \
             AND funding_route = 'bull_bitcoin' \
@@ -1041,6 +1056,7 @@ pub async fn record_bull_bitcoin_observation(
             .quoted_fiat_minor
             .map(|amount| amount.as_minor()),
     )
+    .bind(late_watch_poll_secs)
     .execute(pool)
     .await?;
     Ok(())
@@ -1050,18 +1066,33 @@ pub async fn record_bull_bitcoin_retry(
     pool: &PgPool,
     settlement_id: Uuid,
     delay_secs: i64,
+    late_watch_poll_secs: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET reconcile_attempts = reconcile_attempts + 1, \
                 last_checked_at = now(), \
-                next_attempt_at = now() + \
-                    make_interval(secs => $2::DOUBLE PRECISION), \
+                next_attempt_at = now() + make_interval(secs => (CASE \
+                    WHEN purpose = 'fiat_only' \
+                     AND actual_received_sat IS NULL \
+                     AND invoice_id IS NOT NULL \
+                     AND EXISTS ( \
+                         SELECT 1 FROM invoices invoice \
+                          WHERE invoice.id = bull_bitcoin_settlements.invoice_id \
+                            AND invoice.status IN ('expired', 'cancelled') \
+                            AND COALESCE(invoice.presentation_status, invoice.status) = 'unpaid' \
+                            AND NOT EXISTS ( \
+                                SELECT 1 FROM invoice_payment_events event \
+                                 WHERE event.invoice_id = invoice.id \
+                            ) \
+                     ) THEN GREATEST($2, $3) \
+                    ELSE $2 END)::DOUBLE PRECISION), \
                 updated_at = now() \
           WHERE id = $1 AND settlement_status = 'pending'",
     )
     .bind(settlement_id)
     .bind(delay_secs)
+    .bind(late_watch_poll_secs)
     .execute(pool)
     .await?;
     Ok(())
@@ -1160,7 +1191,9 @@ pub async fn expire_bull_bitcoin_retention(pool: &PgPool) -> Result<u64, sqlx::E
             SET settlement_status = 'unavailable', payer_instruction = NULL, \
                 instruction_kind = NULL, next_attempt_at = NULL, updated_at = now() \
           WHERE provider_state = 'bound' AND settlement_status = 'pending' \
-            AND retention_until IS NOT NULL AND retention_until <= now()",
+            AND retention_until IS NOT NULL AND retention_until <= now() \
+            AND purpose = 'fiat_only' AND actual_received_sat IS NULL \
+            AND invoice_id IS NULL",
     )
     .execute(pool)
     .await?;
