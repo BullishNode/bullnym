@@ -4759,7 +4759,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "073_unfunded_provider_watch"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -5000,7 +5000,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "073_unfunded_provider_watch"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -23259,7 +23259,7 @@ async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit()
     let observed_row_lock_wait = observe_recovery_lock_wait(
         &pool,
         expiry_backend_pid,
-        "%UPDATE invoices SET status = CASE%",
+        "%UPDATE invoices invoice SET status = CASE%",
     )
     .await
     .unwrap();
