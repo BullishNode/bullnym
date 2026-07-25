@@ -327,12 +327,9 @@ fn project_merchant_settlement(
     }
 
     if transaction.settlement_funding_route.as_deref() == Some("bitcoin_fallback") {
-        let reason = match transaction.settlement_fallback_category.as_deref() {
-            Some("below_minimum") => "below_minimum",
-            Some("invalid_split") => "invalid_split",
-            Some("conversion_unavailable" | "ambiguous_create") | None => "conversion_unavailable",
-            Some(_) => "conversion_unavailable",
-        };
+        let reason = crate::bull_bitcoin_settlement::projected_fallback_reason(
+            transaction.settlement_fallback_category.as_deref(),
+        );
         return (
             GetPaidSettlementKind::Bitcoin,
             None,
@@ -616,6 +613,28 @@ mod tests {
             json!({"status": "overridden", "reason": "below_minimum"})
         );
         assert!(fallback.get("settlement_details").is_none());
+
+        let mut ambiguous = settlement_transaction();
+        ambiguous.settlement_funding_route = Some("bitcoin_fallback".into());
+        ambiguous.settlement_fallback_category = Some("ambiguous_create".into());
+        ambiguous.settlement_status_detail = Some("none".into());
+        ambiguous.settlement_credited_fiat_minor = None;
+        let ambiguous = serde_json::to_value(project_transaction(ambiguous).unwrap()).unwrap();
+        assert_eq!(
+            ambiguous["fiat_conversion"],
+            json!({"status": "overridden", "reason": "ambiguous_create"})
+        );
+
+        let mut unknown = settlement_transaction();
+        unknown.settlement_funding_route = Some("bitcoin_fallback".into());
+        unknown.settlement_fallback_category = None;
+        unknown.settlement_status_detail = Some("none".into());
+        unknown.settlement_credited_fiat_minor = None;
+        let unknown = serde_json::to_value(project_transaction(unknown).unwrap()).unwrap();
+        assert_eq!(
+            unknown["fiat_conversion"],
+            json!({"status": "overridden", "reason": "unknown"})
+        );
     }
 
     #[test]

@@ -2807,9 +2807,11 @@ async fn ensure_versioned_lightning_offer(
         .await
         .map_err(|error| AppError::DbError(error.to_string()))?;
     if !acquired {
-        return Err(AppError::ServiceUnavailable(
-            "invoice quote is changing; retry the payer quote request".into(),
-        ));
+        return Err(AppError::QuoteBusy {
+            invoice_id: invoice.id.to_string(),
+            quote_version_id: requested_quote.id.to_string(),
+            rail: "lightning",
+        });
     }
     let mut connection = InvoiceOfferAdvisoryLock::new(pooled_connection, lock_key);
 
@@ -3250,9 +3252,11 @@ async fn ensure_versioned_bitcoin_chain_offer(
             .await
             .map_err(|error| AppError::DbError(error.to_string()))?;
     if !invoice_lock_acquired {
-        return Err(AppError::ServiceUnavailable(
-            "invoice quote is changing; retry the Bitcoin offer request".into(),
-        ));
+        return Err(AppError::QuoteBusy {
+            invoice_id: invoice.id.to_string(),
+            quote_version_id: requested_quote.id.to_string(),
+            rail: "bitcoin",
+        });
     }
 
     let current = db::get_invoice_by_id(permit.connection_mut(), invoice.id)
@@ -5065,6 +5069,16 @@ struct MerchantInvoiceSettlementProjection {
     fallback_reasons: Vec<String>,
 }
 
+impl MerchantInvoiceSettlementProjection {
+    fn effective_fallback_reason(&self) -> Option<&str> {
+        let has_funded_binding = !self.fiat_only.is_empty()
+            || (!self.mixed_bitcoin.is_empty() && !self.mixed_fiat.is_empty());
+        (!has_funded_binding)
+            .then(|| self.fallback_reasons.last().map(String::as_str))
+            .flatten()
+    }
+}
+
 fn merchant_invoice_settlement_projections(
     rows: Vec<db::InvoiceBullBitcoinSettlementProjection>,
 ) -> HashMap<Uuid, MerchantInvoiceSettlementProjection> {
@@ -5072,14 +5086,9 @@ fn merchant_invoice_settlement_projections(
     for row in rows {
         let projection = projections.entry(row.invoice_id).or_default();
         if row.funding_route.as_deref() == Some("bitcoin_fallback") {
-            let reason = match row.fallback_category.as_deref() {
-                Some("below_minimum") => "below_minimum",
-                Some("invalid_split") => "invalid_split",
-                Some("conversion_unavailable" | "ambiguous_create") | None => {
-                    "conversion_unavailable"
-                }
-                Some(_) => "conversion_unavailable",
-            };
+            let reason = crate::bull_bitcoin_settlement::projected_fallback_reason(
+                row.fallback_category.as_deref(),
+            );
             projection.fallback_reasons.push(reason.to_owned());
             continue;
         }
@@ -5250,6 +5259,11 @@ pub async fn list_signed(
                 .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
             let remaining = remaining_amount_from_received(&inv, received);
             let projection = settlement_projections.remove(&inv.id).unwrap_or_default();
+            // A funded provider binding is effective financial evidence and
+            // supersedes any speculative rail attempt retained for audit.
+            // With no binding, rows are ordered oldest-first and the latest
+            // durable fallback decision is the effective projection.
+            let fallback_reason = projection.effective_fallback_reason().map(str::to_owned);
             let settlement_details =
                 if !projection.mixed_bitcoin.is_empty() && !projection.mixed_fiat.is_empty() {
                     Some(MerchantSettlementDetails::Mixed {
@@ -5265,23 +5279,6 @@ pub async fn list_signed(
                 } else {
                     None
                 };
-            let fallback_reason = if projection
-                .fallback_reasons
-                .iter()
-                .any(|reason| reason == "below_minimum")
-            {
-                Some("below_minimum")
-            } else if projection
-                .fallback_reasons
-                .iter()
-                .any(|reason| reason == "invalid_split")
-            {
-                Some("invalid_split")
-            } else if projection.fallback_reasons.is_empty() {
-                None
-            } else {
-                Some("conversion_unavailable")
-            };
             InvoiceListItem {
                 id: inv.id,
                 nym_owner: inv.nym_owner,
@@ -5308,7 +5305,7 @@ pub async fn list_signed(
                 settlement_details,
                 fiat_conversion: fallback_reason.map(|reason| MerchantFiatConversionOverride {
                     status: "overridden",
-                    reason: reason.to_owned(),
+                    reason,
                 }),
             }
         })

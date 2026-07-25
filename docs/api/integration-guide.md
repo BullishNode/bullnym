@@ -42,7 +42,8 @@ it is not returned by the management API.
    wallets/descriptors; back them up through the wallet's documented recovery.
 3. Build signing bytes independently of JSON serialization and test byte-exact
    vectors, especially empty fields and optional trailing surface fields.
-4. Parse coded error envelopes on every status, including HTTP 200.
+4. Branch on truthful HTTP status and parse the coded JSON envelope. Continue
+   recognizing HTTP-200 envelopes for LNURL and rolling-deploy compatibility.
 5. Fetch supported currencies, preserve integer minor units, and avoid
    floating-point money calculations.
 6. Generate a fresh Bitcoin/Liquid address for every wallet invoice and retain

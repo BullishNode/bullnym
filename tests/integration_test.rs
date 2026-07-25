@@ -2384,7 +2384,7 @@ async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
     );
 
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
-    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
     assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert_safe_application_error_reason(&response, &api_key);
     assert!(!response.to_string().contains(&api_key));
@@ -2452,7 +2452,7 @@ async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
         auth_timestamp(),
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", update).await;
-    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
     assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     let after = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
         "SELECT credential.id, credential.ciphertext, credential.nonce, \
@@ -2522,7 +2522,7 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
         auth_timestamp(),
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
-    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{response:?}");
     assert_eq!(response["code"], "FIAT_CREDENTIAL_INVALID");
     assert_safe_application_error_reason(&response, &api_key);
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
@@ -2583,7 +2583,7 @@ async fn fiat_settlement_missing_credential_has_a_stable_client_code() {
     );
 
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
-    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
     assert_eq!(response["code"], "FIAT_CREDENTIAL_REQUIRED");
 
     cleanup_db(&pool).await;
@@ -4224,7 +4224,7 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         ),
     )
     .await;
-    assert_eq!(oversized_status, StatusCode::OK);
+    assert_eq!(oversized_status, StatusCode::BAD_REQUEST);
     assert_eq!(oversized_body["code"], "InvalidAmount");
 
     cleanup_db(&pool).await;
@@ -4463,7 +4463,7 @@ async fn retired_liquid_offer_route_is_absent_while_status_remains_current() {
 
     let (status_status, status_body) =
         get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
-    assert_eq!(status_status, StatusCode::OK);
+    assert_eq!(status_status, StatusCode::NOT_FOUND);
     assert_eq!(status_body["status"], "ERROR");
     assert_eq!(status_body["code"], "InvoiceNotFound");
 
@@ -8462,11 +8462,11 @@ async fn register_without_verification_npub_has_no_nip05() {
     let (status, _) = get_path(&app, "/.well-known/lnurlp/legacyreg").await;
     assert_eq!(status, StatusCode::OK);
 
-    // No verification key supplied => no NIP-05 record. The server returns the
-    // LNURL-style error envelope (HTTP 200 + status=ERROR) rather than
-    // publishing the auth key, so `names` is absent.
+    // No verification key supplied => no NIP-05 record. This is an ordinary
+    // JSON endpoint, so the error envelope carries a truthful 404 rather than
+    // LNURL's protocol-specific HTTP 200 exception.
     let (status, body) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "NymNotFound");
     assert!(body.get("names").is_none());
@@ -11991,7 +11991,7 @@ async fn m11_unsafe_provider_snapshots_disable_only_lightning() {
             get_path(&app, &format!("{callback_path}?amount=100000")).await;
         assert_eq!(
             lightning_status,
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::OK,
             "case {case}: {lightning_body}"
         );
         assert_eq!(
@@ -12067,7 +12067,7 @@ async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert_eq!(
@@ -12265,7 +12265,7 @@ async fn whitelisted_liquid_admission_failure_does_not_fallback_to_lightning() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&pool)
@@ -12813,11 +12813,7 @@ async fn failed_lazy_provider_call_leaves_durable_auditable_key_gap() {
         json!({}),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "LNURL errors use a JSON error envelope"
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["code"], "BoltzError", "unexpected response: {body}");
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -13656,7 +13652,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     )
     .await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
         json!({
@@ -15758,7 +15754,7 @@ async fn anonymous_checkout_json_contract_rejects_unknown_fields_before_mutation
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["code"], "InvalidAmount", "{body:?}");
     assert_eq!(body["reason"], "note too long (max 280 chars)", "{body:?}");
     assert_eq!(
@@ -16956,9 +16952,11 @@ async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail()
     let path = format!("/api/v1/invoices/{}/quote", invoice.id);
 
     let (failed_status, failed_body) = post_json(&app, &path, json!({ "rail": "lightning" })).await;
-    // Bullnym's legacy JSON error envelope intentionally uses HTTP 200; the
-    // stable `code` discriminates failure from the typed quote response.
-    assert_eq!(failed_status, StatusCode::OK, "{failed_body}");
+    assert_eq!(
+        failed_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{failed_body}"
+    );
     assert_eq!(failed_body["code"], "BoltzError");
     assert!(failed_body.get("instruction").is_none());
     let safe_error = failed_body.to_string();
@@ -17095,7 +17093,7 @@ async fn payer_provider_attempt_before_send_restarts_once_without_duplicate_obli
     retry_config.boltz.api_url = boltz_url;
     let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
     let (status, body) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "BoltzError", "{body}");
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
     let after_send: (i64, i64, i64) = sqlx::query_as(
@@ -17421,7 +17419,7 @@ async fn payer_demand_quote_rejects_sat_fixed_and_creates_no_fiat_version() {
         json!({ "rail": "liquid" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "InvalidAmount");
     assert!(body.get("instruction").is_none());
     assert!(body.get("quote").is_none());
@@ -21250,7 +21248,7 @@ async fn signed_invoice_create_rejects_expiry_beyond_thirty_days() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "InvalidAmount", "{body}");
     assert_eq!(
         body["reason"], "expires_at_unix beyond 2592000s cap",
@@ -21495,7 +21493,7 @@ async fn signed_invoice_cancel_is_owner_bound_and_idempotent() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "InvoiceNotFound");
     let still_unpaid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
         .await
@@ -21549,7 +21547,7 @@ async fn invoice_render_paths_preserve_linked_owner_boundary() {
     assert_eq!(status, StatusCode::OK);
 
     let (status, body) = get_path(&app, &format!("/wrongnym/i/{}", invoice.id)).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "InvoiceNotFound");
 
     let (status, _body) = get_path(&app, &format!("/invoice/{}", invoice.id)).await;
@@ -21984,7 +21982,7 @@ async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible(
         json!({}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["code"], "InvalidAmount");
     assert!(body.get("pr").is_none());
 
@@ -36788,7 +36786,7 @@ async fn recovery_address_registration_endpoint_rejects_signature_address_and_ov
         serde_json::to_value(&invalid_address_request).unwrap(),
     )
     .await;
-    assert_eq!(address_status, StatusCode::OK);
+    assert_eq!(address_status, StatusCode::BAD_REQUEST);
     assert_eq!(address_body["code"], "RecoveryAddressInvalid");
 
     let oversized_body = json!({
