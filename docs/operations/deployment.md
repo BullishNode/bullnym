@@ -263,9 +263,11 @@ Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `071_mixed_invoice_payin_valuation.sql`,
 `072_mixed_invoice_blinding_key_invariant.sql`,
 `073_unfunded_provider_watch.sql`, and
-`074_bull_bitcoin_execution_rate.sql` in order as the privileged schema owner with
-`--set runtime_role=bullnym_app` while every Bullnym writer is stopped. Take
-and validate a schema-066 backup first. Keep
+`074_bull_bitcoin_execution_rate.sql` in order as the privileged schema owner
+with `--set runtime_role=bullnym_app` while every Bullnym writer is stopped.
+For a first deployment from schema 066, take and validate a schema-066 backup
+first. For the 0.2-to-0.3 upgrade, verify schema 070, take and validate a fresh
+schema-070 backup, then apply only migrations 071 through 074. Keep
 `features.bull_bitcoin_fiat_settlement = false` throughout migration and
 initial service verification.
 
@@ -283,7 +285,7 @@ URL and a fresh root-only `BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY` containing
 exactly 32 random bytes encoded as 64 lowercase hexadecimal characters. Never
 copy a production credential or encryption key into staging.
 
-Start only the schema-069 binary. Require `/ready`, `/version`, the installed
+Start only the schema-074 binary. Require `/ready`, `/version`, the installed
 artifact digest, and the release record to agree while admission remains off.
 Then test one eligible scoped key, one benchmark-ineligible account, one
 wrong-scope key, and one unavailable-API response before enabling the feature.
@@ -292,8 +294,12 @@ eligibility call must create no Bull Bitcoin order.
 
 Automatic rollback across migration 067 is refused. To return to a pre-067
 release, stop every writer and restore the validated schema-066 database with
-its matching binary, PWA, release record, and configuration. A schema-069
-feature-off binary is the safe rollback target after the migrations exist.
+its matching binary, PWA, release record, and configuration. Migrations 071
+through 074 also form a stopped-writer boundary: 071 changes mixed-payment
+valuation triggers and may populate previously null accounting evidence. Do
+not run a schema-070-or-older binary after those migrations commit. Restore the
+validated immediate pre-071 backup with its matching 0.2 binary/PWA/release
+record, or repair and roll forward with a schema-074 build.
 
 ## Migration 053 privileged-owner boundary
 
