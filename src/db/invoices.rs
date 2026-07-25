@@ -2669,19 +2669,134 @@ pub async fn record_invoice_payment_with_quote_attribution(
     .await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedProviderQuoteAttribution {
     attribution: InvoiceQuoteAttribution,
     first_observed_at_unix_micros: i64,
+    /// Mixed Bull Bitcoin outputs are Liquid accounting evidence, but their
+    /// payer instruction is the parent Lightning/Bitcoin Boltz offer. Keep
+    /// that immutable offer identity explicit instead of pretending the
+    /// Liquid output itself was a payer offer.
+    offer_identity: Option<PersistedPaymentOfferIdentity>,
 }
 
 type PersistedProviderQuoteAttributionRow = (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<i64>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedPaymentOfferIdentity {
+    rail: String,
+    offer_kind: String,
+    provider: Option<String>,
+    provider_offer_id: Option<String>,
+}
+
+type PersistedMixedQuoteAttributionRow = (
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn persisted_provider_quote_attribution(
     tx: &mut Transaction<'_, Postgres>,
     invoice_id: Uuid,
     evidence: &InvoicePaymentEvidence<'_>,
 ) -> Result<Option<PersistedProviderQuoteAttribution>, sqlx::Error> {
+    if evidence.source == "bull_bitcoin_mixed_output" {
+        let settlement_id = evidence.bull_bitcoin_settlement_id.ok_or_else(|| {
+            sqlx::Error::Protocol("mixed Bull Bitcoin payment lacks its local settlement id".into())
+        })?;
+        let row: Option<PersistedMixedQuoteAttributionRow> = sqlx::query_as(
+            "SELECT settlement.invoice_id, \
+                    COALESCE(reverse_swap.invoice_quote_version_id, \
+                             chain_swap.invoice_quote_version_id), \
+                    COALESCE(reverse_swap.invoice_quote_offer_id, \
+                             chain_swap.invoice_quote_offer_id), \
+                    (EXTRACT(EPOCH FROM COALESCE( \
+                        reverse_swap.quote_payment_first_observed_at, \
+                        chain_swap.quote_payment_first_observed_at \
+                    )) * 1000000)::BIGINT, \
+                    CASE WHEN reverse_swap.id IS NOT NULL \
+                         THEN 'lightning' ELSE 'bitcoin' END, \
+                    CASE WHEN reverse_swap.id IS NOT NULL \
+                         THEN 'boltz_reverse' ELSE 'boltz_chain' END, \
+                    'boltz'::TEXT, \
+                    COALESCE(reverse_swap.boltz_swap_id, chain_swap.boltz_swap_id) \
+               FROM bull_bitcoin_settlements settlement \
+               LEFT JOIN swap_records reverse_swap \
+                 ON reverse_swap.id = settlement.reverse_swap_id \
+               LEFT JOIN chain_swap_records chain_swap \
+                 ON chain_swap.id = settlement.chain_swap_id \
+              WHERE settlement.id = $1 AND settlement.purpose = 'mixed'",
+        )
+        .bind(settlement_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((
+            persisted_invoice_id,
+            quote_version_id,
+            quote_offer_id,
+            first_observed_at_unix_micros,
+            rail,
+            offer_kind,
+            provider,
+            provider_offer_id,
+        )) = row
+        else {
+            return Err(sqlx::Error::Protocol(
+                "mixed Bull Bitcoin payment lacks its persisted settlement authority".into(),
+            ));
+        };
+        if persisted_invoice_id != Some(invoice_id) {
+            return Err(sqlx::Error::Protocol(
+                "mixed Bull Bitcoin settlement belongs to a different invoice".into(),
+            ));
+        }
+        return match (quote_version_id, quote_offer_id) {
+            (None, None) => Ok(None),
+            (Some(quote_version_id), Some(quote_offer_id)) => {
+                let first_observed_at_unix_micros =
+                    first_observed_at_unix_micros.ok_or_else(|| {
+                        sqlx::Error::Protocol(
+                            "quote-attributed mixed settlement lacks durable first-observed time"
+                                .into(),
+                        )
+                    })?;
+                let (rail, offer_kind, provider_offer_id) =
+                    match (rail, offer_kind, provider_offer_id) {
+                        (Some(rail), Some(offer_kind), Some(provider_offer_id)) => {
+                            (rail, offer_kind, provider_offer_id)
+                        }
+                        _ => {
+                            return Err(sqlx::Error::Protocol(
+                                "mixed settlement lacks its parent payer-offer identity".into(),
+                            ));
+                        }
+                    };
+                Ok(Some(PersistedProviderQuoteAttribution {
+                    attribution: InvoiceQuoteAttribution {
+                        quote_version_id,
+                        quote_offer_id,
+                    },
+                    first_observed_at_unix_micros,
+                    offer_identity: Some(PersistedPaymentOfferIdentity {
+                        rail,
+                        offer_kind,
+                        provider,
+                        provider_offer_id: Some(provider_offer_id),
+                    }),
+                }))
+            }
+            _ => Err(sqlx::Error::Protocol(
+                "mixed provider settlement has partial quote attribution".into(),
+            )),
+        };
+    }
+
     let Some(boltz_swap_id) = evidence.boltz_swap_id else {
         return Ok(None);
     };
@@ -2736,6 +2851,7 @@ async fn persisted_provider_quote_attribution(
                     quote_offer_id,
                 },
                 first_observed_at_unix_micros,
+                offer_identity: None,
             }))
         }
         _ => Err(sqlx::Error::Protocol(
@@ -2791,6 +2907,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
 
     let persisted_attribution =
         persisted_provider_quote_attribution(&mut tx, id, &evidence).await?;
+    let persisted_offer_identity = persisted_attribution
+        .as_ref()
+        .and_then(|persisted| persisted.offer_identity.clone());
     let attribution = match (requested_attribution, persisted_attribution) {
         (Some(requested), Some(persisted)) if requested != persisted.attribution => {
             return Err(sqlx::Error::Protocol(
@@ -2813,12 +2932,24 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         }),
     };
     if let Some((attribution, _)) = attribution {
-        let (rail, offer_kind, provider, provider_offer_id) = payment_offer_identity(&evidence);
-        if evidence.rail != rail {
-            return Err(sqlx::Error::Protocol(
-                "payment evidence rail does not match its quote offer identity".into(),
-            ));
-        }
+        let inferred_identity;
+        let (rail, offer_kind, provider, provider_offer_id) =
+            if let Some(identity) = persisted_offer_identity.as_ref() {
+                (
+                    identity.rail.as_str(),
+                    identity.offer_kind.as_str(),
+                    identity.provider.as_deref(),
+                    identity.provider_offer_id.as_deref(),
+                )
+            } else {
+                inferred_identity = payment_offer_identity(&evidence);
+                if evidence.rail != inferred_identity.0 {
+                    return Err(sqlx::Error::Protocol(
+                        "payment evidence rail does not match its quote offer identity".into(),
+                    ));
+                }
+                inferred_identity
+            };
         validate_invoice_quote_attribution(
             &mut *tx,
             id,

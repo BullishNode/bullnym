@@ -4638,13 +4638,15 @@ async fn create_invoice_inner(
     };
     let canonical_liquid_address = if let Some(addr) = req.liquid_address.as_deref() {
         let canonical = validators::canonical_liquid_mainnet_address(addr)?;
-        if req.accept_liquid {
-            let key = req.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
-                AppError::InvalidAmount(
-                    "accept_liquid=true requires liquid_blinding_key_hex".into(),
-                )
-            })?;
+        if let Some(key) = req.liquid_blinding_key_hex.as_deref() {
+            // Lightning/Bitcoin mixed settlement also spends to this Liquid
+            // destination. Validate supplied material regardless of whether
+            // the direct Liquid rail is enabled.
             validators::validate_liquid_blinding_key_matches_address(&canonical, key)?;
+        } else if req.accept_liquid {
+            return Err(AppError::InvalidAmount(
+                "accept_liquid=true requires liquid_blinding_key_hex".into(),
+            ));
         }
         Some(canonical)
     } else {

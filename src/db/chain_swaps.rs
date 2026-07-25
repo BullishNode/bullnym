@@ -1859,6 +1859,36 @@ pub async fn record_chain_swap_claim_failure(
     Ok(outcome)
 }
 
+/// Chain-swap counterpart to `mark_claim_integrity_hold`. Permanent
+/// destination/key defects bypass hot retries and slow revival while keeping
+/// the funded obligation and diagnostic evidence durable for an operator.
+pub async fn mark_chain_swap_claim_integrity_hold(
+    pool: &PgPool,
+    id: Uuid,
+    error_msg: &str,
+) -> Result<ClaimFailureOutcome, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'claim_stuck', \
+             last_claim_error = $2, \
+             last_claim_error_at = NOW(), \
+             next_claim_attempt_at = NULL, \
+             next_slow_attempt_at = NULL, \
+             updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(id)
+    .bind(error_msg)
+    .execute(pool)
+    .await?;
+    Ok(if updated.rows_affected() == 1 {
+        ClaimFailureOutcome::Stuck
+    } else {
+        ClaimFailureOutcome::NoOp
+    })
+}
+
 fn chain_claim_failure_may_advance(parent_status: &str, attempt_status: Option<&str>) -> bool {
     matches!(
         parent_status,
@@ -1912,6 +1942,7 @@ pub async fn list_claim_stuck_chain_swaps_for_slow_retry(
         "SELECT id, boltz_swap_id, slow_attempts \
          FROM chain_swap_records \
          WHERE status = 'claim_stuck' \
+           AND COALESCE(last_claim_error, '') NOT LIKE 'mixed_invoice_integrity_hold:%' \
            AND (next_slow_attempt_at IS NULL OR next_slow_attempt_at <= NOW()) \
          ORDER BY next_slow_attempt_at NULLS FIRST \
          LIMIT $1",

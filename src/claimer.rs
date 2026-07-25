@@ -2755,6 +2755,110 @@ async fn resolve_claim_address(
     Ok(derived)
 }
 
+const MIXED_INVOICE_INTEGRITY_HOLD_PREFIX: &str = "mixed_invoice_integrity_hold:";
+
+fn mixed_invoice_integrity_error(invoice_id: Uuid, reason: &str) -> AppError {
+    AppError::ClaimError(format!(
+        "{MIXED_INVOICE_INTEGRITY_HOLD_PREFIX} invoice={invoice_id} reason={reason}"
+    ))
+}
+
+fn is_mixed_invoice_integrity_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::ClaimError(message)
+            if message.starts_with(MIXED_INVOICE_INTEGRITY_HOLD_PREFIX)
+    )
+}
+
+/// Resolve a wallet invoice's exact confidential-destination key. The sole
+/// legacy repair derives the key only when persisted descriptor provenance
+/// reproduces the already payer-visible address byte-for-byte. It never
+/// replaces an address.
+async fn resolve_invoice_claim_blinding_key_hex(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    invoice_id: Uuid,
+    output_address: &str,
+) -> Result<String, AppError> {
+    let invoice = db::get_invoice_by_id(&mut **tx, invoice_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| mixed_invoice_integrity_error(invoice_id, "invoice_missing"))?;
+    if invoice.liquid_address.as_deref() != Some(output_address) {
+        return Err(mixed_invoice_integrity_error(
+            invoice_id,
+            "claim_destination_differs_from_invoice",
+        ));
+    }
+
+    if let Some(key) = invoice.liquid_blinding_key_hex {
+        validators::validate_liquid_blinding_key_matches_address(output_address, &key).map_err(
+            |_| mixed_invoice_integrity_error(invoice_id, "blinding_key_address_mismatch"),
+        )?;
+        return Ok(key);
+    }
+
+    let Some(address_index) = invoice.liquid_address_index else {
+        return Err(mixed_invoice_integrity_error(
+            invoice_id,
+            "missing_blinding_key_without_descriptor_index",
+        ));
+    };
+    let Some(nym) = invoice.nym_owner.as_deref() else {
+        return Err(mixed_invoice_integrity_error(
+            invoice_id,
+            "missing_blinding_key_without_descriptor_owner",
+        ));
+    };
+    let index = u32::try_from(address_index).map_err(|_| {
+        mixed_invoice_integrity_error(invoice_id, "invalid_descriptor_address_index")
+    })?;
+    let user = db::get_user_by_nym(&mut **tx, nym)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| mixed_invoice_integrity_error(invoice_id, "descriptor_owner_missing"))?;
+    let derived_address = descriptor::derive_address(&user.ct_descriptor, index).map_err(|_| {
+        mixed_invoice_integrity_error(invoice_id, "descriptor_address_derivation_failed")
+    })?;
+    if derived_address != output_address {
+        return Err(mixed_invoice_integrity_error(
+            invoice_id,
+            "descriptor_does_not_reproduce_destination",
+        ));
+    }
+    let key =
+        descriptor::derive_blinding_key_hex(&user.ct_descriptor, output_address).map_err(|_| {
+            mixed_invoice_integrity_error(invoice_id, "descriptor_key_derivation_failed")
+        })?;
+    validators::validate_liquid_blinding_key_matches_address(output_address, &key)
+        .map_err(|_| mixed_invoice_integrity_error(invoice_id, "derived_key_address_mismatch"))?;
+    let repaired = sqlx::query(
+        "UPDATE invoices SET liquid_blinding_key_hex = $2 \
+          WHERE id = $1 AND liquid_blinding_key_hex IS NULL \
+            AND liquid_address = $3 AND liquid_address_index = $4",
+    )
+    .bind(invoice_id)
+    .bind(&key)
+    .bind(output_address)
+    .bind(address_index)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    if repaired.rows_affected() != 1 {
+        return Err(mixed_invoice_integrity_error(
+            invoice_id,
+            "legacy_key_repair_lost_authority",
+        ));
+    }
+    tracing::info!(
+        event = "mixed_invoice_blinding_key_repaired",
+        invoice_id = %invoice_id,
+        address_index,
+        "recovered missing key from authoritative descriptor without changing destination"
+    );
+    Ok(key)
+}
+
 /// Resolve only the private key needed to verify Bullnym's own confidential
 /// output. Bull Bitcoin's output remains opaque and is authorized by its
 /// destination script plus the exact source/merchant/fee balance.
@@ -2764,18 +2868,7 @@ async fn resolve_claim_blinding_key_hex(
     output_address: &str,
 ) -> Result<String, AppError> {
     if let Some(invoice_id) = swap.invoice_id {
-        let key: Option<String> =
-            sqlx::query_scalar("SELECT liquid_blinding_key_hex FROM invoices WHERE id = $1")
-                .bind(invoice_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|error| AppError::DbError(error.to_string()))?
-                .flatten();
-        return key.ok_or_else(|| {
-            AppError::ClaimError(format!(
-                "invoice {invoice_id} has no Liquid blinding key for mixed settlement"
-            ))
-        });
+        return resolve_invoice_claim_blinding_key_hex(tx, invoice_id, output_address).await;
     }
 
     let nym = swap.nym.as_deref().ok_or_else(|| {
@@ -3244,6 +3337,27 @@ async fn claim_swap_with_guard(
     }
     if let Err(ref e) = result {
         let err_str = e.to_string();
+        if is_mixed_invoice_integrity_error(e) {
+            match db::mark_claim_integrity_hold(pool, swap_id, &err_str).await {
+                Ok(db::ClaimFailureOutcome::Stuck) => {
+                    tracing::error!(
+                        event = "mixed_invoice_claim_integrity_hold",
+                        swap_id = %swap_id,
+                        reason = %err_str,
+                        "mixed reverse claim has unprovable destination/key authority; automatic retries disabled"
+                    );
+                    db::mark_invoice_settlement_status_for_swap(pool, swap_id, "claim_stuck")
+                        .await
+                        .map_err(|error| AppError::DbError(error.to_string()))?;
+                }
+                Ok(db::ClaimFailureOutcome::NoOp) => {}
+                Ok(db::ClaimFailureOutcome::Scheduled) => {
+                    unreachable!("permanent integrity hold cannot schedule an ordinary retry")
+                }
+                Err(error) => return Err(AppError::DbError(error.to_string())),
+            }
+            return result;
+        }
         match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
             Ok(db::ClaimFailureOutcome::Stuck) => {
                 tracing::error!(
@@ -4195,6 +4309,27 @@ async fn claim_chain_swap_with_guard(
     }
     if let Err(ref e) = result {
         let err_str = e.to_string();
+        if is_mixed_invoice_integrity_error(e) {
+            match db::mark_chain_swap_claim_integrity_hold(pool, chain_swap_id, &err_str).await {
+                Ok(db::ClaimFailureOutcome::Stuck) => {
+                    tracing::error!(
+                        event = "mixed_invoice_chain_claim_integrity_hold",
+                        swap_id = %chain_swap_id,
+                        reason = %err_str,
+                        "mixed chain claim has unprovable destination/key authority; automatic retries disabled"
+                    );
+                    db::mark_chain_swap_invoice_claim_stuck_if_current(pool, chain_swap_id)
+                        .await
+                        .map_err(|error| AppError::DbError(error.to_string()))?;
+                }
+                Ok(db::ClaimFailureOutcome::NoOp) => {}
+                Ok(db::ClaimFailureOutcome::Scheduled) => {
+                    unreachable!("permanent integrity hold cannot schedule an ordinary retry")
+                }
+                Err(error) => return Err(AppError::DbError(error.to_string())),
+            }
+            return result;
+        }
         match db::record_chain_swap_claim_failure(pool, chain_swap_id, &err_str, max_claim_attempts)
             .await
         {
@@ -4917,22 +5052,24 @@ async fn claim_chain_swap_inner(
             ))
         })?
     };
-    let merchant_blinding_key_hex =
-        invoice.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
+    let merchant_blinding_key_hex = if mixed_preparation.is_some() {
+        resolve_invoice_claim_blinding_key_hex(&mut tx, swap.invoice_id, &output_address).await?
+    } else {
+        let key = invoice.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
             AppError::ClaimError(format!(
                 "invoice {} has no Liquid blinding key for chain-swap settlement",
                 swap.invoice_id
             ))
         })?;
-    validators::validate_liquid_blinding_key_matches_address(
-        &output_address,
-        merchant_blinding_key_hex,
-    )
-    .map_err(|error| {
-        AppError::ClaimError(format!(
-            "chain-swap settlement destination/blinding key mismatch: {error}"
-        ))
-    })?;
+        validators::validate_liquid_blinding_key_matches_address(&output_address, key).map_err(
+            |error| {
+                AppError::ClaimError(format!(
+                    "chain-swap settlement destination/blinding key mismatch: {error}"
+                ))
+            },
+        )?;
+        key.to_owned()
+    };
     let default_liquid_asset_id = elements::AssetId::LIQUID_BTC.to_string();
     let liquid_asset_id = swap
         .creation_terms
@@ -5096,7 +5233,7 @@ async fn claim_chain_swap_inner(
         &claim_tx,
         &output_address,
         liquid_asset_id,
-        merchant_blinding_key_hex,
+        &merchant_blinding_key_hex,
         &boltz_response.claim_details.lockup_address,
         boltz_response
             .claim_details
@@ -5118,7 +5255,7 @@ async fn claim_chain_swap_inner(
         }) => Some(verify_mixed_claim_against_prepared(
             &claim_tx,
             &output_address,
-            merchant_blinding_key_hex,
+            &merchant_blinding_key_hex,
             &prepared,
             BullBitcoinOutputAuthority::FreshAddress(confidential_address),
             *bull_bitcoin_amount_sat,
@@ -5144,7 +5281,7 @@ async fn claim_chain_swap_inner(
             let verified = verify_mixed_claim_against_prepared(
                 &claim_tx,
                 &output_address,
-                merchant_blinding_key_hex,
+                &merchant_blinding_key_hex,
                 &prepared,
                 BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
                 *bull_bitcoin_amount_sat,
@@ -5161,7 +5298,7 @@ async fn claim_chain_swap_inner(
         prepared: &prepared.journal,
         fee_amount_sat: prepared.fee_amount_sat,
         fee_rate_sat_vb: prepared.fee_rate_sat_vb,
-        liquid_blinding_key_hex: merchant_blinding_key_hex,
+        liquid_blinding_key_hex: &merchant_blinding_key_hex,
         fee_authority: match journal_mode {
             PersistedChainClaimJournalMode::ConstructAndInsert => fee_record,
             PersistedChainClaimJournalMode::DecodeAndLoadExact => None,

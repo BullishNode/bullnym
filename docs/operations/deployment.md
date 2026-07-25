@@ -258,7 +258,7 @@ payment evidence; it does not create or mutate accounting events.
 
 Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `068_bull_bitcoin_invoice_accounting.sql`, and
-`069_bull_bitcoin_mixed_settlement.sql` in order as the privileged schema owner
+`072_mixed_invoice_blinding_key_invariant.sql` in order as the privileged schema owner
 with `--set runtime_role=bullnym_app` while every Bullnym writer is stopped.
 Take and validate a schema-066 backup first. Keep
 `features.bull_bitcoin_fiat_settlement = false` throughout migration and
