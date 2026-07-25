@@ -1,26 +1,27 @@
-// Covers the LNURL-style (LUD-06) error-envelope detection in request()
-// (see src/error.rs) — the server returns HTTP 200 with
-// {"status":"ERROR","code":"...","reason":"..."} for most failures across
-// nearly every endpoint, rather than a real non-2xx status. Before this
-// fix, request() only checked res.ok, so every such envelope silently
-// parsed as a success (e.g. createInvoice returning invoice_id: undefined).
+// Covers truthful non-2xx JSON errors plus rolling-deploy/LNURL compatibility
+// with the legacy HTTP-200 error envelope.
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { ApiError, createInvoice, fetchPayerQuote, getInvoiceStatus } from './client'
 
-function mockFetchOnce(status: number, body: unknown): void {
+function response(status: number, body: unknown, headers: Record<string, string> = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: 'irrelevant',
+    headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+    text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
+  }
+}
+
+function mockFetchOnce(status: number, body: unknown, headers: Record<string, string> = {}): void {
   vi.stubGlobal(
     'fetch',
-    vi.fn().mockResolvedValue({
-      ok: status >= 200 && status < 300,
-      status,
-      statusText: 'irrelevant',
-      json: () => Promise.resolve(body),
-      text: () => Promise.resolve(JSON.stringify(body)),
-    }),
+    vi.fn().mockResolvedValue(response(status, body, headers)),
   )
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -86,9 +87,13 @@ describe('request() error-envelope detection', () => {
     expect(res.invoice_id).toBe('real-id')
   })
 
-  it('still throws for a real non-2xx status (unchanged behavior)', async () => {
-    mockFetchOnce(401, 'unauthorized')
-    await expect(getInvoiceStatus('x')).rejects.toMatchObject({ status: 401 })
+  it('preserves the code and sanitized reason from a non-2xx JSON envelope', async () => {
+    mockFetchOnce(500, { status: 'ERROR', code: 'InternalError', reason: 'Internal server error.' })
+    await expect(getInvoiceStatus('x')).rejects.toMatchObject({
+      status: 500,
+      code: 'InternalError',
+      message: 'Internal server error.',
+    })
   })
 
   it('POSTs to <invoice_base>/invoice, so an alias base stays nym-free', async () => {
@@ -153,6 +158,27 @@ describe('request() error-envelope detection', () => {
       headers: { 'Content-Type': 'application/json' },
       body: '{"rail":"liquid"}',
     })
+  })
+
+  it('retries QUOTE_BUSY exactly once using Retry-After and preserves the code if it stays busy', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const busy = { status: 'ERROR', code: 'QUOTE_BUSY', reason: 'The invoice quote is being updated.' }
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response(503, busy, { 'retry-after': '1' }))
+      .mockResolvedValueOnce(response(503, busy, { 'retry-after': '1' }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = fetchPayerQuote('invoice-id', 'bitcoin').catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(1_000)
+    await expect(pending).resolves.toMatchObject({
+      status: 503,
+      code: 'QUOTE_BUSY',
+      retryAfterSeconds: 1,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
   })
 
   it('keeps status reads as a projection-only GET', async () => {

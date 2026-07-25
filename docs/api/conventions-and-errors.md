@@ -31,7 +31,7 @@ required route in the target environment.
 
 ## Error contract
 
-Most application errors deliberately return HTTP `200` in an LNURL-compatible
+JSON API application errors return a truthful non-2xx status with a stable
 envelope:
 
 ```json
@@ -42,23 +42,27 @@ envelope:
 }
 ```
 
-Clients must decode the body and check `status == "ERROR"` for every JSON API
-response, including HTTP 2xx responses.
+LNURL metadata/callback endpoints are the deliberate protocol exception: LUD-06
+errors retain HTTP `200` with the same envelope. During a rolling deployment,
+clients should continue checking `status == "ERROR"` on successful responses so
+they remain compatible with a pre-0.3 server.
 
 | HTTP status | Meaning |
 |---|---|
-| `200` | Success or most coded application errors; inspect the body. |
+| `200` | Success, or a coded error only on an LNURL/LUD-06 endpoint. |
 | `201` | Successful nym registration. |
-| `400` | Framework query/path or malformed-JSON rejection; generally not a Bullnym error envelope. |
-| `401` | `AuthError`: malformed key/signature, bad signature, or timestamp outside the allowed window. |
-| `409` | A supplied Bitcoin/Liquid address is already assigned, a public name is permanently reserved, or this npub already owns another permanent nym/alias. Blind retry is wrong. |
+| `400` | Request validation failure, or a framework query/path/malformed-JSON rejection. Framework responses may not use the Bullnym envelope. |
+| `401` | Authentication/signature failure or an invalid/revoked scoped credential. |
+| `404` | A requested nym, donation page, invoice, or UTXO does not exist. Route-level 404s may be HTML/plain text. |
+| `409` | A durable ownership, policy, state, or resource conflict. Blind retry without refreshing/changing state is wrong. |
 | `410` | Deprecated Liquid-offer endpoint. |
 | `413` | Axum request-body limit exceeded before the handler. |
-| `429` | Wallet-backup source or authenticated-key rate limit. |
-| `404`, `405` | Route not found or method not allowed; may be HTML/plain text rather than JSON. |
+| `429` | Sender/recipient/network/pending-reservation rate limit. |
+| `405` | Method not allowed; may be HTML/plain text rather than JSON. |
 | `415` | Missing or unsupported JSON `Content-Type`; framework response, not a Bullnym envelope. |
 | `422` | JSON syntax was valid but could not deserialize into the request type; framework response. |
-| `503` | Hard configured capacity, or readiness failure on `/ready`. |
+| `500` | Unexpected database/internal/claim failure; the message is sanitized. |
+| `503` | Transient dependency/readiness/capacity failure, or typed quote contention. |
 
 Only errors produced after a request reaches a Bullnym handler use the stable
 `status`/`code`/`reason` envelope. Axum extractor, routing, and body-limit
@@ -74,12 +78,12 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 `ProofOfFundsRequired`, `ProofOfFundsInvalid`, `UtxoNotFound`, `UtxoSpent`,
 `PubkeyUtxoMismatch`, `RateLimitedSender`, `RateLimitedRecipient`,
 `RateLimitedNetwork`, `BackendThrottled`, `TooManyPendingReservations`,
-`ServiceUnavailable`, `PurgeBlocked`, `RecoveryAddressInvalid`,
+`ServiceUnavailable`, `QUOTE_BUSY`, `PurgeBlocked`, `RecoveryAddressInvalid`,
 `RecoveryNotAvailable`, `ElectrumError`, `BoltzError`,
 `ClaimError`, and `InternalError`.
 
-The wallet-backup API deliberately uses strict HTTP statuses rather than the
-LNURL-compatible HTTP-200 error behavior. Its additional stable codes are
+The wallet-backup API uses its own strict error shape/status mapping. Its
+additional stable codes are
 `BackupInvalidRequest`, `BackupAuthError`, `BackupHeadConflict`,
 `BackupBlobTooLarge`, and `BackupCapacityExceeded`; see
 [Opaque wallet backups](wallet-backups.md).

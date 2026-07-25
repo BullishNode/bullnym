@@ -117,7 +117,60 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
     assert_eq!(projection.fiat_percentage, Some(100));
     assert_eq!(projection.creation_rate_minor_per_btc, Some(6_416_000));
     assert_eq!(projection.creation_rate_currency.as_deref(), Some("USD"));
-    assert_eq!(projection.fallback_reasons, vec!["conversion_unavailable"]);
+    assert_eq!(projection.fallback_reasons, vec!["ambiguous_create"]);
+    assert_eq!(
+        projection.effective_fallback_reason(),
+        None,
+        "a funded binding must supersede an abandoned speculative attempt"
+    );
+}
+
+#[test]
+fn merchant_projection_uses_latest_unsuperseded_fallback_without_relabelling() {
+    let invoice_id = Uuid::new_v4();
+    let rows = vec![
+        db::InvoiceBullBitcoinSettlementProjection {
+            invoice_id,
+            purpose: "mixed".into(),
+            bull_bitcoin_order_id: None,
+            fiat_currency: "CAD".into(),
+            settlement_status: "none".into(),
+            creation_rate_minor_per_btc: None,
+            creation_rate_currency: None,
+            credited_fiat_minor: None,
+            quoted_fiat_minor: None,
+            execution_rate_minor_per_btc: None,
+            fiat_percentage: Some(40),
+            funding_route: Some("bitcoin_fallback".into()),
+            fallback_category: Some("conversion_unavailable".into()),
+            merchant_bitcoin_sat: None,
+            merchant_bitcoin_settled: false,
+        },
+        db::InvoiceBullBitcoinSettlementProjection {
+            invoice_id,
+            purpose: "mixed".into(),
+            bull_bitcoin_order_id: None,
+            fiat_currency: "CAD".into(),
+            settlement_status: "none".into(),
+            creation_rate_minor_per_btc: None,
+            creation_rate_currency: None,
+            credited_fiat_minor: None,
+            quoted_fiat_minor: None,
+            execution_rate_minor_per_btc: None,
+            fiat_percentage: Some(40),
+            funding_route: Some("bitcoin_fallback".into()),
+            fallback_category: Some("ambiguous_create".into()),
+            merchant_bitcoin_sat: None,
+            merchant_bitcoin_settled: false,
+        },
+    ];
+    let projection = merchant_invoice_settlement_projections(rows)
+        .remove(&invoice_id)
+        .unwrap();
+    assert_eq!(
+        projection.effective_fallback_reason(),
+        Some("ambiguous_create")
+    );
 }
 
 #[test]
