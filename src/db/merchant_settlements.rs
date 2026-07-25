@@ -1189,7 +1189,7 @@ async fn sync_mixed_bull_bitcoin_event(
     if snapshot.context.path() != MerchantSettlementPath::LiquidClaim {
         return Ok(());
     }
-    let row: Option<(
+    type MixedBullBitcoinEventRow = (
         Uuid,
         Uuid,
         String,
@@ -1198,7 +1198,8 @@ async fn sync_mixed_bull_bitcoin_event(
         Option<Uuid>,
         Option<Uuid>,
         Option<i64>,
-    )> = sqlx::query_as(
+    );
+    let row: Option<MixedBullBitcoinEventRow> = sqlx::query_as(
         "SELECT settlement.id, settlement.invoice_id, output.txid, output.vout, \
                 output.authorized_amount_sat, \
                 COALESCE(reverse_swap.invoice_quote_version_id, \

@@ -17518,7 +17518,8 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
         .await
     );
 
-    let events: Vec<(String, i64, Option<i64>, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+    type MixedValuationEventRow = (String, i64, Option<i64>, Option<Uuid>, Option<Uuid>);
+    let events: Vec<MixedValuationEventRow> = sqlx::query_as(
         "SELECT source, amount_sat, fiat_credited_minor, \
                 fiat_valuation_quote_version_id, invoice_quote_offer_id \
            FROM invoice_payment_events WHERE invoice_id = $1 \
