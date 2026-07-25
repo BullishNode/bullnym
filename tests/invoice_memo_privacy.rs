@@ -70,6 +70,7 @@ fn public_status_response_hides_memo() {
         fiat_currency: None,
         remaining_amount_sat: 1000,
         payment_tolerance_sat: 0,
+        creation_rate_minor_per_btc: None,
         rate_minor_per_btc: None,
         rate_locks_until_unix: 0,
         expires_at_unix: 0,

@@ -64,6 +64,7 @@ pub struct StoredBullBitcoinSettlement {
     pub reconcile_attempts: i32,
     pub actual_received_sat: Option<i64>,
     pub credited_fiat_minor: Option<i64>,
+    pub execution_rate_minor_per_btc: Option<i64>,
     pub provider_final: bool,
 }
 
@@ -147,8 +148,9 @@ struct ReverseMixedSettlementAccountingRow {
 
 /// Privacy-minimal, local-only projection for the signed merchant invoice
 /// list. It deliberately excludes payer instructions, transaction identifiers,
-/// account identity, rates, and raw provider state. The one Bitcoin amount is
-/// the exact merchant output needed to explain a mixed settlement.
+/// account identity, and raw provider state. It includes only the immutable
+/// invoice reference rate and provider-final execution rate needed for the
+/// merchant accounting contract.
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
 pub struct InvoiceBullBitcoinSettlementProjection {
     pub invoice_id: Uuid,
@@ -156,8 +158,11 @@ pub struct InvoiceBullBitcoinSettlementProjection {
     pub bull_bitcoin_order_id: Option<Uuid>,
     pub fiat_currency: String,
     pub settlement_status: String,
+    pub creation_rate_minor_per_btc: Option<i64>,
+    pub creation_rate_currency: Option<String>,
     pub credited_fiat_minor: Option<i64>,
     pub quoted_fiat_minor: Option<i64>,
+    pub execution_rate_minor_per_btc: Option<i64>,
     pub fiat_percentage: Option<i16>,
     pub funding_route: Option<String>,
     pub fallback_category: Option<String>,
@@ -190,7 +195,7 @@ const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
      extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
-     actual_received_sat, credited_fiat_minor, provider_final";
+     actual_received_sat, credited_fiat_minor, execution_rate_minor_per_btc, provider_final";
 
 /// Copy an invoice's immutable mixed policy onto the reverse swap in the same
 /// transaction that makes the Boltz obligation durable. A 0%/100% policy does
@@ -432,8 +437,23 @@ where
     sqlx::query_as(
         "SELECT settlement.invoice_id, settlement.purpose, \
                 settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
-                settlement.settlement_status, settlement.credited_fiat_minor, \
-                settlement.quoted_fiat_minor, settlement.fiat_percentage, \
+                settlement.settlement_status, \
+                CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND creation_quote.rate_minor_per_btc > 0 \
+                      AND creation_quote.fiat_currency = invoice.fiat_currency \
+                     THEN creation_quote.rate_minor_per_btc END \
+                    AS creation_rate_minor_per_btc, \
+                CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND creation_quote.rate_minor_per_btc > 0 \
+                      AND creation_quote.fiat_currency = invoice.fiat_currency \
+                     THEN creation_quote.fiat_currency END \
+                    AS creation_rate_currency, \
+                settlement.credited_fiat_minor, \
+                settlement.quoted_fiat_minor, \
+                CASE WHEN settlement.provider_final \
+                     THEN settlement.execution_rate_minor_per_btc END \
+                    AS execution_rate_minor_per_btc, \
+                settlement.fiat_percentage, \
                 settlement.funding_route, settlement.fallback_category, \
                 merchant.authorized_amount_sat AS merchant_bitcoin_sat, \
                 EXISTS ( \
@@ -447,6 +467,11 @@ where
                        AND event.accounting_state = 'active' \
                 ) AS merchant_bitcoin_settled \
            FROM bull_bitcoin_settlements settlement \
+           JOIN invoices invoice ON invoice.id = settlement.invoice_id \
+            AND invoice.npub_owner = settlement.owner_npub \
+           LEFT JOIN invoice_quote_versions creation_quote \
+             ON creation_quote.invoice_id = invoice.id \
+            AND creation_quote.version_number = 1 \
            LEFT JOIN bull_bitcoin_claim_outputs merchant \
              ON merchant.settlement_id = settlement.id \
             AND merchant.role = 'merchant' \
@@ -1006,6 +1031,8 @@ pub async fn record_bull_bitcoin_observation(
                 actual_received_sat = COALESCE($5, actual_received_sat), \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
+                execution_rate_minor_per_btc = COALESCE( \
+                    $11, execution_rate_minor_per_btc), \
                 provider_final = $7, \
                 settlement_status = CASE \
                     WHEN $7 THEN 'settled' \
@@ -1031,7 +1058,7 @@ pub async fn record_bull_bitcoin_observation(
                                     SELECT 1 FROM invoice_payment_events event \
                                      WHERE event.invoice_id = invoice.id \
                                 ) \
-                         ) THEN GREATEST($9, $11) \
+                         ) THEN GREATEST($9, $12) \
                         ELSE $9 END)::DOUBLE PRECISION) END, \
                 updated_at = now() \
           WHERE id = $1 AND provider_state = 'bound' \
@@ -1054,6 +1081,11 @@ pub async fn record_bull_bitcoin_observation(
     .bind(
         observation
             .quoted_fiat_minor
+            .map(|amount| amount.as_minor()),
+    )
+    .bind(
+        observation
+            .execution_rate_minor_per_btc
             .map(|amount| amount.as_minor()),
     )
     .bind(late_watch_poll_secs)

@@ -70,8 +70,11 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
             bull_bitcoin_order_id: Some(order_id),
             fiat_currency: "CAD".into(),
             settlement_status: "pending".into(),
+            creation_rate_minor_per_btc: Some(6_416_000),
+            creation_rate_currency: Some("USD".into()),
             credited_fiat_minor: None,
             quoted_fiat_minor: Some(5_000),
+            execution_rate_minor_per_btc: None,
             fiat_percentage: Some(100),
             funding_route: Some("bull_bitcoin".into()),
             fallback_category: None,
@@ -84,8 +87,11 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
             bull_bitcoin_order_id: None,
             fiat_currency: "CAD".into(),
             settlement_status: "none".into(),
+            creation_rate_minor_per_btc: Some(6_416_000),
+            creation_rate_currency: Some("USD".into()),
             credited_fiat_minor: None,
             quoted_fiat_minor: None,
+            execution_rate_minor_per_btc: None,
             fiat_percentage: None,
             funding_route: Some("bitcoin_fallback".into()),
             fallback_category: Some("ambiguous_create".into()),
@@ -101,6 +107,7 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
             amount_minor: None,
             // The locked quote is exposed while the leg is still pending.
             quoted_amount_minor: Some(5_000),
+            execution_rate_minor_per_btc: None,
             currency: "CAD".into(),
             order_id,
             status: "pending".into(),
@@ -108,6 +115,8 @@ fn merchant_bull_bitcoin_projection_is_minimal_and_never_fabricates_fiat() {
     );
     // The captured split is surfaced from the settlement row.
     assert_eq!(projection.fiat_percentage, Some(100));
+    assert_eq!(projection.creation_rate_minor_per_btc, Some(6_416_000));
+    assert_eq!(projection.creation_rate_currency.as_deref(), Some("USD"));
     assert_eq!(projection.fallback_reasons, vec!["conversion_unavailable"]);
 }
 

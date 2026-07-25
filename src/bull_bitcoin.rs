@@ -430,6 +430,9 @@ pub struct OrderObservation {
     /// payout status. Distinct from `credited_fiat_minor`, which is only the
     /// settled amount at a final payout.
     pub quoted_fiat_minor: Option<FiatAmountMinor>,
+    /// API-Orders' explicit exchangeRateAmount in payout-currency minor units
+    /// per BTC. This is provider evidence, never a ratio inferred by Bullnym.
+    pub execution_rate_minor_per_btc: Option<FiatAmountMinor>,
     pub provider_final: bool,
     pub provider_terminal: bool,
 }

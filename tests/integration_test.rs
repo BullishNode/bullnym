@@ -3007,6 +3007,7 @@ async fn get_paid_history_marks_terminal_mixed_fiat_outcome_as_problem() {
         actual_received_sat: Some(40_100),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: false,
         provider_terminal: true,
     }))
@@ -3153,6 +3154,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         actual_received_sat: Some(40_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -3751,6 +3753,7 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -3837,6 +3840,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
             // provider-declared terminal failure.
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
             quoted_fiat_minor: None,
+            execution_rate_minor_per_btc: None,
             provider_final: false,
             provider_terminal: true,
         }))
@@ -3928,6 +3932,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
         actual_received_sat: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -3977,6 +3982,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         actual_received_sat: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -3990,6 +3996,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         actual_received_sat: Some(25_001),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -4059,6 +4066,7 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         actual_received_sat: Some(27_500),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -4325,6 +4333,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         actual_received_sat: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -4374,6 +4383,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         actual_received_sat: Some(25_000),
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: false,
         provider_terminal: false,
     }))
@@ -4403,6 +4413,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         actual_received_sat: Some(25_000),
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
         provider_final: true,
         provider_terminal: false,
     }))
@@ -4577,6 +4588,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
             actual_received_sat: Some(27_500),
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
             quoted_fiat_minor: None,
+            execution_rate_minor_per_btc: None,
             provider_final: true,
             provider_terminal: false,
         },
@@ -4759,7 +4771,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "074_bull_bitcoin_execution_rate"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -5000,7 +5012,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "074_bull_bitcoin_execution_rate"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -16490,6 +16502,7 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
         let (status, body) = get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["pricing_mode"], "fiat_fixed");
+        assert_eq!(body["creation_rate_minor_per_btc"], Value::Null);
         assert_eq!(body["rate_minor_per_btc"], Value::Null);
         assert_eq!(body["rate_locks_until_unix"], 0);
         assert!(body["expires_at_unix"].as_i64().unwrap() > 0);
@@ -16536,6 +16549,7 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
         get_path(&app, &format!("/api/v1/invoices/{sat_invoice_id}/status")).await;
     assert_eq!(sat_status, StatusCode::OK, "{sat_body}");
     assert_eq!(sat_body["pricing_mode"], "sat_fixed");
+    assert_eq!(sat_body["creation_rate_minor_per_btc"], Value::Null);
     assert_eq!(sat_body["rate_minor_per_btc"], Value::Null);
     assert_eq!(
         sat_body["rate_locks_until_unix"], sat_body["expires_at_unix"],
@@ -17574,7 +17588,7 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
     cleanup_db(&pool).await;
 
     let fake = ScriptedBullBitcoinApi::default();
-    let (state, owner_npub, credential_id, _) =
+    let (state, owner_npub, credential_id, keypair) =
         fiat_lifecycle_test_state(&pool, fake.clone(), "mixed-fiat-lightning-quote").await;
     pay_service::db::upsert_fiat_settlement_setting(
         &pool,
@@ -17697,6 +17711,7 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
         actual_received_sat: Some(5_000),
         credited_fiat_minor: Some(FiatAmountMinor::new(31_406).unwrap()),
         quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: Some(FiatAmountMinor::new(6_390_000).unwrap()),
         provider_final: true,
         provider_terminal: false,
     }))
@@ -17815,15 +17830,41 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
     pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
         .await
         .unwrap();
-    let provider_credit: i64 = sqlx::query_scalar(
-        "SELECT credited_fiat_minor FROM bull_bitcoin_settlements WHERE id = $1",
+    let (provider_credit, execution_rate): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT credited_fiat_minor, execution_rate_minor_per_btc \
+           FROM bull_bitcoin_settlements WHERE id = $1",
     )
     .bind(settlement_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(provider_credit, 31_406);
+    assert_eq!(execution_rate, Some(6_390_000));
     assert_ne!(quote_target_minor, provider_credit);
+
+    let accounting_app = test_app(state.clone());
+    let (status, status_body) = get_path(
+        &accounting_app,
+        &format!("/api/v1/invoices/{}/status", invoice.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{status_body}");
+    assert_eq!(status_body["creation_rate_minor_per_btc"], 10_000_000);
+
+    let history_uri =
+        get_paid_transaction_history_uri(&keypair, &owner_npub, "", 10, auth_timestamp());
+    let (status, history) = get_path(&accounting_app, &history_uri).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let item = &history["transactions"][0];
+    assert_eq!(
+        item["settlement_details"]["creation_rate_minor_per_btc"],
+        10_000_000
+    );
+    assert_eq!(item["settlement_details"]["creation_rate_currency"], "USD");
+    assert_eq!(
+        item["settlement_details"]["fiat"][0]["execution_rate_minor_per_btc"],
+        6_390_000
+    );
 
     pricer_task.abort();
     let _ = pricer_task.await;
@@ -23259,7 +23300,7 @@ async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit()
     let observed_row_lock_wait = observe_recovery_lock_wait(
         &pool,
         expiry_backend_pid,
-        "%UPDATE invoices SET status = CASE%",
+        "%UPDATE invoices invoice SET status = CASE%",
     )
     .await
     .unwrap();

@@ -559,6 +559,9 @@ known Bull Bitcoin order ID. It never calls an order-list endpoint.
 - no retry storm on authentication or schema errors;
 - decrypt the key only for the duration of one request;
 - require the response order ID and fiat currency to match the binding;
+- persist API-Orders' explicit positive `exchangeRateAmount` only when its
+  `exchangeRateCurrency` matches the bound payout currency; never derive or
+  backfill an execution rate from rounded payout/received totals;
 - atomically update the minimal projection and idempotent payment event;
 - clear the no-longer-needed BOLT11/address/BIP21 when the order becomes
   terminal;

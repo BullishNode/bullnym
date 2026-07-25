@@ -1410,6 +1410,34 @@ pub async fn current_invoice_quote<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Immutable invoice-creation reference rate (R1). Only fiat-priced invoices
+/// have this accounting estimate; sat-priced invoices deliberately return
+/// `None`. Version 1 is append-only and must never be replaced by a later
+/// payer-instruction or late-observation quote.
+pub async fn invoice_creation_rate_minor_per_btc<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<Option<i64>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND quote.rate_minor_per_btc > 0 \
+                      AND quote.fiat_currency = invoice.fiat_currency \
+                     THEN quote.rate_minor_per_btc END \
+           FROM invoices invoice \
+      LEFT JOIN invoice_quote_versions quote \
+             ON quote.invoice_id = invoice.id \
+            AND quote.version_number = 1 \
+          WHERE invoice.id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(executor)
+    .await
+    .map(Option::flatten)
+}
+
 /// Recomputed fiat projection used by every payment reducer. Immutable event
 /// deltas remain audit evidence; current accounting and presentation are
 /// derived cumulatively per quote so split payments and reorgs are order-safe.

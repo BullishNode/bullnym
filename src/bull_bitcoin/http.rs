@@ -293,6 +293,7 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
     // repriced late payment. It is captured independently of the settled
     // credit so a pending leg can already show its amount.
     let quoted_fiat_minor = parse_optional_fiat_field(order, "payoutAmount")?;
+    let execution_rate_minor_per_btc = parse_execution_rate(order, currency)?;
     let credited_fiat_minor = if payout_status == "Completed" && !provider_terminal {
         Some(parse_fiat_field(order, "payoutAmount")?)
     } else {
@@ -312,6 +313,7 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         actual_received_sat,
         credited_fiat_minor,
         quoted_fiat_minor,
+        execution_rate_minor_per_btc,
         provider_final,
         provider_terminal,
     })
@@ -475,6 +477,26 @@ fn parse_optional_fiat_field(
         None => Ok(None),
         Some(field_value) if field_value.is_null() => Ok(None),
         Some(_) => parse_fiat_field(value, field).map(Some),
+    }
+}
+
+fn parse_execution_rate(
+    value: &Value,
+    payout_currency: FiatCurrency,
+) -> Result<Option<FiatAmountMinor>, BullBitcoinError> {
+    let amount = value.get("exchangeRateAmount");
+    let currency = value.get("exchangeRateCurrency");
+    match (amount, currency) {
+        (None, None) => Ok(None),
+        (Some(amount), Some(currency)) if amount.is_null() && currency.is_null() => Ok(None),
+        (Some(amount), Some(currency)) if !amount.is_null() && !currency.is_null() => {
+            let rate_currency = parse_currency_field(value, "exchangeRateCurrency")?;
+            if rate_currency != payout_currency {
+                return Err(BullBitcoinError::Integrity);
+            }
+            parse_fiat_field(value, "exchangeRateAmount").map(Some)
+        }
+        _ => Err(BullBitcoinError::MalformedResponse),
     }
 }
 
@@ -785,12 +807,18 @@ mod tests {
                 "requestedAmount": 0.001,
                 "receivedAmount": 0.00100001
             },
-            "payoutAmount": 61.23
+            "payoutAmount": 61.23,
+            "exchangeRateAmount": 61230.45,
+            "exchangeRateCurrency": "EUR"
         }))
         .unwrap();
         assert_eq!(observation.actual_received_sat, Some(100_001));
         assert_eq!(observation.credited_fiat_minor.unwrap().as_minor(), 6_123);
         assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 6_123);
+        assert_eq!(
+            observation.execution_rate_minor_per_btc.unwrap().as_minor(),
+            6_123_045
+        );
         assert!(observation.provider_final);
         assert!(!observation.provider_terminal);
     }
@@ -887,6 +915,46 @@ mod tests {
         .unwrap();
         assert_eq!(observation.quoted_fiat_minor, None);
         assert_eq!(observation.credited_fiat_minor, None);
+        assert_eq!(observation.execution_rate_minor_per_btc, None);
+    }
+
+    #[test]
+    fn observation_rejects_malformed_or_inconsistent_execution_rates() {
+        let base = serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payoutCurrency": "CAD",
+            "orderStatus": "In progress",
+            "payinStatus": "Awaiting payment",
+            "payoutStatus": "Not started",
+            "payinAmount": 0.001
+        });
+
+        for (amount, currency) in [
+            (Some(serde_json::json!(0)), Some(serde_json::json!("CAD"))),
+            (Some(serde_json::json!(-1)), Some(serde_json::json!("CAD"))),
+            (Some(serde_json::json!(61_000)), None),
+            (None, Some(serde_json::json!("CAD"))),
+        ] {
+            let mut order = base.clone();
+            if let Some(amount) = amount {
+                order["exchangeRateAmount"] = amount;
+            }
+            if let Some(currency) = currency {
+                order["exchangeRateCurrency"] = currency;
+            }
+            assert_eq!(
+                parse_order_observation(&order),
+                Err(BullBitcoinError::MalformedResponse)
+            );
+        }
+
+        let mut wrong_currency = base;
+        wrong_currency["exchangeRateAmount"] = serde_json::json!(61_000);
+        wrong_currency["exchangeRateCurrency"] = serde_json::json!("USD");
+        assert_eq!(
+            parse_order_observation(&wrong_currency),
+            Err(BullBitcoinError::Integrity)
+        );
     }
 
     #[test]

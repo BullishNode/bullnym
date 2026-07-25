@@ -1407,6 +1407,14 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'execution_rate_minor_per_btc' \
+                   AND data_type = 'bigint' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
                    AND table_name = 'invoice_payment_events' \
                    AND column_name = 'bull_bitcoin_settlement_id' \
                    AND data_type = 'uuid' \
@@ -1422,6 +1430,7 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_status_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_swap_binding_chk'), \

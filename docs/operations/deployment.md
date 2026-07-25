@@ -254,19 +254,25 @@ the timestamp column, immutable stamping trigger, indexes, and runtime read
 privilege before serving traffic. The endpoint reads existing swap and invoice
 payment evidence; it does not create or mutate accounting events.
 
-## Migrations 067-073 Bull Bitcoin fiat settlement
+## Migrations 067-074 Bull Bitcoin fiat settlement
 
 Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `068_bull_bitcoin_invoice_accounting.sql`,
 `069_bull_bitcoin_mixed_settlement.sql`,
 `070_bull_bitcoin_quoted_fiat.sql`,
 `071_mixed_invoice_payin_valuation.sql`,
-`072_mixed_invoice_blinding_key_invariant.sql`, and
-`073_unfunded_provider_watch.sql` in order as the privileged schema owner with
+`072_mixed_invoice_blinding_key_invariant.sql`,
+`073_unfunded_provider_watch.sql`, and
+`074_bull_bitcoin_execution_rate.sql` in order as the privileged schema owner with
 `--set runtime_role=bullnym_app` while every Bullnym writer is stopped. Take
 and validate a schema-066 backup first. Keep
 `features.bull_bitcoin_fiat_settlement = false` throughout migration and
 initial service verification.
+
+Migration 074 adds one nullable, positive-only execution-rate column and does
+not backfill legacy orders or change runtime grants. Start only a matching
+schema-074 binary after it is applied. Readiness verifies both the column and
+its validated constraint before the service accepts traffic.
 
 Deploy the compatible API-Orders release before Bullnym. Its scoped contract
 must provide `validateSellToBalance`, `sellToBalance`, and same-key
