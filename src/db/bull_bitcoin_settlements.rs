@@ -482,6 +482,18 @@ where
                  AND settlement.funding_committed_at IS NOT NULL) \
                 OR settlement.funding_route = 'bitcoin_fallback' \
             ) \
+            AND NOT ( \
+                invoice.status IN ('expired', 'cancelled') \
+                AND COALESCE(invoice.presentation_status, invoice.status) = 'unpaid' \
+                AND settlement.purpose = 'fiat_only' \
+                AND settlement.actual_received_sat IS NULL \
+                AND NOT settlement.provider_final \
+                AND settlement.settlement_status IN ('pending', 'unavailable') \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events event \
+                     WHERE event.invoice_id = invoice.id \
+                ) \
+            ) \
           ORDER BY settlement.created_at, settlement.id",
     )
     .bind(owner_npub)
