@@ -630,12 +630,9 @@ fn project_lightning_address_settlement(
     row: db::LightningAddressBullBitcoinSettlementProjection,
 ) -> Result<LightningAddressSettlementEntry, AppError> {
     if row.funding_route.as_deref() == Some("bitcoin_fallback") {
-        let reason = match row.fallback_category.as_deref() {
-            Some("below_minimum") => "below_minimum",
-            Some("invalid_split") => "invalid_split",
-            Some("conversion_unavailable" | "ambiguous_create") | None => "conversion_unavailable",
-            Some(_) => "conversion_unavailable",
-        };
+        let reason = crate::bull_bitcoin_settlement::projected_fallback_reason(
+            row.fallback_category.as_deref(),
+        );
         return Ok(LightningAddressSettlementEntry::BitcoinFallback {
             fiat_conversion: FiatConversionOverride {
                 status: "overridden",
@@ -857,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn lightning_address_projection_collapses_fallback_details() {
+    fn lightning_address_projection_preserves_known_fallback_category() {
         let projected = project_lightning_address_settlement(
             db::LightningAddressBullBitcoinSettlementProjection {
                 purpose: "mixed".into(),
@@ -877,7 +874,34 @@ mod tests {
             LightningAddressSettlementEntry::BitcoinFallback {
                 fiat_conversion: FiatConversionOverride {
                     status: "overridden",
-                    reason: "conversion_unavailable",
+                    reason: "ambiguous_create",
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn lightning_address_projection_marks_missing_fallback_category_unknown() {
+        let projected = project_lightning_address_settlement(
+            db::LightningAddressBullBitcoinSettlementProjection {
+                purpose: "fiat_only".into(),
+                bull_bitcoin_order_id: None,
+                fiat_currency: "USD".into(),
+                settlement_status: "none".into(),
+                credited_fiat_minor: None,
+                funding_route: Some("bitcoin_fallback".into()),
+                fallback_category: None,
+                merchant_bitcoin_sat: None,
+                merchant_bitcoin_settled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            LightningAddressSettlementEntry::BitcoinFallback {
+                fiat_conversion: FiatConversionOverride {
+                    status: "overridden",
+                    reason: "unknown",
                 },
             }
         );

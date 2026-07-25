@@ -64,6 +64,7 @@ pub struct StoredBullBitcoinSettlement {
     pub reconcile_attempts: i32,
     pub actual_received_sat: Option<i64>,
     pub credited_fiat_minor: Option<i64>,
+    pub quoted_fiat_minor: Option<i64>,
     pub provider_final: bool,
 }
 
@@ -190,7 +191,7 @@ const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
      extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
-     actual_received_sat, credited_fiat_minor, provider_final";
+     actual_received_sat, credited_fiat_minor, quoted_fiat_minor, provider_final";
 
 /// Copy an invoice's immutable mixed policy onto the reverse swap in the same
 /// transaction that makes the Boltz obligation durable. A 0%/100% policy does
@@ -749,8 +750,8 @@ pub async fn abandon_bull_bitcoin_dispatch(
     connection: &mut PgConnection,
     settlement_id: Uuid,
     fallback_category: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET provider_state = 'abandoned', \
                 funding_route = 'bitcoin_fallback', \
@@ -761,7 +762,7 @@ pub async fn abandon_bull_bitcoin_dispatch(
     .bind(fallback_category)
     .execute(connection)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// A mixed order may be bound but not yet referenced by claim bytes. In that
@@ -943,19 +944,19 @@ pub async fn reverse_mixed_settlement_accounting(
 pub async fn recover_stale_bull_bitcoin_dispatches(
     pool: &PgPool,
     stale_after_secs: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
+) -> Result<Vec<StoredBullBitcoinSettlement>, sqlx::Error> {
+    sqlx::query_as::<_, StoredBullBitcoinSettlement>(&format!(
         "UPDATE bull_bitcoin_settlements \
             SET provider_state = 'abandoned', \
                 funding_route = 'bitcoin_fallback', \
                 fallback_category = 'ambiguous_create', updated_at = now() \
           WHERE provider_state = 'dispatch_started' \
-            AND updated_at < now() - make_interval(secs => $1::DOUBLE PRECISION)",
-    )
+            AND updated_at < now() - make_interval(secs => $1::DOUBLE PRECISION) \
+         RETURNING {SETTLEMENT_PROJECTION}"
+    ))
     .bind(stale_after_secs)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn claim_bull_bitcoin_reconciliation_batch(

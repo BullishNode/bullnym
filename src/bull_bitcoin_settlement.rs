@@ -51,6 +51,108 @@ impl FallbackCategory {
     }
 }
 
+/// Stable public/audit projection for persisted fallback categories. Keep
+/// known causes distinct; corrupt, missing, or future values are explicit
+/// instead of being silently relabelled as a conversion outage.
+pub fn projected_fallback_reason(value: Option<&str>) -> &'static str {
+    match value {
+        Some("below_minimum") => "below_minimum",
+        Some("invalid_split") => "invalid_split",
+        Some("conversion_unavailable") => "conversion_unavailable",
+        Some("ambiguous_create") => "ambiguous_create",
+        Some(_) | None => "unknown",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FallbackDecisionLogFields<'a> {
+    event: &'static str,
+    category: &'static str,
+    requested_sats: i64,
+    fiat_currency: &'a str,
+    fiat_amount_minor: Option<i64>,
+    invoice_id: Option<Uuid>,
+    reverse_swap_id: Option<Uuid>,
+    chain_swap_id: Option<Uuid>,
+    settlement_id: Uuid,
+    selected_fallback_rail: &'static str,
+    speculative: bool,
+    transition: &'static str,
+}
+
+fn fallback_decision_log_fields<'a>(
+    stored: &'a StoredBullBitcoinSettlement,
+    category: FallbackCategory,
+    transition: &'static str,
+) -> FallbackDecisionLogFields<'a> {
+    FallbackDecisionLogFields {
+        event: "bull_bitcoin_fallback_committed",
+        category: category.as_str(),
+        requested_sats: stored.requested_bitcoin_sat,
+        fiat_currency: &stored.fiat_currency,
+        fiat_amount_minor: stored.quoted_fiat_minor,
+        invoice_id: stored.invoice_id,
+        reverse_swap_id: stored.reverse_swap_id,
+        chain_swap_id: stored.chain_swap_id,
+        settlement_id: stored.id,
+        selected_fallback_rail: "bitcoin",
+        speculative: stored.purpose == "mixed" && stored.funding_committed_at_unix.is_none(),
+        transition,
+    }
+}
+
+fn emit_committed_fallback_decision(
+    stored: &StoredBullBitcoinSettlement,
+    category: FallbackCategory,
+    transition: &'static str,
+) {
+    let fields = fallback_decision_log_fields(stored, category, transition);
+    tracing::info!(
+        event = fields.event,
+        category = fields.category,
+        requested_sats = fields.requested_sats,
+        fiat_currency = fields.fiat_currency,
+        fiat_amount_minor = ?fields.fiat_amount_minor,
+        invoice_id = ?fields.invoice_id,
+        reverse_swap_id = ?fields.reverse_swap_id,
+        chain_swap_id = ?fields.chain_swap_id,
+        settlement_id = %fields.settlement_id,
+        selected_fallback_rail = fields.selected_fallback_rail,
+        speculative = fields.speculative,
+        transition = fields.transition,
+        "Bull Bitcoin conversion fell back after the local decision committed"
+    );
+}
+
+async fn abandon_dispatch_with_log(
+    connection: &mut sqlx::PgConnection,
+    stored: &StoredBullBitcoinSettlement,
+    category: FallbackCategory,
+) -> Result<bool, SettlementServiceError> {
+    let committed = db::abandon_bull_bitcoin_dispatch(connection, stored.id, category.as_str())
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    if committed {
+        emit_committed_fallback_decision(stored, category, "dispatch_abandoned");
+    }
+    Ok(committed)
+}
+
+async fn route_unfunded_mixed_with_log(
+    connection: &mut sqlx::PgConnection,
+    stored: &StoredBullBitcoinSettlement,
+    category: FallbackCategory,
+) -> Result<bool, SettlementServiceError> {
+    let committed =
+        db::route_unfunded_mixed_settlement_to_fallback(connection, stored.id, category.as_str())
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+    if committed {
+        emit_committed_fallback_decision(stored, category, "unfunded_binding_routed");
+    }
+    Ok(committed)
+}
+
 #[derive(Clone, Debug)]
 pub struct FiatOnlyInstructionRequest<'a> {
     pub owner_npub: &'a str,
@@ -291,13 +393,8 @@ async fn create_fiat_only_instruction_locked(
         // a concurrent exact caller. It survived a crash/cancellation and is
         // therefore ambiguous; never issue a second create.
         "dispatch_started" => {
-            db::abandon_bull_bitcoin_dispatch(
-                connection,
-                stored.id,
-                FallbackCategory::AmbiguousCreate.as_str(),
-            )
-            .await
-            .map_err(|_| SettlementServiceError::Database)?;
+            abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
+                .await?;
             stored = db::load_bull_bitcoin_settlement(connection, stored.id)
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
@@ -321,23 +418,15 @@ async fn create_fiat_only_instruction_locked(
         .await
         .map_err(|_| SettlementServiceError::Database)?;
     let Some(credential) = credential else {
-        return abandon_and_return(
-            connection,
-            stored.id,
-            FallbackCategory::ConversionUnavailable,
-        )
-        .await;
+        return abandon_and_return(connection, &stored, FallbackCategory::ConversionUnavailable)
+            .await;
     };
     if credential.owner_npub != stored.owner_npub {
         return Err(SettlementServiceError::StoredState);
     }
     let Some(encryption_key) = state.config.bull_bitcoin_credential_encryption_key.clone() else {
-        return abandon_and_return(
-            connection,
-            stored.id,
-            FallbackCategory::ConversionUnavailable,
-        )
-        .await;
+        return abandon_and_return(connection, &stored, FallbackCategory::ConversionUnavailable)
+            .await;
     };
     let scoped_key = match CredentialCipher::new(encryption_key).decrypt(
         credential.id,
@@ -346,12 +435,8 @@ async fn create_fiat_only_instruction_locked(
     ) {
         Ok(key) => key,
         Err(_) => {
-            return abandon_and_return(
-                connection,
-                stored.id,
-                FallbackCategory::ConversionUnavailable,
-            )
-            .await
+            return abandon_and_return(connection, &stored, FallbackCategory::ConversionUnavailable)
+                .await
         }
     };
 
@@ -374,13 +459,8 @@ async fn create_fiat_only_instruction_locked(
                 || order.requested_bitcoin != request.bitcoin_amount
                 || instruction_network(&order.instruction) != request.network
             {
-                db::abandon_bull_bitcoin_dispatch(
-                    connection,
-                    stored.id,
-                    FallbackCategory::AmbiguousCreate.as_str(),
-                )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
+                    .await?;
                 return Ok(FiatOnlyInstructionOutcome::BitcoinFallback {
                     settlement_id: stored.id,
                     category: FallbackCategory::AmbiguousCreate,
@@ -412,9 +492,7 @@ async fn create_fiat_only_instruction_locked(
         }
         Err(error) => {
             let category = fallback_for_create_error(error);
-            db::abandon_bull_bitcoin_dispatch(connection, stored.id, category.as_str())
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+            abandon_dispatch_with_log(connection, &stored, category).await?;
             if error == BullBitcoinError::Authentication {
                 // This call has no exposed destination. Disable the proven
                 // invalid generation and all future settings after the local
@@ -620,13 +698,8 @@ async fn prepare_mixed_settlement_locked(
                 return mixed_stored_outcome(stored).map(Some);
             }
             ("dispatch_started", None, None) => {
-                db::abandon_bull_bitcoin_dispatch(
-                    connection,
-                    stored.id,
-                    FallbackCategory::AmbiguousCreate.as_str(),
-                )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                abandon_dispatch_with_log(connection, stored, FallbackCategory::AmbiguousCreate)
+                    .await?;
                 let stored = db::load_bull_bitcoin_settlement(connection, stored.id)
                     .await
                     .map_err(|_| SettlementServiceError::Database)?;
@@ -697,22 +770,12 @@ async fn prepare_mixed_settlement_locked(
     if merchant_amount_sat <= 0 || split_rounds_to_zero {
         match stored.provider_state.as_str() {
             "reserved" | "dispatch_started" => {
-                db::abandon_bull_bitcoin_dispatch(
-                    connection,
-                    stored.id,
-                    FallbackCategory::InvalidSplit.as_str(),
-                )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                abandon_dispatch_with_log(connection, &stored, FallbackCategory::InvalidSplit)
+                    .await?;
             }
             "bound" if stored.funding_route.is_none() => {
-                db::route_unfunded_mixed_settlement_to_fallback(
-                    connection,
-                    stored.id,
-                    FallbackCategory::InvalidSplit.as_str(),
-                )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                route_unfunded_mixed_with_log(connection, &stored, FallbackCategory::InvalidSplit)
+                    .await?;
             }
             _ => {}
         }
@@ -743,13 +806,8 @@ async fn prepare_mixed_settlement_locked(
         .await
         .map_err(|_| SettlementServiceError::Database)?;
     let Some(credential) = credential else {
-        db::abandon_bull_bitcoin_dispatch(
-            connection,
-            stored.id,
-            FallbackCategory::ConversionUnavailable.as_str(),
-        )
-        .await
-        .map_err(|_| SettlementServiceError::Database)?;
+        abandon_dispatch_with_log(connection, &stored, FallbackCategory::ConversionUnavailable)
+            .await?;
         return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
             settlement_id: stored.id,
             category: FallbackCategory::ConversionUnavailable,
@@ -759,13 +817,8 @@ async fn prepare_mixed_settlement_locked(
         return Err(SettlementServiceError::StoredState);
     }
     let Some(encryption_key) = state.config.bull_bitcoin_credential_encryption_key.clone() else {
-        db::abandon_bull_bitcoin_dispatch(
-            connection,
-            stored.id,
-            FallbackCategory::ConversionUnavailable.as_str(),
-        )
-        .await
-        .map_err(|_| SettlementServiceError::Database)?;
+        abandon_dispatch_with_log(connection, &stored, FallbackCategory::ConversionUnavailable)
+            .await?;
         return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
             settlement_id: stored.id,
             category: FallbackCategory::ConversionUnavailable,
@@ -774,13 +827,8 @@ async fn prepare_mixed_settlement_locked(
     let scoped_key = match decrypt_credential(encryption_key, &credential) {
         Ok(key) => key,
         Err(_) => {
-            db::abandon_bull_bitcoin_dispatch(
-                connection,
-                stored.id,
-                FallbackCategory::ConversionUnavailable.as_str(),
-            )
-            .await
-            .map_err(|_| SettlementServiceError::Database)?;
+            abandon_dispatch_with_log(connection, &stored, FallbackCategory::ConversionUnavailable)
+                .await?;
             return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
                 settlement_id: stored.id,
                 category: FallbackCategory::ConversionUnavailable,
@@ -817,13 +865,8 @@ async fn prepare_mixed_settlement_locked(
             if liquid_script_pubkey_len(&confidential_address)
                 != Some(basis.additional_output_script_len)
             {
-                db::abandon_bull_bitcoin_dispatch(
-                    connection,
-                    stored.id,
-                    FallbackCategory::InvalidSplit.as_str(),
-                )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                abandon_dispatch_with_log(connection, &stored, FallbackCategory::InvalidSplit)
+                    .await?;
                 return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
                     settlement_id: stored.id,
                     category: FallbackCategory::InvalidSplit,
@@ -855,13 +898,8 @@ async fn prepare_mixed_settlement_locked(
             }))
         }
         Ok(_) => {
-            db::abandon_bull_bitcoin_dispatch(
-                connection,
-                stored.id,
-                FallbackCategory::AmbiguousCreate.as_str(),
-            )
-            .await
-            .map_err(|_| SettlementServiceError::Database)?;
+            abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
+                .await?;
             Ok(Some(MixedSettlementPreparation::BitcoinFallback {
                 settlement_id: stored.id,
                 category: FallbackCategory::AmbiguousCreate,
@@ -869,9 +907,7 @@ async fn prepare_mixed_settlement_locked(
         }
         Err(error) => {
             let category = fallback_for_create_error(error);
-            db::abandon_bull_bitcoin_dispatch(connection, stored.id, category.as_str())
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+            abandon_dispatch_with_log(connection, &stored, category).await?;
             if error == BullBitcoinError::Authentication {
                 db::invalidate_bull_bitcoin_credential_on_connection(
                     connection,
@@ -954,21 +990,18 @@ async fn route_unfunded_mixed_to_invalid_split(
     stored: &StoredBullBitcoinSettlement,
 ) -> Result<(), SettlementServiceError> {
     match stored.provider_state.as_str() {
-        "reserved" | "dispatch_started" => db::abandon_bull_bitcoin_dispatch(
-            connection,
-            stored.id,
-            FallbackCategory::InvalidSplit.as_str(),
-        )
-        .await
-        .map_err(|_| SettlementServiceError::Database),
+        "reserved" | "dispatch_started" => {
+            if abandon_dispatch_with_log(connection, stored, FallbackCategory::InvalidSplit).await?
+            {
+                Ok(())
+            } else {
+                Err(SettlementServiceError::StoredState)
+            }
+        }
         "bound" if stored.funding_route.is_none() && stored.funding_committed_at_unix.is_none() => {
-            let routed = db::route_unfunded_mixed_settlement_to_fallback(
-                connection,
-                stored.id,
-                FallbackCategory::InvalidSplit.as_str(),
-            )
-            .await
-            .map_err(|_| SettlementServiceError::Database)?;
+            let routed =
+                route_unfunded_mixed_with_log(connection, stored, FallbackCategory::InvalidSplit)
+                    .await?;
             if routed {
                 Ok(())
             } else {
@@ -988,14 +1021,12 @@ fn liquid_script_pubkey_len(address: &str) -> Option<usize> {
 
 async fn abandon_and_return(
     connection: &mut sqlx::PgConnection,
-    settlement_id: Uuid,
+    stored: &StoredBullBitcoinSettlement,
     category: FallbackCategory,
 ) -> Result<FiatOnlyInstructionOutcome, SettlementServiceError> {
-    db::abandon_bull_bitcoin_dispatch(connection, settlement_id, category.as_str())
-        .await
-        .map_err(|_| SettlementServiceError::Database)?;
+    abandon_dispatch_with_log(connection, stored, category).await?;
     Ok(FiatOnlyInstructionOutcome::BitcoinFallback {
-        settlement_id,
+        settlement_id: stored.id,
         category,
     })
 }
@@ -1130,9 +1161,17 @@ async fn reconcile_once(
 ) -> Result<(), SettlementServiceError> {
     let stale_after_secs =
         i64::try_from(stale_after_secs).map_err(|_| SettlementServiceError::StoredState)?;
-    let recovered = db::recover_stale_bull_bitcoin_dispatches(&state.db, stale_after_secs)
+    let recovered_rows = db::recover_stale_bull_bitcoin_dispatches(&state.db, stale_after_secs)
         .await
         .map_err(|_| SettlementServiceError::Database)?;
+    for settlement in &recovered_rows {
+        emit_committed_fallback_decision(
+            settlement,
+            FallbackCategory::AmbiguousCreate,
+            "stale_dispatch_recovered",
+        );
+    }
+    let recovered = recovered_rows.len();
     let expired = db::expire_bull_bitcoin_retention(&state.db)
         .await
         .map_err(|_| SettlementServiceError::Database)?;
@@ -1424,6 +1463,39 @@ fn map_store_error(error: BullBitcoinSettlementStoreError) -> SettlementServiceE
 mod tests {
     use super::*;
 
+    fn stored_settlement_for_log() -> StoredBullBitcoinSettlement {
+        StoredBullBitcoinSettlement {
+            id: Uuid::new_v4(),
+            owner_npub: "owner-secret-canary".into(),
+            invoice_id: Some(Uuid::new_v4()),
+            reverse_swap_id: Some(Uuid::new_v4()),
+            chain_swap_id: None,
+            credential_id: Uuid::new_v4(),
+            product: "api-orders".into(),
+            purpose: "mixed".into(),
+            payer_rail: "lightning".into(),
+            request_key: "request-secret-canary".into(),
+            fiat_percentage: 40,
+            fiat_currency: "CAD".into(),
+            provider_state: "abandoned".into(),
+            funding_route: Some("bitcoin_fallback".into()),
+            fallback_category: Some("below_minimum".into()),
+            settlement_status: "none".into(),
+            requested_bitcoin_sat: 7_794,
+            bull_bitcoin_order_id: None,
+            instruction_kind: Some("liquid".into()),
+            payer_instruction: Some("payer-instruction-secret-canary".into()),
+            instruction_expires_at_unix: None,
+            funding_committed_at_unix: None,
+            retention_until_unix: None,
+            reconcile_attempts: 0,
+            actual_received_sat: None,
+            credited_fiat_minor: Some(500),
+            quoted_fiat_minor: Some(500),
+            provider_final: false,
+        }
+    }
+
     #[test]
     fn create_error_fallbacks_are_conservative() {
         assert_eq!(
@@ -1446,5 +1518,50 @@ mod tests {
             fallback_for_create_error(BullBitcoinError::BenchmarkEligibilityDenied),
             FallbackCategory::ConversionUnavailable
         );
+    }
+
+    #[test]
+    fn public_fallback_projection_preserves_known_categories() {
+        for known in [
+            "below_minimum",
+            "invalid_split",
+            "conversion_unavailable",
+            "ambiguous_create",
+        ] {
+            assert_eq!(projected_fallback_reason(Some(known)), known);
+        }
+        assert_eq!(projected_fallback_reason(None), "unknown");
+        assert_eq!(
+            projected_fallback_reason(Some("future_category")),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn committed_fallback_log_fields_are_stable_and_privacy_minimal() {
+        let stored = stored_settlement_for_log();
+        let fields = fallback_decision_log_fields(
+            &stored,
+            FallbackCategory::BelowMinimum,
+            "dispatch_abandoned",
+        );
+        assert_eq!(fields.event, "bull_bitcoin_fallback_committed");
+        assert_eq!(fields.category, "below_minimum");
+        assert_eq!(fields.requested_sats, 7_794);
+        assert_eq!(fields.fiat_currency, "CAD");
+        assert_eq!(fields.fiat_amount_minor, Some(500));
+        assert_eq!(fields.invoice_id, stored.invoice_id);
+        assert_eq!(fields.settlement_id, stored.id);
+        assert_eq!(fields.selected_fallback_rail, "bitcoin");
+        assert!(fields.speculative);
+
+        let rendered = format!("{fields:?}");
+        for secret in [
+            "owner-secret-canary",
+            "request-secret-canary",
+            "payer-instruction-secret-canary",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

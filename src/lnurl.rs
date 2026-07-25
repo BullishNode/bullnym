@@ -19,7 +19,7 @@ use crate::bull_bitcoin_settlement::{
 use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
-use crate::error::AppError;
+use crate::error::{AppError, LnurlError};
 use crate::ip_whitelist;
 use crate::lnurl_comment::{
     LnurlCommentIntentKey, LnurlCommentRail, LnurlCommentValidationError, LnurlPayerComment,
@@ -395,7 +395,7 @@ pub async fn metadata(
     Path(nym): Path<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-) -> Result<Json<LnurlPayMetadata>, AppError> {
+) -> Result<Json<LnurlPayMetadata>, LnurlError> {
     // Gate before any DB work.
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     gate_metadata_per_ip(&state, peer, &headers, Some(&nym)).await?;
@@ -969,10 +969,12 @@ pub async fn callback_with_comment_intent(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
-) -> Result<axum::response::Response, AppError> {
+) -> Result<axum::response::Response, LnurlError> {
     let comment_intent_key = LnurlCommentIntentKey::from_callback_token(&comment_intent_token)
         .map_err(|_| AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
-    callback_inner(state, nym, comment_intent_key, peer_opt, headers, params).await
+    callback_inner(state, nym, comment_intent_key, peer_opt, headers, params)
+        .await
+        .map_err(Into::into)
 }
 
 async fn callback_inner(

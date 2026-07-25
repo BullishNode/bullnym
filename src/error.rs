@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
@@ -115,6 +115,13 @@ pub enum AppError {
     /// and dependency reasons are emitted by the admission component only;
     /// the wire response is deliberately fixed and retryable.
     MoneyAdmissionUnavailable,
+    /// Another request is holding the per-invoice quote/provider-mutation
+    /// boundary. The caller may retry once after the advertised delay.
+    QuoteBusy {
+        invoice_id: String,
+        quote_version_id: String,
+        rail: &'static str,
+    },
     /// Deactivation is blocked by `_pending` in-flight swaps.
     PurgeBlocked(usize),
 
@@ -196,7 +203,9 @@ impl AppError {
             | Self::BackendThrottled
             | Self::TooManyPendingReservations => ErrorClass::RateLimit,
 
-            Self::ServiceUnavailable(_) | Self::PurgeBlocked(_) => ErrorClass::Capacity,
+            Self::ServiceUnavailable(_) | Self::QuoteBusy { .. } | Self::PurgeBlocked(_) => {
+                ErrorClass::Capacity
+            }
 
             Self::MoneyAdmissionUnavailable
             | Self::ElectrumError(_)
@@ -249,6 +258,7 @@ impl AppError {
             Self::TooManyPendingReservations => "TooManyPendingReservations",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::MoneyAdmissionUnavailable => "ServiceUnavailable",
+            Self::QuoteBusy { .. } => "QUOTE_BUSY",
             Self::PurgeBlocked(_) => "PurgeBlocked",
 
             Self::ElectrumError(_) => "ElectrumError",
@@ -327,6 +337,14 @@ impl std::fmt::Display for AppError {
             Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
             Self::ServiceUnavailable(r) => write!(f, "service unavailable: {r}"),
             Self::MoneyAdmissionUnavailable => write!(f, "money admission unavailable"),
+            Self::QuoteBusy {
+                invoice_id,
+                quote_version_id,
+                rail,
+            } => write!(
+                f,
+                "invoice quote is busy: invoice={invoice_id} quote={quote_version_id} rail={rail}"
+            ),
             Self::PurgeBlocked(n) => write!(f, "purge blocked: {n} in-flight swap(s)"),
 
             Self::ElectrumError(msg) => write!(f, "electrum error: {msg}"),
@@ -349,6 +367,25 @@ impl IntoResponse for AppError {
             AppError::ServiceUnavailable(msg) => tracing::error!("service unavailable: {msg}"),
             AppError::MoneyAdmissionUnavailable => {
                 tracing::warn!("money admission temporarily unavailable")
+            }
+            AppError::QuoteBusy {
+                invoice_id,
+                quote_version_id,
+                rail,
+            } => tracing::info!(
+                event = "invoice_quote_busy",
+                invoice_id,
+                quote_version_id,
+                rail,
+                retry_after_seconds = 1_u64,
+                "payer quote request serialized behind another provider mutation"
+            ),
+            AppError::DonationPageNotFound(identifier) => {
+                tracing::debug!(
+                    event = "donation_page_not_found",
+                    identifier,
+                    "public donation page does not exist"
+                )
             }
             _ => tracing::warn!("{self}"),
         }
@@ -422,6 +459,9 @@ impl IntoResponse for AppError {
             AppError::MoneyAdmissionUnavailable => {
                 "This payment method is temporarily unavailable. Try again later.".into()
             }
+            AppError::QuoteBusy { .. } => {
+                "The invoice quote is being updated. Retry the request shortly.".into()
+            }
             AppError::PurgeBlocked(n) => format!(
                 "Deactivation is blocked: {n} payment(s) are still in flight. \
                  These payments must complete or expire first."
@@ -455,21 +495,58 @@ impl IntoResponse for AppError {
             _ => None,
         };
 
-        // HTTP status. LNURL spec (LUD-06) requires 200 + JSON body for the
-        // public LNURL endpoints; we use the same envelope for our custom
-        // endpoints for consistency. Auth: 401. Hard ceiling: 503.
+        // Truthful HTTP status for JSON/API routes. LNURL handlers wrap errors
+        // in `LnurlError` below to retain their protocol-required HTTP 200
+        // envelope without weakening every other route's transport contract.
         let status = match &self {
-            AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
-            AppError::NameTaken
+            AppError::NymNotFound(_)
+            | AppError::DonationPageNotFound(_)
+            | AppError::InvoiceNotFound(_)
+            | AppError::UtxoNotFound => StatusCode::NOT_FOUND,
+
+            AppError::NymTaken
+            | AppError::NameTaken
+            | AppError::KeyAlreadyRegistered { .. }
+            | AppError::NymQuotaExceeded { .. }
             | AppError::NymAlreadyAssigned { .. }
+            | AppError::ProofOfFundsRequired { .. }
+            | AppError::UtxoSpent
+            | AppError::FiatConversionKycRequired
+            | AppError::BullBitcoinCredentialRequired
+            | AppError::RecoveryNotAvailable(_)
             | AppError::BitcoinAddressAlreadyUsed
             | AppError::LiquidAddressAlreadyUsed
             | AppError::InvoiceCreateConflict
-            | AppError::AliasAlreadyAssigned { .. } => StatusCode::CONFLICT,
-            AppError::ServiceUnavailable(_) | AppError::MoneyAdmissionUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
+            | AppError::AliasAlreadyAssigned { .. }
+            | AppError::PurgeBlocked(_) => StatusCode::CONFLICT,
+
+            AppError::AuthError(_) | AppError::BullBitcoinCredentialInvalid => {
+                StatusCode::UNAUTHORIZED
             }
-            _ => StatusCode::OK,
+
+            AppError::RateLimitedSender
+            | AppError::RateLimitedRecipient
+            | AppError::RateLimitedNetwork
+            | AppError::TooManyPendingReservations => StatusCode::TOO_MANY_REQUESTS,
+
+            AppError::BackendThrottled
+            | AppError::ServiceUnavailable(_)
+            | AppError::MoneyAdmissionUnavailable
+            | AppError::QuoteBusy { .. }
+            | AppError::ElectrumError(_)
+            | AppError::BoltzError(_) => StatusCode::SERVICE_UNAVAILABLE,
+
+            AppError::ClaimError(_) | AppError::DbError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+            AppError::NymInvalid(_)
+            | AppError::NymReserved
+            | AppError::DonationPageInvalid(_)
+            | AppError::RecoveryAddressInvalid(_)
+            | AppError::InvalidDescriptor(_)
+            | AppError::ProofOfFundsInvalid(_)
+            | AppError::PubkeyUtxoMismatch
+            | AppError::InvalidAmount(_)
+            | AppError::InvalidComment(_) => StatusCode::BAD_REQUEST,
         };
 
         let mut body = json!({
@@ -481,7 +558,40 @@ impl IntoResponse for AppError {
             body["details"] = d;
         }
 
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if matches!(self, AppError::QuoteBusy { .. }) {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+
+/// LNURL/LUD-06 endpoints require a JSON error envelope with HTTP 200. Keeping
+/// that exception in the handler result type prevents protocol compatibility
+/// from leaking into ordinary JSON APIs.
+#[derive(Debug)]
+pub struct LnurlError(pub AppError);
+
+impl From<AppError> for LnurlError {
+    fn from(error: AppError) -> Self {
+        Self(error)
+    }
+}
+
+impl From<sqlx::Error> for LnurlError {
+    fn from(error: sqlx::Error) -> Self {
+        Self(AppError::from(error))
+    }
+}
+
+impl IntoResponse for LnurlError {
+    fn into_response(self) -> Response {
+        let mut response = self.0.into_response();
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().remove(RETRY_AFTER);
+        response
     }
 }
 
@@ -601,12 +711,12 @@ mod tests {
                     nym: "alice".to_string(),
                     domain: "pay.example.com".to_string(),
                 },
-                StatusCode::OK,
+                StatusCode::CONFLICT,
                 "This wallet's Lightning Address is already online at alice@pay.example.com. A wallet cannot claim a second name.",
             ),
             (
                 AppError::NymQuotaExceeded { used: 1, cap: 1 },
-                StatusCode::OK,
+                StatusCode::CONFLICT,
                 "This wallet has reached its lifetime Lightning Address name limit (1). Permanently owned names cannot be replaced.",
             ),
             (
@@ -691,5 +801,58 @@ mod tests {
                 "private admission term leaked: {private_term}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn generic_json_errors_never_use_http_200() {
+        let cases = [
+            AppError::DbError("private database detail".into()),
+            AppError::ElectrumError("private backend detail".into()),
+            AppError::DonationPageNotFound("missing-alias".into()),
+            AppError::InvalidAmount("invalid amount".into()),
+            AppError::NymTaken,
+            AppError::RateLimitedSender,
+        ];
+
+        for error in cases {
+            let code = error.code();
+            let (status, body) = response_json(error).await;
+            assert_ne!(status, StatusCode::OK, "{code} used HTTP 200");
+            assert_eq!(body["status"], "ERROR");
+            assert_eq!(body["code"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn quote_busy_has_stable_code_and_bounded_retry_hint() {
+        let response = AppError::QuoteBusy {
+            invoice_id: "invoice-id".into(),
+            quote_version_id: "quote-id".into(),
+            rail: "lightning",
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "1");
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read quote busy response");
+        let value: Value = serde_json::from_slice(&body).expect("parse quote busy response");
+        assert_eq!(value["code"], "QUOTE_BUSY");
+        assert!(!String::from_utf8_lossy(&body).contains("invoice-id"));
+        assert!(!String::from_utf8_lossy(&body).contains("quote-id"));
+    }
+
+    #[tokio::test]
+    async fn lnurl_wrapper_preserves_the_protocol_http_200_envelope() {
+        let response = LnurlError(AppError::NymNotFound("missing".into())).into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read LNURL response");
+        let value: Value = serde_json::from_slice(&body).expect("parse LNURL response");
+        assert_eq!(value["status"], "ERROR");
+        assert_eq!(value["code"], "NymNotFound");
     }
 }

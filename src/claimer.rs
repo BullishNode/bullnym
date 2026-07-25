@@ -429,7 +429,12 @@ fn webhook_dispatch_response(result: Result<&'static str, AppError>) -> Response
         Ok(body) => body.into_response(),
         Err(error) => {
             let mut response = error.into_response();
-            if response.status().is_success() {
+            // This is a provider-delivery acknowledgement, not a public API
+            // endpoint. Every failure must remain retryable to Boltz: ordinary
+            // 4xx mappings (including rate limiting) would incorrectly make a
+            // transient delivery failure terminal. Preserve an explicit 503;
+            // normalize every other error to 500.
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE {
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             }
             response

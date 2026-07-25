@@ -3,7 +3,7 @@
   "errors": [
     {
       "name": "credential_required",
-      "http_status": 200,
+      "http_status": 409,
       "response": {
         "status": "ERROR",
         "code": "FIAT_CREDENTIAL_REQUIRED",
@@ -12,7 +12,7 @@
     },
     {
       "name": "credential_invalid",
-      "http_status": 200,
+      "http_status": 401,
       "response": {
         "status": "ERROR",
         "code": "FIAT_CREDENTIAL_INVALID",
@@ -21,7 +21,7 @@
     },
     {
       "name": "kyc_required",
-      "http_status": 200,
+      "http_status": 409,
       "response": {
         "status": "ERROR",
         "code": "FIAT_CONVERSION_KYC_REQUIRED",

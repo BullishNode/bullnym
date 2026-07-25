@@ -25,6 +25,10 @@ ALTER TABLE invoice_payment_events
 -- on-time quote and no later committed event would have had different
 -- cumulative rounding. Anything less certain remains unchanged and is exposed
 -- by invoice_mixed_valuation_exceptions below; migrations never invent a rate.
+CREATE TEMPORARY TABLE migration_071_repaired_invoices (
+    invoice_id UUID PRIMARY KEY
+) ON COMMIT DROP;
+
 DO $$
 DECLARE
     candidate RECORD;
@@ -116,9 +120,181 @@ BEGIN
                fiat_rate_fetched_at = candidate.rate_fetched_at,
                fiat_rate_fresh_until = candidate.rate_fresh_until
          WHERE id = candidate.event_id;
+
+        INSERT INTO migration_071_repaired_invoices (invoice_id)
+        VALUES (candidate.invoice_id)
+        ON CONFLICT DO NOTHING;
     END LOOP;
 END
 $$;
+
+-- Updating immutable event evidence does not invoke the Rust payment reducer.
+-- Rebuild the same cached fiat projection while the service is stopped so a
+-- repaired invoice cannot remain falsely in_progress until another event
+-- happens to arrive. This touches only invoices repaired above and never
+-- creates, deletes, or reorders payment evidence.
+WITH per_quote AS (
+    SELECT quote.invoice_id,
+           projection.active_fiat_credited_minor,
+           projection.active_eligible_sat > quote.merchant_amount_sat
+               AS active_overpaid,
+           COALESCE(SUM(event.amount_sat) FILTER (WHERE
+               event.fiat_credited_minor IS NOT NULL
+               AND event.accounting_state <> 'superseded'
+               AND (
+                   event.accounting_state IN ('active', 'legacy_unverified')
+                   OR (
+                       event.source IN ('bitcoin_direct', 'liquid_direct')
+                       AND event.verification_state = 'verified'
+                       AND observation.last_seen_state = 'seen_unconfirmed'
+                   )
+               )
+           ), 0)::BIGINT AS presentation_eligible_sat,
+           quote.fiat_target_amount_minor,
+           quote.merchant_amount_sat,
+           quote.rate_minor_per_btc
+      FROM migration_071_repaired_invoices repaired
+      JOIN invoice_quote_versions quote ON quote.invoice_id = repaired.invoice_id
+      JOIN invoice_quote_active_fiat_projection projection
+        ON projection.quote_version_id = quote.id
+ LEFT JOIN invoice_payment_events event
+        ON event.invoice_id = quote.invoice_id
+       AND event.fiat_valuation_quote_version_id = quote.id
+ LEFT JOIN invoice_payment_observations observation
+        ON observation.id = event.observation_id
+  GROUP BY quote.invoice_id, quote.id,
+           projection.active_fiat_credited_minor,
+           projection.active_eligible_sat
+), quote_projection AS (
+    SELECT invoice_id,
+           COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT
+               AS active_credit_minor,
+           COALESCE(SUM(invoice_quote_credit_for_sats(
+               fiat_target_amount_minor, merchant_amount_sat,
+               rate_minor_per_btc, presentation_eligible_sat
+           )), 0)::BIGINT AS presentation_credit_minor,
+           COALESCE(BOOL_OR(active_overpaid), FALSE) AS active_overpaid,
+           COALESCE(BOOL_OR(
+               presentation_eligible_sat > merchant_amount_sat
+           ), FALSE) AS presentation_overpaid
+      FROM per_quote
+  GROUP BY invoice_id
+), bull_bitcoin_projection AS (
+    SELECT repaired.invoice_id,
+           COALESCE(SUM(event.fiat_credited_minor) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ), 0)::BIGINT AS active_credit_minor,
+           COALESCE(SUM(event.fiat_credited_minor) FILTER (WHERE
+               event.accounting_state <> 'superseded'
+           ), 0)::BIGINT AS presentation_credit_minor
+      FROM migration_071_repaired_invoices repaired
+ LEFT JOIN invoice_payment_events event
+        ON event.invoice_id = repaired.invoice_id
+       AND event.source = 'bull_bitcoin_fiat'
+  GROUP BY repaired.invoice_id
+), projection AS (
+    SELECT invoice.id AS invoice_id,
+           invoice.status AS prior_status,
+           invoice.fiat_amount_minor::BIGINT AS face_minor,
+           quote.active_credit_minor + bull.active_credit_minor
+               AS active_credit_minor,
+           quote.presentation_credit_minor + bull.presentation_credit_minor
+               AS presentation_credit_minor,
+           (
+               quote.active_overpaid
+               OR quote.active_credit_minor + bull.active_credit_minor
+                    > invoice.fiat_amount_minor
+           ) AS active_overpaid,
+           (
+               quote.presentation_overpaid
+               OR quote.presentation_credit_minor + bull.presentation_credit_minor
+                    > invoice.fiat_amount_minor
+           ) AS presentation_overpaid,
+           EXISTS (
+               SELECT 1
+                 FROM invoice_payment_events unresolved
+                WHERE unresolved.invoice_id = invoice.id
+                  AND unresolved.source <> 'bull_bitcoin_fiat'
+                  AND (
+                      unresolved.quote_first_observed_at IS NULL
+                      OR unresolved.fiat_credited_minor IS NULL
+                      OR unresolved.fiat_credit_policy IS NULL
+                      OR unresolved.fiat_valued_at IS NULL
+                      OR (
+                          unresolved.source NOT IN ('bitcoin_direct', 'liquid_direct')
+                          AND (
+                              unresolved.invoice_quote_version_id IS NULL
+                              OR unresolved.invoice_quote_offer_id IS NULL
+                          )
+                      )
+                  )
+           ) AS unresolved_evidence
+      FROM migration_071_repaired_invoices repaired
+      JOIN invoices invoice ON invoice.id = repaired.invoice_id
+      JOIN quote_projection quote ON quote.invoice_id = invoice.id
+      JOIN bull_bitcoin_projection bull ON bull.invoice_id = invoice.id
+), payment_projection AS (
+    SELECT repaired.invoice_id,
+           COALESCE(SUM(event.amount_sat) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ), 0)::BIGINT AS received_sat,
+           COUNT(DISTINCT event.rail) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ) AS rail_count,
+           MIN(event.rail) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ) AS single_rail
+      FROM migration_071_repaired_invoices repaired
+ LEFT JOIN invoice_payment_events event ON event.invoice_id = repaired.invoice_id
+  GROUP BY repaired.invoice_id
+), resolved AS (
+    SELECT projection.*,
+           payment.received_sat,
+           CASE
+               WHEN payment.rail_count = 1 THEN payment.single_rail
+               ELSE 'mixed'
+           END AS paid_via,
+           CASE
+               WHEN projection.prior_status = 'cancelled' THEN 'cancelled'
+               WHEN projection.prior_status = 'expired' THEN 'expired'
+               WHEN projection.unresolved_evidence
+                    AND projection.active_credit_minor < projection.face_minor
+                   THEN 'in_progress'
+               WHEN projection.active_credit_minor >= projection.face_minor
+                   THEN CASE WHEN projection.active_overpaid
+                             THEN 'overpaid' ELSE 'paid' END
+               WHEN projection.active_credit_minor > 0 THEN 'partially_paid'
+               WHEN projection.presentation_credit_minor > 0 THEN 'in_progress'
+               ELSE 'unpaid'
+           END AS resolved_status,
+           CASE
+               WHEN projection.presentation_credit_minor >= projection.face_minor
+                   THEN CASE WHEN projection.presentation_overpaid
+                             THEN 'overpaid' ELSE 'payment_received' END
+               WHEN projection.presentation_credit_minor > 0 THEN 'partial'
+               ELSE 'unpaid'
+           END AS resolved_presentation_status
+      FROM projection
+      JOIN payment_projection payment ON payment.invoice_id = projection.invoice_id
+)
+UPDATE invoices invoice
+   SET status = resolved.resolved_status,
+       presentation_status = resolved.resolved_presentation_status,
+       paid_via = resolved.paid_via,
+       paid_amount_sat = resolved.received_sat,
+       paid_at = CASE
+           WHEN resolved.resolved_status IN ('paid', 'overpaid')
+             OR (
+                 resolved.resolved_status IN ('cancelled', 'expired')
+                 AND resolved.resolved_presentation_status IN (
+                     'payment_received', 'overpaid'
+                 )
+             )
+           THEN COALESCE(invoice.paid_at, clock_timestamp())
+           ELSE invoice.paid_at
+       END
+  FROM resolved
+ WHERE invoice.id = resolved.invoice_id;
 
 ALTER TABLE invoice_payment_events
     ADD CONSTRAINT invoice_payment_events_bull_bitcoin_shape_chk CHECK (
