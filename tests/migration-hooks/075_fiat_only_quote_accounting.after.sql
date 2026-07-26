@@ -84,6 +84,8 @@ UPDATE bull_bitcoin_settlements
  WHERE id = '75000000-0000-4000-8000-000000000013';
 
 DO $$
+DECLARE
+    rejected_constraint TEXT;
 BEGIN
     BEGIN
         INSERT INTO bull_bitcoin_settlements (
@@ -118,6 +120,44 @@ BEGIN
         RAISE EXCEPTION 'migration 075 accepted a request key unrelated to its quote';
     EXCEPTION WHEN check_violation THEN
         NULL;
+    END;
+
+    BEGIN
+        INSERT INTO bull_bitcoin_settlements (
+            id, owner_npub, invoice_id, invoice_quote_version_id,
+            credential_id, product, purpose, payer_rail, request_key,
+            fiat_percentage, fiat_currency, requested_bitcoin_sat,
+            actual_received_sat
+        )
+        SELECT
+            '75000000-0000-4000-8000-000000000009', repeat('6', 64),
+            '75000000-0000-4000-8000-000000000001', quote.id,
+            '66000000-0000-4000-8000-000000000001',
+            'invoice', 'fiat_only', 'liquid',
+            encode(
+                digest(
+                    convert_to('bullnym-invoice-quote-offer-v1', 'UTF8')
+                    || decode('00', 'hex')
+                    || decode(replace(quote.id::TEXT, '-', ''), 'hex')
+                    || decode('00', 'hex')
+                    || convert_to('liquid', 'UTF8')
+                    || decode('00', 'hex')
+                    || convert_to('bull_bitcoin_fiat_only', 'UTF8'),
+                    'sha256'
+                ),
+                'hex'
+            ),
+            100, 'CAD', 10000, 10000
+          FROM invoice_quote_versions quote
+         WHERE quote.id = '75000000-0000-4000-8000-000000000002';
+        RAISE EXCEPTION 'migration 075 accepted an already-funded insert';
+    EXCEPTION WHEN check_violation THEN
+        GET STACKED DIAGNOSTICS rejected_constraint = CONSTRAINT_NAME;
+        IF rejected_constraint <>
+           'bull_bitcoin_settlements_funded_insert_forbidden' THEN
+            RAISE EXCEPTION 'funded insert failed at the wrong boundary: %',
+                rejected_constraint;
+        END IF;
     END;
 END
 $$;

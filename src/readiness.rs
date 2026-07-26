@@ -1549,6 +1549,10 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                        IN pg_get_functiondef(function_info.oid) \
                    ) > 0 \
                    AND POSITION( \
+                       'bull_bitcoin_settlements_funded_insert_forbidden' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
                        'bullnym-invoice-quote-offer-v1' \
                        IN pg_get_functiondef(function_info.oid) \
                    ) > 0 \

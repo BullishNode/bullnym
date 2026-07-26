@@ -207,6 +207,12 @@ BEGIN
     END IF;
 
     IF TG_OP = 'INSERT'
+       AND NEW.purpose = 'fiat_only'
+       AND NEW.actual_received_sat IS NOT NULL THEN
+        RAISE EXCEPTION 'funded Bull Bitcoin settlements must cross the observed transition'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'bull_bitcoin_settlements_funded_insert_forbidden';
+    ELSIF TG_OP = 'INSERT'
        AND NEW.quote_payment_first_observed_at IS NOT NULL THEN
         RAISE EXCEPTION 'Bull Bitcoin first-funds observation is database-owned'
             USING ERRCODE = '23514',
