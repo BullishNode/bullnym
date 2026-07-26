@@ -3830,6 +3830,64 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
 }
 
 #[tokio::test]
+async fn bull_bitcoin_integrity_hold_retains_deletion_pending_credential() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    fake.push_read(Err(BullBitcoinError::Integrity)).await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-integrity-key-retention").await;
+    let request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-integrity-key-retention",
+    );
+    pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+        .await
+        .unwrap();
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(fake.read_call_count(), 1);
+    let settlement_status = sqlx::query_scalar::<_, String>(
+        "SELECT settlement_status FROM bull_bitcoin_settlements \
+          WHERE bull_bitcoin_order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_status, "integrity_error");
+
+    let deletion = pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &owner_npub)
+        .await
+        .unwrap();
+    assert_eq!(
+        deletion.credential,
+        pay_service::db::CredentialLifecycle::DeletionPending
+    );
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(fake.read_call_count(), 1);
+
+    let retained = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "SELECT ciphertext IS NOT NULL, nonce IS NOT NULL, \
+                deletion_requested_at IS NOT NULL, erased_at IS NULL \
+           FROM bull_bitcoin_credentials WHERE id = $1",
+    )
+    .bind(credential_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, (true, true, true, true));
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
