@@ -308,7 +308,9 @@ for later_migration in \
   migrations/067_bull_bitcoin_fiat_settlement.sql \
   migrations/068_bull_bitcoin_invoice_accounting.sql \
   migrations/069_bull_bitcoin_mixed_settlement.sql \
-  migrations/070_bull_bitcoin_quoted_fiat.sql; do
+  migrations/070_bull_bitcoin_quoted_fiat.sql \
+  migrations/071_mixed_invoice_payin_valuation.sql \
+  migrations/072_mixed_invoice_blinding_key_invariant.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \

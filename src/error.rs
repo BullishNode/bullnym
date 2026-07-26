@@ -633,6 +633,12 @@ impl From<sqlx::Error> for AppError {
             if db_err.constraint() == Some("invoice_payment_addresses_liquid_address_key") {
                 return AppError::LiquidAddressAlreadyUsed;
             }
+            if db_err.constraint() == Some("invoice_fiat_policy_mixed_blinding_key_required") {
+                return AppError::InvalidAmount(
+                    "mixed fiat settlement requires a Liquid blinding key matching the invoice address"
+                        .into(),
+                );
+            }
             // A second reverse swap tried to persist an already-used Boltz swap
             // id (issue #69). Boltz ids are unique, so this is an integrity
             // incident (retry/concurrency/import defect), never a normal path.

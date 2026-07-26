@@ -1383,7 +1383,9 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('invoice_fiat_settlement_policies'), \
                     ('bull_bitcoin_settlements'), \
                     ('swap_fiat_settlement_policies'), \
-                    ('bull_bitcoin_claim_outputs') \
+                    ('bull_bitcoin_claim_outputs'), \
+                    ('invoice_mixed_valuation_exceptions'), \
+                    ('mixed_invoice_integrity_holds') \
                 ) required(table_name) \
                  WHERE to_regclass('public.' || required.table_name) IS NULL \
             ) \
@@ -1476,6 +1478,8 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                      'invoice_payment_events_guard_bull_bitcoin'), \
                     ('invoice_payment_events', \
                      'invoice_payment_events_guard_mixed_reverse'), \
+                    ('invoice_fiat_settlement_policies', \
+                     'invoice_fiat_policy_guard_mixed_blinding_key'), \
                     ('invoices', 'zz_invoices_compose_settlement_components') \
                 ) required(table_name, trigger_name) \
                  WHERE NOT EXISTS ( \
@@ -1494,7 +1498,9 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('invoice_fiat_settlement_policies', TRUE, TRUE, FALSE, FALSE), \
                     ('bull_bitcoin_settlements', TRUE, TRUE, TRUE, FALSE), \
                     ('swap_fiat_settlement_policies', TRUE, TRUE, FALSE, FALSE), \
-                    ('bull_bitcoin_claim_outputs', TRUE, TRUE, FALSE, FALSE) \
+                    ('bull_bitcoin_claim_outputs', TRUE, TRUE, FALSE, FALSE), \
+                    ('invoice_mixed_valuation_exceptions', TRUE, FALSE, FALSE, FALSE), \
+                    ('mixed_invoice_integrity_holds', TRUE, FALSE, FALSE, FALSE) \
                 ) required(table_name, can_select, can_insert, can_update, can_delete) \
                  WHERE has_table_privilege( \
                            current_user, 'public.' || required.table_name, 'SELECT' \
@@ -1519,7 +1525,9 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('invoice_fiat_settlement_policies'), \
                     ('bull_bitcoin_settlements'), \
                     ('swap_fiat_settlement_policies'), \
-                    ('bull_bitcoin_claim_outputs') \
+                    ('bull_bitcoin_claim_outputs'), \
+                    ('invoice_mixed_valuation_exceptions'), \
+                    ('mixed_invoice_integrity_holds') \
                 ) required(table_name) \
                  WHERE pg_get_userbyid( \
                            (SELECT relowner FROM pg_class \

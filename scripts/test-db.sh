@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=70
+EXPECTED_MIGRATION_COUNT=72
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "070_bull_bitcoin_quoted_fiat.sql" ]] \
-  || die "unexpected migration-070 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "072_mixed_invoice_blinding_key_invariant.sql" ]] \
+  || die "unexpected migration-072 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -324,7 +324,9 @@ apply_migrations() {
        || "$base" == "067_bull_bitcoin_fiat_settlement" \
        || "$base" == "068_bull_bitcoin_invoice_accounting" \
        || "$base" == "069_bull_bitcoin_mixed_settlement" \
-       || "$base" == "070_bull_bitcoin_quoted_fiat" ]]; then
+       || "$base" == "070_bull_bitcoin_quoted_fiat" \
+       || "$base" == "071_mixed_invoice_payin_valuation" \
+       || "$base" == "072_mixed_invoice_blinding_key_invariant" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

@@ -4498,7 +4498,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "070_bull_bitcoin_quoted_fiat"
+        "072_mixed_invoice_blinding_key_invariant"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -4739,7 +4739,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "070_bull_bitcoin_quoted_fiat"
+        "072_mixed_invoice_blinding_key_invariant"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -17306,13 +17306,13 @@ async fn reverse_response_before_commit_restarts_into_hold_without_second_post()
 }
 
 #[tokio::test]
-async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
+async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
 
     let fake = ScriptedBullBitcoinApi::default();
-    let (_, owner_npub, credential_id, _) =
-        fiat_lifecycle_test_state(&pool, fake, "mixed-sat-lightning-quote").await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "mixed-fiat-lightning-quote").await;
     pay_service::db::upsert_fiat_settlement_setting(
         &pool,
         &owner_npub,
@@ -17338,9 +17338,9 @@ async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
             npub_owner: &owner_npub,
             origin: "wallet",
             checkout_surface_kind: None,
-            fiat_amount_minor: None,
-            fiat_currency: None,
-            amount_sat: 30_000,
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 0,
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
@@ -17362,14 +17362,24 @@ async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
         .await
         .unwrap() as u64;
     let provider = spawn_successful_reverse_barrier_server(
-        "MIXED_SAT_LIGHTNING_QUOTE",
-        30_123,
+        "MIXED_FIAT_LIGHTNING_QUOTE",
+        10_073,
         first_key_index,
     )
     .await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
-    let app = test_app(test_state_with_config(pool.clone(), config));
+    config.features.bull_bitcoin_fiat_settlement = true;
+    let mut quote_state = test_state_with_config(pool.clone(), config);
+    quote_state.pricer = Arc::new(
+        PricerClient::new(PricerConfig {
+            url: pricer_url,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let app = test_app(quote_state);
     let path = format!("/api/v1/invoices/{}/quote", invoice.id);
     let request_app = app.clone();
     let request = tokio::spawn(async move {
@@ -17379,8 +17389,13 @@ async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
     provider.release_response().await;
     let (status, body) = request.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["instruction"]["kind"], "lightning_current", "{body}");
-    assert_eq!(body["instruction"]["payer_amount_sat"], 30_123);
+    assert_eq!(
+        body["instruction"]["kind"], "lightning_boltz_reverse",
+        "{body}"
+    );
+    assert_eq!(body["quote"]["merchant_amount_sat"], 10_000);
+    assert_eq!(body["instruction"]["payer_amount_sat"], 10_073);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
 
     let captured: (i64, i16, String) = sqlx::query_as(
         "SELECT COUNT(*), MIN(policy.fiat_percentage), MIN(policy.fiat_currency) \
@@ -17394,7 +17409,231 @@ async fn mixed_sat_fixed_lightning_quote_captures_policy_on_reverse_swap() {
     .unwrap();
     assert_eq!(captured, (1, 50, "CAD".into()));
 
+    // The payer's entire 10,000-sat merchant amount is valued from the
+    // immutable Bullnym quote, including the 5,000 sats routed through Bull Bitcoin.
+    // Bull Bitcoin's eventual CAD payout is separate from this USD pay-in
+    // valuation and must never replace the payer-side quote valuation.
+    let (reverse_swap_id, boltz_swap_id, net_settlement_sat): (Uuid, String, i64) = sqlx::query_as(
+        "UPDATE swap_records SET status = 'lockup_confirmed' \
+          WHERE invoice_id = $1 RETURNING id, boltz_swap_id, amount_sat",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(net_settlement_sat, 10_000);
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_liquid_order(order_id, 5_000)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(5_000),
+        credited_fiat_minor: Some(FiatAmountMinor::new(31_406).unwrap()),
+        quoted_fiat_minor: None,
+        provider_final: true,
+        provider_terminal: false,
+    }))
+    .await;
+    let preparation = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &state,
+        reverse_swap_id,
+        mixed_claim_basis(net_settlement_sat),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let settlement_id = match preparation {
+        MixedSettlementPreparation::BullBitcoinOutput {
+            settlement_id,
+            bull_bitcoin_amount_sat: 5_000,
+            ..
+        } => settlement_id,
+        _ => panic!("expected exact mixed provider output"),
+    };
+
+    let claim_txid = "4a".repeat(32);
+    let asset_hash = "4b".repeat(32);
+    let value_hash = "4c".repeat(32);
+    let nonce_hash = "4d".repeat(32);
+    let surjection_hash = "4e".repeat(32);
+    let rangeproof_hash = "4f".repeat(32);
+    let merchant_script = "0014".to_owned() + &"50".repeat(20);
+    let provider_script = "0014".to_owned() + &"51".repeat(20);
+    let merchant = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "merchant",
+        txid: &claim_txid,
+        vout: 0,
+        script_pubkey_hex: &merchant_script,
+        authorized_amount_sat: 5_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let bull_bitcoin = pay_service::db::NewBullBitcoinClaimOutput {
+        role: "bull_bitcoin",
+        txid: &claim_txid,
+        vout: 1,
+        script_pubkey_hex: &provider_script,
+        authorized_amount_sat: 5_000,
+        asset_commitment_sha256: &asset_hash,
+        value_commitment_sha256: &value_hash,
+        nonce_commitment_sha256: &nonce_hash,
+        surjection_proof_sha256: &surjection_hash,
+        rangeproof_sha256: &rangeproof_hash,
+    };
+    let mut funding_tx = pool.begin().await.unwrap();
+    pay_service::db::commit_mixed_bull_bitcoin_funding(
+        &mut funding_tx,
+        settlement_id,
+        &merchant,
+        &bull_bitcoin,
+    )
+    .await
+    .unwrap();
+    funding_tx.commit().await.unwrap();
+    sqlx::query("UPDATE swap_records SET status = 'claimed', claim_txid = $2 WHERE id = $1")
+        .bind(reverse_swap_id)
+        .bind(&claim_txid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        invoice::record_reverse_claim_settlement(
+            &pool,
+            reverse_swap_id,
+            Some(invoice.id),
+            net_settlement_sat,
+            &boltz_swap_id,
+            &claim_txid,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+    );
+
+    type MixedValuationEventRow = (String, i64, Option<i64>, Option<Uuid>, Option<Uuid>);
+    let events: Vec<MixedValuationEventRow> = sqlx::query_as(
+        "SELECT source, amount_sat, fiat_credited_minor, \
+                fiat_valuation_quote_version_id, invoice_quote_offer_id \
+           FROM invoice_payment_events WHERE invoice_id = $1 \
+          ORDER BY accounting_sequence",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "lightning_boltz_reverse");
+    assert_eq!(events[0].1, 5_000);
+    assert_eq!(events[1].0, "bull_bitcoin_mixed_output");
+    assert_eq!(events[1].1, 5_000);
+    assert!(events.iter().all(|event| event.2.is_some()), "{events:?}");
+    assert!(events.iter().all(|event| event.3 == events[0].3));
+    assert!(events.iter().all(|event| event.4 == events[0].4));
+    let (quote_id, quote_target_minor): (Uuid, i64) = sqlx::query_as(
+        "SELECT id, fiat_target_amount_minor::BIGINT \
+           FROM invoice_quote_versions WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events[0].3, Some(quote_id));
+    assert_eq!(
+        events.iter().map(|event| event.2.unwrap()).sum::<i64>(),
+        quote_target_minor
+    );
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let provider_credit: i64 = sqlx::query_scalar(
+        "SELECT credited_fiat_minor FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(provider_credit, 31_406);
+    assert_ne!(quote_target_minor, provider_credit);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
     provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn mixed_lightning_invoice_without_blinding_key_is_rejected_atomically() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let fake = ScriptedBullBitcoinApi::default();
+    let (_, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake, "mixed-missing-blinding-key").await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        50,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let liquid_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let result = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 30_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        2,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        result
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("invoice_fiat_policy_mixed_blinding_key_required")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices WHERE npub_owner = $1")
+            .bind(&owner_npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0,
+        "invoice and policy admission must roll back together"
+    );
+
     cleanup_db(&pool).await;
 }
 

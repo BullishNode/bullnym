@@ -697,6 +697,37 @@ pub async fn record_claim_failure(
     Ok(outcome)
 }
 
+/// Put a permanent mixed-destination invariant failure directly into the
+/// operator-visible terminal state. Unlike an ordinary construction or
+/// transport failure this is not retried: no amount of scheduler backoff can
+/// manufacture a missing key or prove an address/key correspondence.
+pub async fn mark_claim_integrity_hold(
+    pool: &PgPool,
+    id: Uuid,
+    error_msg: &str,
+) -> Result<ClaimFailureOutcome, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE swap_records \
+         SET status = 'claim_stuck', \
+             last_claim_error = $2, \
+             last_claim_error_at = NOW(), \
+             next_claim_attempt_at = NULL, \
+             next_slow_attempt_at = NULL, \
+             updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
+    )
+    .bind(id)
+    .bind(error_msg)
+    .execute(pool)
+    .await?;
+    Ok(if updated.rows_affected() == 1 {
+        ClaimFailureOutcome::Stuck
+    } else {
+        ClaimFailureOutcome::NoOp
+    })
+}
+
 /// Funded reverse swaps stranded in `claim_stuck` whose slow-recovery backoff is
 /// due (issue #63). Bounded + oldest-first. Returns `(id, boltz_swap_id,
 /// slow_attempts)` so the caller can compute the next backoff. `claim_stuck` is
@@ -710,6 +741,7 @@ pub async fn list_claim_stuck_swaps_for_slow_retry(
         "SELECT id, boltz_swap_id, slow_attempts \
          FROM swap_records \
          WHERE status = 'claim_stuck' \
+           AND COALESCE(last_claim_error, '') NOT LIKE 'mixed_invoice_integrity_hold:%' \
            AND (next_slow_attempt_at IS NULL OR next_slow_attempt_at <= NOW()) \
          ORDER BY next_slow_attempt_at NULLS FIRST \
          LIMIT $1",

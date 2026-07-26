@@ -1189,13 +1189,35 @@ async fn sync_mixed_bull_bitcoin_event(
     if snapshot.context.path() != MerchantSettlementPath::LiquidClaim {
         return Ok(());
     }
-    let row: Option<(Uuid, Uuid, String, i16, i64)> = sqlx::query_as(
+    type MixedBullBitcoinEventRow = (
+        Uuid,
+        Uuid,
+        String,
+        i16,
+        i64,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<i64>,
+    );
+    let row: Option<MixedBullBitcoinEventRow> = sqlx::query_as(
         "SELECT settlement.id, settlement.invoice_id, output.txid, output.vout, \
-                output.authorized_amount_sat \
+                output.authorized_amount_sat, \
+                COALESCE(reverse_swap.invoice_quote_version_id, \
+                         chain_swap.invoice_quote_version_id), \
+                COALESCE(reverse_swap.invoice_quote_offer_id, \
+                         chain_swap.invoice_quote_offer_id), \
+                (EXTRACT(EPOCH FROM COALESCE( \
+                    reverse_swap.quote_payment_first_observed_at, \
+                    chain_swap.quote_payment_first_observed_at \
+                )) * 1000000)::BIGINT \
            FROM bull_bitcoin_settlements settlement \
            JOIN bull_bitcoin_claim_outputs output \
              ON output.settlement_id = settlement.id \
             AND output.role = 'bull_bitcoin' \
+           LEFT JOIN swap_records reverse_swap \
+             ON reverse_swap.id = settlement.reverse_swap_id \
+           LEFT JOIN chain_swap_records chain_swap \
+             ON chain_swap.id = settlement.chain_swap_id \
           WHERE settlement.chain_swap_id = $1 \
             AND settlement.purpose = 'mixed' \
             AND settlement.provider_state = 'bound' \
@@ -1205,9 +1227,24 @@ async fn sync_mixed_bull_bitcoin_event(
     .bind(snapshot.context.chain_swap_id())
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((settlement_id, invoice_id, txid, vout, amount_sat)) = row else {
+    let Some((
+        settlement_id,
+        invoice_id,
+        txid,
+        vout,
+        amount_sat,
+        quote_version_id,
+        quote_offer_id,
+        first_observed_at_unix_micros,
+    )) = row
+    else {
         return Ok(());
     };
+    if quote_version_id.is_some() != quote_offer_id.is_some()
+        || quote_version_id.is_some() != first_observed_at_unix_micros.is_some()
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
     if invoice_id != snapshot.context.invoice_id()
         || txid != snapshot.lifecycle.active_txid.as_str()
         || vout != 1
@@ -1225,9 +1262,14 @@ async fn sync_mixed_bull_bitcoin_event(
             "INSERT INTO invoice_payment_events ( \
                  invoice_id, rail, source, event_key, amount_sat, txid, vout, \
                  boltz_swap_id, address, accounting_state, verification_state, \
-                 bull_bitcoin_settlement_id, last_activated_at \
+                 invoice_quote_version_id, invoice_quote_offer_id, \
+                 quote_first_observed_at, bull_bitcoin_settlement_id, \
+                 last_activated_at \
              ) VALUES ($1,'liquid','bull_bitcoin_mixed_output',$2,$3,$4,$5, \
-                       NULL,NULL,'active','not_applicable',$6,NOW()) \
+                       NULL,NULL,'active','not_applicable',$6,$7, \
+                       CASE WHEN $6::UUID IS NULL THEN NULL \
+                            ELSE to_timestamp($8::NUMERIC / 1000000) END, \
+                       $9,NOW()) \
              ON CONFLICT (event_key) DO NOTHING",
         )
         .bind(invoice_id)
@@ -1235,6 +1277,9 @@ async fn sync_mixed_bull_bitcoin_event(
         .bind(amount_sat)
         .bind(&txid)
         .bind(i32::from(vout))
+        .bind(quote_version_id)
+        .bind(quote_offer_id)
+        .bind(first_observed_at_unix_micros)
         .bind(settlement_id)
         .execute(&mut **tx)
         .await?;
@@ -1247,7 +1292,8 @@ async fn sync_mixed_bull_bitcoin_event(
             AND amount_sat = $3 AND txid = $4 AND vout = $5 \
             AND boltz_swap_id IS NULL AND address IS NULL \
             AND bull_bitcoin_settlement_id = $6 \
-            AND fiat_credited_minor IS NULL \
+            AND invoice_quote_version_id IS NOT DISTINCT FROM $7::UUID \
+            AND invoice_quote_offer_id IS NOT DISTINCT FROM $8::UUID \
           FOR UPDATE",
     )
     .bind(&event_key)
@@ -1256,6 +1302,8 @@ async fn sync_mixed_bull_bitcoin_event(
     .bind(&txid)
     .bind(i32::from(vout))
     .bind(settlement_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(current_state) = current_state else {
