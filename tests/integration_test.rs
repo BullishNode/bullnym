@@ -4228,6 +4228,300 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
 }
 
 #[tokio::test]
+async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-invoice-late-watch").await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        100,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 25_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: true,
+            accept_ln: false,
+            accept_liquid: false,
+            bitcoin_address: Some("bc1qfiatinvoicelatewatch"),
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        1,
+    )
+    .await
+    .unwrap();
+    let request = FiatOnlyInstructionRequest {
+        owner_npub: &owner_npub,
+        invoice_id: Some(invoice.id),
+        product: Product::Invoice,
+        credential_id,
+        request_key: "invoice-payer-intent-late-watch",
+        fiat_currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Bitcoin,
+        bitcoin_amount: BitcoinAmountSat::new(25_000).unwrap(),
+        use_payjoin: true,
+    };
+    let settlement_id =
+        match pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap()
+        {
+            FiatOnlyInstructionOutcome::BullBitcoin { settlement_id, .. } => settlement_id,
+            other => panic!("expected Bull Bitcoin instruction, got {other:?}"),
+        };
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        1
+    );
+    let expired = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.status, "expired");
+    assert_eq!(expired.presentation_status.as_deref(), Some("unpaid"));
+    assert_eq!(expired.fiat_settlement_status, "none");
+    assert_eq!(expired.settlement_status, "none");
+    assert!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[invoice.id],
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "an unfunded provider watch must not remain active merchant work"
+    );
+
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "In progress".into(),
+        payin_status: "Payment deadline expired".into(),
+        payout_status: "Initialized".into(),
+        actual_received_sat: None,
+        credited_fiat_minor: None,
+        quoted_fiat_minor: None,
+        provider_final: false,
+        provider_terminal: false,
+    }))
+    .await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let watch_delay_secs: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (next_attempt_at - NOW()))::DOUBLE PRECISION \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        watch_delay_secs > 3_500.0 && watch_delay_secs <= 3_600.0,
+        "unexpected late-watch delay: {watch_delay_secs}"
+    );
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements SET retention_until = created_at \
+          WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::expire_bull_bitcoin_retention(&pool)
+            .await
+            .unwrap(),
+        0,
+        "a locally expired timer is not proof that the provider instruction is terminal"
+    );
+
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = NOW() WHERE id = $1")
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "In progress".into(),
+        payin_status: "Awaiting confirmation".into(),
+        payout_status: "Initialized".into(),
+        actual_received_sat: Some(25_000),
+        credited_fiat_minor: None,
+        quoted_fiat_minor: None,
+        provider_final: false,
+        provider_terminal: false,
+    }))
+    .await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let funded = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(funded.status, "expired");
+    assert_eq!(funded.fiat_settlement_status, "pending");
+    assert_eq!(funded.settlement_status, "pending");
+    assert_eq!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[invoice.id],
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "late money evidence must restore the merchant settlement projection"
+    );
+
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = NOW() WHERE id = $1")
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(25_000),
+        credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
+        quoted_fiat_minor: None,
+        provider_final: true,
+        provider_terminal: false,
+    }))
+    .await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let settled = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(settled.paid_amount_sat, Some(25_000));
+    assert_eq!(settled.fiat_settlement_status, "settled");
+    assert_eq!(settled.settlement_status, "settled");
+
+    let cancelled_order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(cancelled_order_id)))
+        .await;
+    let cancellable = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 25_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: true,
+            accept_ln: false,
+            accept_liquid: false,
+            bitcoin_address: Some("bc1qfiatinvoicecancelwatch"),
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        2,
+    )
+    .await
+    .unwrap();
+    let cancel_request = FiatOnlyInstructionRequest {
+        owner_npub: &owner_npub,
+        invoice_id: Some(cancellable.id),
+        product: Product::Invoice,
+        credential_id,
+        request_key: "invoice-payer-intent-cancel-watch",
+        fiat_currency: FiatCurrency::CAD,
+        network: BitcoinNetwork::Bitcoin,
+        bitcoin_amount: BitcoinAmountSat::new(25_000).unwrap(),
+        use_payjoin: true,
+    };
+    assert!(matches!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &cancel_request)
+            .await
+            .unwrap(),
+        FiatOnlyInstructionOutcome::BullBitcoin { .. }
+    ));
+    assert_eq!(
+        pay_service::db::cancel_invoice(&pool, cancellable.id)
+            .await
+            .unwrap(),
+        (1, "cancelled".to_owned())
+    );
+    let cancelled = pay_service::db::get_invoice_by_id(&pool, cancellable.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(cancelled.presentation_status.as_deref(), Some("unpaid"));
+    assert_eq!(cancelled.fiat_settlement_status, "none");
+    assert_eq!(cancelled.settlement_status, "none");
+    assert!(
+        pay_service::db::invoice_bull_bitcoin_settlement_projections(
+            &pool,
+            &owner_npub,
+            &[cancellable.id],
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "a cancelled never-funded order is audit-only merchant history"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_after_crash() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -4321,6 +4615,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
             provider_terminal: false,
         },
         1,
+        3_600,
     )
     .await
     .unwrap();
@@ -4498,7 +4793,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "073_unfunded_provider_watch"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -4739,7 +5034,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "072_mixed_invoice_blinding_key_invariant"
+        "073_unfunded_provider_watch"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -22996,7 +23291,7 @@ async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit()
     let observed_row_lock_wait = observe_recovery_lock_wait(
         &pool,
         expiry_backend_pid,
-        "%UPDATE invoices SET status = CASE%",
+        "%UPDATE invoices invoice SET status = CASE%",
     )
     .await
     .unwrap();

@@ -254,16 +254,17 @@ the timestamp column, immutable stamping trigger, indexes, and runtime read
 privilege before serving traffic. The endpoint reads existing swap and invoice
 payment evidence; it does not create or mutate accounting events.
 
-## Migrations 067-072 Bull Bitcoin fiat settlement
+## Migrations 067-073 Bull Bitcoin fiat settlement
 
 Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `068_bull_bitcoin_invoice_accounting.sql`,
 `069_bull_bitcoin_mixed_settlement.sql`,
 `070_bull_bitcoin_quoted_fiat.sql`,
-`071_mixed_invoice_payin_valuation.sql`, and
-`072_mixed_invoice_blinding_key_invariant.sql` in order as the privileged schema
-owner with `--set runtime_role=bullnym_app` while every Bullnym writer is
-stopped. Take and validate a schema-066 backup first. Keep
+`071_mixed_invoice_payin_valuation.sql`,
+`072_mixed_invoice_blinding_key_invariant.sql`, and
+`073_unfunded_provider_watch.sql` in order as the privileged schema owner with
+`--set runtime_role=bullnym_app` while every Bullnym writer is stopped. Take
+and validate a schema-066 backup first. Keep
 `features.bull_bitcoin_fiat_settlement = false` throughout migration and
 initial service verification.
 
@@ -276,7 +277,7 @@ URL and a fresh root-only `BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY` containing
 exactly 32 random bytes encoded as 64 lowercase hexadecimal characters. Never
 copy a production credential or encryption key into staging.
 
-Start only the schema-072 binary. Require `/ready`, `/version`, the installed
+Start only the schema-073 binary. Require `/ready`, `/version`, the installed
 artifact digest, and the release record to agree while admission remains off.
 Then test one eligible scoped key, one benchmark-ineligible account, one
 wrong-scope key, and one unavailable-API response before enabling the feature.
@@ -285,7 +286,7 @@ eligibility call must create no Bull Bitcoin order.
 
 Automatic rollback across migration 067 is refused. To return to a pre-067
 release, stop every writer and restore the validated schema-066 database with
-its matching binary, PWA, release record, and configuration. A schema-072
+its matching binary, PWA, release record, and configuration. A schema-073
 feature-off binary is the safe rollback target after the migrations exist.
 
 ## Migration 053 privileged-owner boundary

@@ -405,9 +405,11 @@ smallest explicit compromise:
    full-Bitcoin fallback, releasing its credential dependency;
 3. retain the encrypted key only for an already exposed Boltz instruction that
    may later need its mixed order, a funded swap, or a bound Bull Bitcoin order;
-4. erase ciphertext when all dependencies are provider-final or when the
-   configured, provider-validated late-payment retention window ends; any
-   unresolved leg then becomes `unavailable` rather than being guessed.
+4. erase ciphertext when all invoice dependencies are provider-final. A local
+   timer is not authority to erase the only read capability for an exposed
+   invoice order. The configured retention boundary remains applicable to
+   Lightning Address instructions, which have no parent invoice lifecycle;
+   unresolved rows become `unavailable` rather than being guessed.
 
 Displayed `Expired` or account-side archival alone is not provider-final. The
 retention window must be set from Bull Bitcoin's documented/live-validated
@@ -563,8 +565,13 @@ known Bull Bitcoin order ID. It never calls an order-list endpoint.
 - treat canceled, rejected, archived-readable, and not-found results according
   to the exact-order contract instead of silently treating them as unpaid;
 - reduce invoice fiat status over all value-bearing legs after each change;
+- after an unpaid invoice expires or is cancelled, remove a never-funded
+  fiat-only leg from the customer-facing aggregate and poll the retained order
+  at `late_payment_watch_interval_secs`; any received-funds evidence restores
+  the active financial projection immediately;
 - finalize pending credential deletion when its last exposed/funded dependency
-  is resolved or reaches the configured retention boundary.
+  is resolved (or, for an invoice-less Lightning Address instruction, reaches
+  the configured retention boundary).
 
 The global feature flag gates new settings and new orders, not reconciliation
 of existing obligations. Disabling rollout must not abandon a funded order.
@@ -684,7 +691,7 @@ merchant-only detail may add only `fiat_conversion: {"status":"overridden",
 | Duplicate payer/claim requests | Existing session advisory lock plus a unique local request key returns one binding/routing decision. |
 | Bound fiat instruction expires before/after socket delivery | Treat it as potentially exposed; do not replace or redirect it. A later partial instruction requires a new request key. |
 | Order is archived in the Bull Bitcoin account | Exact same-key lookup still works; archive is not authorization and does not hide Bullnym's own settlement. |
-| Order displays expired after exposure | Do not assume irreversible finality. Reconcile through the validated late-payment retention boundary. |
+| Order displays expired after exposure | Do not assume irreversible finality. For an expired/cancelled unpaid invoice, retain the exact-order lookup on a low-frequency watch until provider terminality; do not keep the invoice itself pending. |
 | Invoice cancellation/expiry after payment evidence | Preserve and attribute late settlement using current Bullnym lifecycle rules. |
 | Underpayment/overpayment | Supersede one active actual-sat event when needed and record the provider-credited fiat; never create a compensating order. |
 | Multiple partial payments | One leg/order per committed payer instruction; active events sum actual sats once and merchant projection lists each order. |
@@ -781,8 +788,9 @@ without pretending to own Bull Bitcoin's blinding key.
 - split rounding, minimum fallback, primary dust fallback, 100% boundary, and
   no destination mutation after commitment;
 - write-ahead state transitions including ambiguous crash fallback;
-- worker retry/backoff, idempotent/superseding completion, credential drain,
-  retention boundary, and key replacement conflict.
+- worker retry/backoff, idempotent/superseding completion, derived late-payment
+  watch, invoice-less retention boundary, credential drain, and key replacement
+  conflict.
 
 ### 13.2 Bullnym PostgreSQL integration tests
 

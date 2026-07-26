@@ -405,6 +405,7 @@ const DEFAULT_BULL_BITCOIN_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_BULL_BITCOIN_RECONCILE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_BULL_BITCOIN_RECONCILE_BATCH_SIZE: u32 = 50;
 const DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS: u64 = 900;
+const DEFAULT_BULL_BITCOIN_LATE_PAYMENT_WATCH_INTERVAL_SECS: u64 = 3_600;
 const DEFAULT_BULL_BITCOIN_LATE_PAYMENT_RETENTION_SECS: u64 = 2_592_000;
 
 fn default_bull_bitcoin_api_url() -> String {
@@ -431,6 +432,10 @@ fn default_bull_bitcoin_retry_backoff_cap_secs() -> u64 {
     DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS
 }
 
+fn default_bull_bitcoin_late_payment_watch_interval_secs() -> u64 {
+    DEFAULT_BULL_BITCOIN_LATE_PAYMENT_WATCH_INTERVAL_SECS
+}
+
 fn default_bull_bitcoin_late_payment_retention_secs() -> u64 {
     DEFAULT_BULL_BITCOIN_LATE_PAYMENT_RETENTION_SECS
 }
@@ -450,6 +455,10 @@ pub struct BullBitcoinConfig {
     pub reconcile_batch_size: u32,
     #[serde(default = "default_bull_bitcoin_retry_backoff_cap_secs")]
     pub retry_backoff_cap_secs: u64,
+    /// Poll cadence for an expired/cancelled fiat-only invoice whose provider
+    /// instruction remains payable but has never reported received funds.
+    #[serde(default = "default_bull_bitcoin_late_payment_watch_interval_secs")]
+    pub late_payment_watch_interval_secs: u64,
     /// Operator-validated window during which a previously exposed order may
     /// still receive a late payment. This is a retention bound, not a claim
     /// that an upstream display status is financially final.
@@ -466,6 +475,8 @@ impl Default for BullBitcoinConfig {
             reconcile_interval_secs: default_bull_bitcoin_reconcile_interval_secs(),
             reconcile_batch_size: default_bull_bitcoin_reconcile_batch_size(),
             retry_backoff_cap_secs: default_bull_bitcoin_retry_backoff_cap_secs(),
+            late_payment_watch_interval_secs: default_bull_bitcoin_late_payment_watch_interval_secs(
+            ),
             late_payment_retention_secs: default_bull_bitcoin_late_payment_retention_secs(),
         }
     }
@@ -1838,6 +1849,18 @@ impl Config {
             "bull_bitcoin.retry_backoff_cap_secs",
             self.bull_bitcoin.retry_backoff_cap_secs,
         )?;
+        require_positive(
+            "bull_bitcoin.late_payment_watch_interval_secs",
+            self.bull_bitcoin.late_payment_watch_interval_secs,
+        )?;
+        if self.bull_bitcoin.late_payment_watch_interval_secs
+            < self.bull_bitcoin.reconcile_interval_secs
+        {
+            return Err(
+                "bull_bitcoin.late_payment_watch_interval_secs must be >= reconcile_interval_secs"
+                    .into(),
+            );
+        }
         require_positive(
             "bull_bitcoin.late_payment_retention_secs",
             self.bull_bitcoin.late_payment_retention_secs,

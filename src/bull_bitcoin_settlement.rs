@@ -1261,6 +1261,7 @@ async fn reconcile_settlement(
             &state.db,
             settlement.id,
             retry_delay_secs(state, settlement.reconcile_attempts),
+            late_payment_watch_delay_secs(state),
         )
         .await
         .map_err(|_| SettlementServiceError::Database)?;
@@ -1271,6 +1272,7 @@ async fn reconcile_settlement(
             &state.db,
             settlement.id,
             retry_delay_secs(state, settlement.reconcile_attempts),
+            late_payment_watch_delay_secs(state),
         )
         .await
         .map_err(|_| SettlementServiceError::Database)?;
@@ -1313,6 +1315,7 @@ async fn reconcile_settlement(
                     &observation,
                     i64::try_from(state.config.bull_bitcoin.reconcile_interval_secs)
                         .map_err(|_| SettlementServiceError::StoredState)?,
+                    late_payment_watch_delay_secs(state),
                 )
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
@@ -1351,6 +1354,7 @@ async fn reconcile_settlement(
                 &state.db,
                 settlement.id,
                 retry_delay_secs(state, settlement.reconcile_attempts),
+                late_payment_watch_delay_secs(state),
             )
             .await
             .map_err(|_| SettlementServiceError::Database)?;
@@ -1433,6 +1437,10 @@ fn retry_delay_secs(state: &AppState, attempts: i32) -> i64 {
         .saturating_mul(multiplier)
         .min(state.config.bull_bitcoin.retry_backoff_cap_secs);
     i64::try_from(delay).unwrap_or(i64::MAX)
+}
+
+fn late_payment_watch_delay_secs(state: &AppState) -> i64 {
+    i64::try_from(state.config.bull_bitcoin.late_payment_watch_interval_secs).unwrap_or(i64::MAX)
 }
 
 fn map_store_error(error: BullBitcoinSettlementStoreError) -> SettlementServiceError {

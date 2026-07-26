@@ -3771,11 +3771,45 @@ pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<(u64, String), sq
     let mut tx = pool.begin().await?;
     lock_invoice_lightning_projection(&mut tx, id).await?;
     let result = sqlx::query(
-        "UPDATE invoices SET status = 'cancelled', cancelled_at = NOW() \
+        "UPDATE invoices invoice \
+         SET status = 'cancelled', cancelled_at = NOW(), \
+             fiat_settlement_status = 'none' \
          WHERE id = $1 \
            AND status = 'unpaid' \
            AND presentation_status = 'unpaid' \
-           AND settlement_status = 'none'",
+           AND (settlement_status = 'none' OR ( \
+               direct_settlement_status = 'none' \
+               AND swap_settlement_status = 'none' \
+               AND fiat_settlement_status IN ('pending', 'unavailable') \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM invoice_payment_events event \
+                    WHERE event.invoice_id = invoice.id \
+               ) \
+               AND EXISTS ( \
+                   SELECT 1 FROM bull_bitcoin_settlements settlement \
+                    WHERE settlement.invoice_id = invoice.id \
+                      AND settlement.provider_state = 'bound' \
+                      AND settlement.funding_route = 'bull_bitcoin' \
+                      AND settlement.funding_committed_at IS NOT NULL \
+                      AND settlement.purpose = 'fiat_only' \
+                      AND settlement.actual_received_sat IS NULL \
+                      AND NOT settlement.provider_final \
+                      AND settlement.settlement_status IN ( \
+                          'pending', 'unavailable' \
+                      ) \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM bull_bitcoin_settlements settlement \
+                    WHERE settlement.invoice_id = invoice.id \
+                      AND settlement.provider_state = 'bound' \
+                      AND settlement.funding_route = 'bull_bitcoin' \
+                      AND settlement.funding_committed_at IS NOT NULL \
+                      AND (settlement.purpose <> 'fiat_only' \
+                           OR settlement.actual_received_sat IS NOT NULL \
+                           OR settlement.provider_final \
+                           OR settlement.settlement_status = 'integrity_error') \
+               ) \
+           ))",
     )
     .bind(id)
     .execute(&mut *tx)
@@ -3811,16 +3845,52 @@ pub async fn expire_invoices_past_deadline(
     payment_grace_secs: u64,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE invoices SET status = CASE \
+        "UPDATE invoices invoice SET status = CASE \
             WHEN status = 'partially_paid' THEN 'underpaid' \
             ELSE 'expired' \
+         END, \
+         fiat_settlement_status = CASE \
+             WHEN status IN ('unpaid', 'in_progress') THEN 'none' \
+             ELSE fiat_settlement_status \
          END \
          WHERE expires_at < NOW() - ($1 || ' seconds')::interval \
            AND ( \
              ( \
                status IN ('unpaid', 'in_progress') \
                AND presentation_status = 'unpaid' \
-               AND settlement_status = 'none' \
+               AND (settlement_status = 'none' OR ( \
+                   direct_settlement_status = 'none' \
+                   AND swap_settlement_status = 'none' \
+                   AND fiat_settlement_status IN ('pending', 'unavailable') \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM invoice_payment_events event \
+                        WHERE event.invoice_id = invoice.id \
+                   ) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM bull_bitcoin_settlements settlement \
+                        WHERE settlement.invoice_id = invoice.id \
+                          AND settlement.provider_state = 'bound' \
+                          AND settlement.funding_route = 'bull_bitcoin' \
+                          AND settlement.funding_committed_at IS NOT NULL \
+                          AND settlement.purpose = 'fiat_only' \
+                          AND settlement.actual_received_sat IS NULL \
+                          AND NOT settlement.provider_final \
+                          AND settlement.settlement_status IN ( \
+                              'pending', 'unavailable' \
+                          ) \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM bull_bitcoin_settlements settlement \
+                        WHERE settlement.invoice_id = invoice.id \
+                          AND settlement.provider_state = 'bound' \
+                          AND settlement.funding_route = 'bull_bitcoin' \
+                          AND settlement.funding_committed_at IS NOT NULL \
+                          AND (settlement.purpose <> 'fiat_only' \
+                               OR settlement.actual_received_sat IS NOT NULL \
+                               OR settlement.provider_final \
+                               OR settlement.settlement_status = 'integrity_error') \
+                   ) \
+               )) \
              ) \
              OR ( \
                status = 'partially_paid' \
