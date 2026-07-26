@@ -1320,6 +1320,9 @@ pub async fn expire_bull_bitcoin_retention(pool: &PgPool) -> Result<u64, sqlx::E
 }
 
 pub async fn finalize_drained_bull_bitcoin_credentials(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    // An integrity hold may be the only durable evidence for a funded provider
+    // order whose response could not be trusted. Keep the key until an
+    // operator resolves that obligation; it is not a drained terminal row.
     let result = sqlx::query(
         "UPDATE bull_bitcoin_credentials credential \
             SET ciphertext = NULL, nonce = NULL, erased_at = now() \
@@ -1330,7 +1333,8 @@ pub async fn finalize_drained_bull_bitcoin_credentials(pool: &PgPool) -> Result<
                  WHERE settlement.credential_id = credential.id \
                    AND (settlement.provider_state = 'dispatch_started' \
                         OR (settlement.provider_state = 'bound' \
-                            AND settlement.settlement_status = 'pending')) \
+                            AND settlement.settlement_status \
+                                IN ('pending', 'integrity_error'))) \
             )",
     )
     .execute(pool)
