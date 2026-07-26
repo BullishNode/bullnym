@@ -183,7 +183,7 @@ const DONATION_CSP: &str = "default-src 'self'; \
              img-src 'self' data:; \
              script-src 'self' 'unsafe-inline'; \
              style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com; \
+             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com wss://mempool.bullbitcoin.com; \
              frame-ancestors 'none'; \
              base-uri 'none'";
 
@@ -191,7 +191,7 @@ const POS_CSP: &str = "default-src 'self'; \
              img-src 'self' data:; \
              script-src 'self' 'unsafe-inline'; \
              style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' https: wss://liquid.network wss://liquid.bullbitcoin.com; \
+             connect-src 'self' https: wss://liquid.network wss://liquid.bullbitcoin.com wss://mempool.bullbitcoin.com; \
              frame-ancestors 'none'; \
              base-uri 'none'";
 const PWA_SHELL_HEADER: &str = "x-bullnym-pwa-shell";
@@ -221,10 +221,10 @@ fn apply_security_headers(resp: &mut Response, is_pos: bool) {
     // - 'unsafe-inline' for script and style — the page bundles its JS/CSS
     //   inline, no remote CDN. User-controlled fields are askama-escaped
     //   so injection through them is blocked.
-    // - connect-src widened to wss://liquid.network so the donation page
-    //   can subscribe directly to the public Esplora WebSocket for
-    //   instant zero-conf Liquid payment notification. The
-    //   Lightning path remains same-origin (server-side polling).
+    // - connect-src permits only Bullnym's Liquid and Bitcoin Esplora
+    //   WebSocket authorities so the donation page can receive instant
+    //   zero-conf payment hints. The Lightning path remains same-origin
+    //   (server-side polling).
     // - POS terminals also need arbitrary HTTPS card-service origins for
     //   Bolt Card LNURL-withdraw. Keep script-src pinned; only connect-src
     //   changes for live POS pages.

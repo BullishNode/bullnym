@@ -767,7 +767,7 @@ const INVOICE_CSP: &str = "default-src 'self'; \
              img-src 'self' data:; \
              script-src 'self' 'unsafe-inline'; \
              style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com; \
+             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com wss://mempool.bullbitcoin.com; \
              frame-ancestors 'none'; \
              base-uri 'none'";
 

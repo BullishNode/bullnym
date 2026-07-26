@@ -56,6 +56,7 @@ fn security_headers_keep_donation_csp_tight() {
 
     assert_eq!(csp, DONATION_CSP);
     assert!(csp.contains("connect-src 'self' wss://liquid.network"));
+    assert!(csp.contains("wss://mempool.bullbitcoin.com"));
     assert!(!csp.contains("connect-src 'self' https:"));
     assert_eq!(
         resp.headers().get("x-robots-tag").expect("robots header"),
@@ -84,6 +85,7 @@ fn security_headers_allow_https_connects_for_pos_csp() {
 
     assert_eq!(csp, POS_CSP);
     assert!(csp.contains("connect-src 'self' https: wss://liquid.network"));
+    assert!(csp.contains("wss://mempool.bullbitcoin.com"));
     assert!(csp.contains("script-src 'self' 'unsafe-inline'"));
 }
 

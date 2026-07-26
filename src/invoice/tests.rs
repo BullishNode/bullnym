@@ -219,7 +219,15 @@ fn invoice_html_response_is_private_and_not_offline_cacheable() {
     assert!(!resp.headers().contains_key("x-bullnym-pwa-shell"));
     assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
     assert_eq!(resp.headers()[header::REFERRER_POLICY], "no-referrer");
-    assert!(resp.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    let csp = resp
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("invoice csp")
+        .to_str()
+        .expect("valid invoice csp");
+    assert_eq!(csp, INVOICE_CSP);
+    assert!(csp.contains("wss://liquid.bullbitcoin.com"));
+    assert!(csp.contains("wss://mempool.bullbitcoin.com"));
 }
 
 #[test]
