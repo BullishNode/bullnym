@@ -1536,6 +1536,30 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND EXISTS ( \
                 SELECT 1 FROM pg_proc function_info \
                  WHERE function_info.proname = \
+                           'guard_fiat_only_quote_authority' \
+                   AND function_info.prosecdef \
+                   AND array_to_string(function_info.proconfig, ',') LIKE \
+                           '%search_path=pg_catalog, public%' \
+                   AND POSITION( \
+                       'new.quote_payment_first_observed_at := clock_timestamp()' \
+                       IN LOWER(pg_get_functiondef(function_info.oid)) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'bull_bitcoin_settlements_first_observation_immutable' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'bullnym-invoice-quote-offer-v1' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'fiat-fixed bull bitcoin settlement requires a payer quote' \
+                       IN LOWER(pg_get_functiondef(function_info.oid)) \
+                   ) > 0 \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
                            'sync_invoice_bull_bitcoin_settlement_status' \
                    AND function_info.prosecdef \
                    AND array_to_string(function_info.proconfig, ',') LIKE \

@@ -1086,12 +1086,6 @@ pub async fn record_bull_bitcoin_observation(
         "UPDATE bull_bitcoin_settlements \
             SET order_status = $2, payin_status = $3, payout_status = $4, \
                 actual_received_sat = COALESCE($5, actual_received_sat), \
-                quote_payment_first_observed_at = CASE \
-                    WHEN purpose = 'fiat_only' \
-                     AND actual_received_sat IS NULL \
-                     AND $5::BIGINT IS NOT NULL \
-                    THEN clock_timestamp() \
-                    ELSE quote_payment_first_observed_at END, \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
                 execution_rate_minor_per_btc = COALESCE( \

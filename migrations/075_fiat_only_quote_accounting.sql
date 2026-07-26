@@ -126,6 +126,8 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     quote_row RECORD;
+    invoice_pricing_mode TEXT;
+    expected_request_key TEXT;
 BEGIN
     IF TG_OP = 'UPDATE'
        AND NEW.invoice_quote_version_id IS DISTINCT FROM OLD.invoice_quote_version_id THEN
@@ -138,6 +140,18 @@ BEGIN
         PERFORM pg_advisory_xact_lock(
             hashtext('invoice-lightning:' || NEW.invoice_id::TEXT)
         );
+
+        SELECT invoice.pricing_mode
+          INTO invoice_pricing_mode
+          FROM invoices invoice
+         WHERE invoice.id = NEW.invoice_id;
+        IF TG_OP = 'INSERT'
+           AND invoice_pricing_mode = 'fiat_fixed'
+           AND NEW.invoice_quote_version_id IS NULL THEN
+            RAISE EXCEPTION 'fiat-fixed Bull Bitcoin settlement requires a payer quote'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'bull_bitcoin_settlements_invoice_quote_authority';
+        END IF;
     END IF;
 
     IF TG_OP = 'INSERT'
@@ -171,6 +185,43 @@ BEGIN
                 USING ERRCODE = '23514',
                       CONSTRAINT = 'bull_bitcoin_settlements_invoice_quote_authority';
         END IF;
+
+        expected_request_key := encode(
+            digest(
+                convert_to('bullnym-invoice-quote-offer-v1', 'UTF8')
+                || decode('00', 'hex')
+                || decode(replace(quote_row.id::TEXT, '-', ''), 'hex')
+                || decode('00', 'hex')
+                || convert_to(NEW.payer_rail, 'UTF8')
+                || decode('00', 'hex')
+                || convert_to('bull_bitcoin_fiat_only', 'UTF8'),
+                'sha256'
+            ),
+            'hex'
+        );
+        IF NEW.request_key IS DISTINCT FROM expected_request_key THEN
+            RAISE EXCEPTION 'fiat-only settlement request key does not commit to its payer quote'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'bull_bitcoin_settlements_invoice_quote_authority';
+        END IF;
+    END IF;
+
+    IF TG_OP = 'INSERT'
+       AND NEW.quote_payment_first_observed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'Bull Bitcoin first-funds observation is database-owned'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'bull_bitcoin_settlements_first_observation_immutable';
+    ELSIF TG_OP = 'UPDATE'
+       AND OLD.actual_received_sat IS NULL
+       AND NEW.actual_received_sat IS NOT NULL
+       AND NEW.purpose = 'fiat_only' THEN
+        NEW.quote_payment_first_observed_at := clock_timestamp();
+    ELSIF TG_OP = 'UPDATE'
+       AND NEW.quote_payment_first_observed_at IS DISTINCT FROM
+           OLD.quote_payment_first_observed_at THEN
+        RAISE EXCEPTION 'Bull Bitcoin first-funds observation is immutable'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'bull_bitcoin_settlements_first_observation_immutable';
     END IF;
 
     IF NEW.actual_received_sat IS NOT NULL
@@ -185,8 +236,9 @@ $$;
 
 CREATE TRIGGER bull_bitcoin_settlements_guard_fiat_only_quote
     BEFORE INSERT OR UPDATE OF invoice_quote_version_id, invoice_id, purpose,
-        requested_bitcoin_sat, actual_received_sat, payer_instruction,
-        instruction_kind
+        requested_bitcoin_sat, actual_received_sat,
+        quote_payment_first_observed_at, request_key, payer_rail,
+        payer_instruction, instruction_kind
     ON bull_bitcoin_settlements
     FOR EACH ROW EXECUTE FUNCTION guard_fiat_only_quote_authority();
 
@@ -752,6 +804,184 @@ ALTER TABLE invoice_payment_events
             )
         )
     );
+
+-- The pre-075 reducer counted Bull Bitcoin's payout-currency amount as if it
+-- were invoice-face credit. Rebuild the cached status for every fiat-fixed
+-- invoice carrying that legacy evidence while writers are stopped. The event
+-- remains immutable provider audit evidence, but contributes no face credit
+-- unless a Bullnym quote actually values it.
+CREATE TEMP TABLE migration_075_legacy_fiat_only_invoices (
+    invoice_id UUID PRIMARY KEY
+) ON COMMIT DROP;
+
+INSERT INTO migration_075_legacy_fiat_only_invoices (invoice_id)
+SELECT DISTINCT invoice.id
+  FROM invoices invoice
+  JOIN invoice_payment_events event ON event.invoice_id = invoice.id
+ WHERE invoice.pricing_mode = 'fiat_fixed'
+   AND event.source = 'bull_bitcoin_fiat'
+   AND event.invoice_quote_version_id IS NULL;
+
+WITH per_quote AS (
+    SELECT quote.invoice_id,
+           projection.active_fiat_credited_minor,
+           projection.active_eligible_sat > quote.merchant_amount_sat
+               AS active_overpaid,
+           COALESCE(SUM(event.amount_sat) FILTER (WHERE
+               event.fiat_credited_minor IS NOT NULL
+               AND event.accounting_state <> 'superseded'
+               AND (
+                   event.accounting_state IN ('active', 'legacy_unverified')
+                   OR (
+                       event.source IN ('bitcoin_direct', 'liquid_direct')
+                       AND event.verification_state = 'verified'
+                       AND observation.last_seen_state = 'seen_unconfirmed'
+                   )
+               )
+           ), 0)::BIGINT AS presentation_eligible_sat,
+           quote.fiat_target_amount_minor,
+           quote.merchant_amount_sat,
+           quote.rate_minor_per_btc
+      FROM migration_075_legacy_fiat_only_invoices affected
+      JOIN invoice_quote_versions quote ON quote.invoice_id = affected.invoice_id
+      JOIN invoice_quote_active_fiat_projection projection
+        ON projection.quote_version_id = quote.id
+ LEFT JOIN invoice_payment_events event
+        ON event.invoice_id = quote.invoice_id
+       AND event.fiat_valuation_quote_version_id = quote.id
+ LEFT JOIN invoice_payment_observations observation
+        ON observation.id = event.observation_id
+  GROUP BY quote.invoice_id, quote.id,
+           projection.active_fiat_credited_minor,
+           projection.active_eligible_sat
+), quote_projection AS (
+    SELECT invoice_id,
+           COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT
+               AS active_credit_minor,
+           COALESCE(SUM(invoice_quote_credit_for_sats(
+               fiat_target_amount_minor, merchant_amount_sat,
+               rate_minor_per_btc, presentation_eligible_sat
+           )), 0)::BIGINT AS presentation_credit_minor,
+           COALESCE(BOOL_OR(active_overpaid), FALSE) AS active_overpaid,
+           COALESCE(BOOL_OR(
+               presentation_eligible_sat > merchant_amount_sat
+           ), FALSE) AS presentation_overpaid
+      FROM per_quote
+  GROUP BY invoice_id
+), projection AS (
+    SELECT invoice.id AS invoice_id,
+           invoice.status AS prior_status,
+           invoice.fiat_amount_minor::BIGINT AS face_minor,
+           COALESCE(quote.active_credit_minor, 0)::BIGINT
+               AS active_credit_minor,
+           COALESCE(quote.presentation_credit_minor, 0)::BIGINT
+               AS presentation_credit_minor,
+           COALESCE(quote.active_overpaid, FALSE) AS active_overpaid,
+           COALESCE(quote.presentation_overpaid, FALSE)
+               AS presentation_overpaid,
+           EXISTS (
+               SELECT 1
+                 FROM invoice_payment_events unresolved
+                WHERE unresolved.invoice_id = invoice.id
+                  AND (
+                      unresolved.quote_first_observed_at IS NULL
+                      OR unresolved.fiat_credited_minor IS NULL
+                      OR unresolved.fiat_credit_policy IS NULL
+                      OR unresolved.fiat_valued_at IS NULL
+                      OR unresolved.fiat_valuation_quote_version_id IS NULL
+                      OR (
+                          unresolved.source = 'bull_bitcoin_fiat'
+                          AND (
+                              unresolved.invoice_quote_version_id IS NULL
+                              OR unresolved.invoice_quote_offer_id IS NOT NULL
+                          )
+                      )
+                      OR (
+                          unresolved.source NOT IN (
+                              'bitcoin_direct', 'liquid_direct',
+                              'bull_bitcoin_fiat'
+                          )
+                          AND (
+                              unresolved.invoice_quote_version_id IS NULL
+                              OR unresolved.invoice_quote_offer_id IS NULL
+                          )
+                      )
+                  )
+           ) AS unresolved_evidence
+      FROM migration_075_legacy_fiat_only_invoices affected
+      JOIN invoices invoice ON invoice.id = affected.invoice_id
+ LEFT JOIN quote_projection quote ON quote.invoice_id = invoice.id
+), payment_projection AS (
+    SELECT affected.invoice_id,
+           COALESCE(SUM(event.amount_sat) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ), 0)::BIGINT AS received_sat,
+           COUNT(DISTINCT event.rail) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ) AS rail_count,
+           MIN(event.rail) FILTER (WHERE
+               event.accounting_state IN ('active', 'legacy_unverified')
+           ) AS single_rail
+      FROM migration_075_legacy_fiat_only_invoices affected
+ LEFT JOIN invoice_payment_events event ON event.invoice_id = affected.invoice_id
+  GROUP BY affected.invoice_id
+), resolved AS (
+    SELECT projection.*,
+           payment.received_sat,
+           CASE WHEN payment.rail_count = 1
+                THEN payment.single_rail ELSE 'mixed' END AS paid_via,
+           CASE
+               WHEN projection.prior_status = 'cancelled' THEN 'cancelled'
+               WHEN projection.prior_status = 'expired' THEN 'expired'
+               WHEN projection.unresolved_evidence
+                    AND projection.active_credit_minor < projection.face_minor
+                   THEN 'in_progress'
+               WHEN projection.active_credit_minor >= projection.face_minor
+                   THEN CASE WHEN projection.active_overpaid
+                             THEN 'overpaid' ELSE 'paid' END
+               WHEN projection.active_credit_minor > 0 THEN 'partially_paid'
+               WHEN projection.presentation_credit_minor > 0 THEN 'in_progress'
+               ELSE 'unpaid'
+           END AS resolved_status,
+           CASE
+               WHEN projection.presentation_credit_minor >= projection.face_minor
+                   THEN CASE WHEN projection.presentation_overpaid
+                             THEN 'overpaid' ELSE 'payment_received' END
+               WHEN projection.presentation_credit_minor > 0 THEN 'partial'
+               ELSE 'unpaid'
+           END AS resolved_presentation_status
+      FROM projection
+      JOIN payment_projection payment ON payment.invoice_id = projection.invoice_id
+)
+UPDATE invoices invoice
+   SET status = resolved.resolved_status,
+       presentation_status = resolved.resolved_presentation_status,
+       paid_via = resolved.paid_via,
+       paid_amount_sat = resolved.received_sat,
+       paid_at = CASE
+           WHEN resolved.resolved_status IN ('paid', 'overpaid')
+             OR (
+                 resolved.resolved_status IN ('cancelled', 'expired')
+                 AND resolved.resolved_presentation_status IN (
+                     'payment_received', 'overpaid'
+                 )
+             )
+           THEN COALESCE(invoice.paid_at, clock_timestamp())
+           ELSE invoice.paid_at
+       END
+  FROM resolved
+ WHERE invoice.id = resolved.invoice_id;
+
+DO $$
+DECLARE
+    repaired_count BIGINT;
+BEGIN
+    SELECT COUNT(*) INTO repaired_count
+      FROM migration_075_legacy_fiat_only_invoices;
+    RAISE NOTICE 'migration 075 rebuilt % legacy fiat-only invoice cache(s)',
+        repaired_count;
+END
+$$;
 
 REVOKE ALL ON FUNCTION guard_fiat_only_quote_authority() FROM PUBLIC;
 REVOKE ALL ON FUNCTION reject_quote_after_bull_bitcoin_payment() FROM PUBLIC;

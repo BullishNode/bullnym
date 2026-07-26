@@ -310,11 +310,21 @@ JOIN bull_bitcoin_settlements settlement
 WHERE event.source = 'bull_bitcoin_fiat'
   AND settlement.invoice_quote_version_id IS NOT NULL
   AND event.fiat_valuation_quote_version_id IS NULL;
+
+SELECT COUNT(DISTINCT invoice.id) AS legacy_fiat_only_caches_rebuilt
+FROM invoices invoice
+JOIN invoice_payment_events event ON event.invoice_id = invoice.id
+WHERE invoice.pricing_mode = 'fiat_fixed'
+  AND event.source = 'bull_bitcoin_fiat'
+  AND event.invoice_quote_version_id IS NULL;
 ```
 
-The latter two counts must be zero. A nonzero unresolved mixed count is a
-visible integrity exception to investigate; do not invent a rate to force it
-to zero. Preserve all three query results in the deployment record.
+`funded_instructions` and `current_fiat_events_without_quote` must be zero. A
+nonzero unresolved mixed count is a visible integrity exception to investigate;
+do not invent a rate to force it to zero. The migration prints its legacy
+fiat-only cache rebuild count; require it to equal
+`legacy_fiat_only_caches_rebuilt`. Preserve the migration output and all four
+query results in the deployment record.
 
 Deploy the compatible API-Orders release before Bullnym. Its scoped contract
 must provide `validateSellToBalance`, `sellToBalance`, and same-key

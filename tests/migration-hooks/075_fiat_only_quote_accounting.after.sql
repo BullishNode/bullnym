@@ -54,6 +54,71 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'migration 075 mishandled funded legacy admission state';
     END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM invoices
+         WHERE id = '75000000-0000-4000-8000-000000000011'
+           AND status = 'in_progress'
+           AND presentation_status = 'unpaid'
+           AND paid_via = 'bitcoin'
+           AND paid_amount_sat = 10000
+    ) OR NOT EXISTS (
+        SELECT 1 FROM invoice_payment_events
+         WHERE bull_bitcoin_settlement_id =
+               '75000000-0000-4000-8000-000000000013'
+           AND fiat_credited_minor = 31406
+           AND fiat_credit_policy = 'bull_bitcoin_actual_v1'
+           AND invoice_quote_version_id IS NULL
+           AND fiat_valuation_quote_version_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'migration 075 did not rebuild the legacy fiat-only cache safely';
+    END IF;
+END
+$$;
+
+-- A funded legacy row has no recoverable quote authority. It must remain
+-- reconcilable after cutover even though new fiat-fixed inserts require one.
+UPDATE bull_bitcoin_settlements
+   SET actual_received_sat = actual_received_sat,
+       updated_at = clock_timestamp()
+ WHERE id = '75000000-0000-4000-8000-000000000013';
+
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO bull_bitcoin_settlements (
+            id, owner_npub, invoice_id, credential_id, product, purpose,
+            payer_rail, request_key, fiat_percentage, fiat_currency,
+            requested_bitcoin_sat
+        ) VALUES (
+            '75000000-0000-4000-8000-000000000006', repeat('6', 64),
+            '75000000-0000-4000-8000-000000000001',
+            '66000000-0000-4000-8000-000000000001',
+            'invoice', 'fiat_only', 'bitcoin', repeat('6', 64),
+            100, 'CAD', 10000
+        );
+        RAISE EXCEPTION 'migration 075 accepted a fiat-fixed settlement without a quote';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
+    BEGIN
+        INSERT INTO bull_bitcoin_settlements (
+            id, owner_npub, invoice_id, invoice_quote_version_id,
+            credential_id, product, purpose, payer_rail, request_key,
+            fiat_percentage, fiat_currency, requested_bitcoin_sat
+        ) VALUES (
+            '75000000-0000-4000-8000-000000000007', repeat('6', 64),
+            '75000000-0000-4000-8000-000000000001',
+            '75000000-0000-4000-8000-000000000002',
+            '66000000-0000-4000-8000-000000000001',
+            'invoice', 'fiat_only', 'bitcoin', repeat('7', 64),
+            100, 'CAD', 10000
+        );
+        RAISE EXCEPTION 'migration 075 accepted a request key unrelated to its quote';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
 END
 $$;
 
@@ -65,7 +130,6 @@ SET LOCAL ROLE bullnym_app;
 UPDATE bull_bitcoin_settlements
    SET order_status = 'Completed', payin_status = 'Completed',
        payout_status = 'Completed', actual_received_sat = 10000,
-       quote_payment_first_observed_at = clock_timestamp(),
        credited_fiat_minor = 31406, provider_final = TRUE,
        settlement_status = 'settled', terminal_at = clock_timestamp(),
        payer_instruction = NULL, instruction_kind = NULL,
@@ -107,13 +171,31 @@ BEGIN
         RAISE EXCEPTION 'migration 075 conflated invoice face and payout currency';
     END IF;
 
+    IF NOT EXISTS (
+        SELECT 1 FROM bull_bitcoin_settlements
+         WHERE id = '75000000-0000-4000-8000-000000000003'
+           AND quote_payment_first_observed_at IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'migration 075 did not stamp first provider funds in the database';
+    END IF;
+
+    BEGIN
+        UPDATE bull_bitcoin_settlements
+           SET quote_payment_first_observed_at =
+               quote_payment_first_observed_at + INTERVAL '1 second'
+         WHERE id = '75000000-0000-4000-8000-000000000003';
+        RAISE EXCEPTION 'migration 075 allowed first-funds time mutation';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
     BEGIN
         INSERT INTO bull_bitcoin_settlements (
             id, owner_npub, invoice_id, invoice_quote_version_id,
             credential_id, product, purpose, payer_rail, request_key,
             fiat_percentage, fiat_currency, requested_bitcoin_sat
         ) VALUES (
-            '75000000-0000-4000-8000-000000000006', repeat('6', 64),
+            '75000000-0000-4000-8000-000000000008', repeat('6', 64),
             '75000000-0000-4000-8000-000000000001',
             '75000000-0000-4000-8000-000000000002',
             '66000000-0000-4000-8000-000000000001',
