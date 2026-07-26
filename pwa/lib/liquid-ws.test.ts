@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { watchLiquidAddress } from './liquid-ws'
+import { watchBitcoinAddress, watchLiquidAddress } from './liquid-ws'
 
 // Minimal WebSocket stand-in: captures sends + listeners and lets the test
 // drive open/message/close events synchronously.
@@ -85,5 +85,16 @@ describe('watchLiquidAddress', () => {
     FakeWS.instances[0]!.emit('close')
     vi.advanceTimersByTime(60_000)
     expect(FakeWS.instances.length).toBe(1)
+  })
+})
+
+describe('watchBitcoinAddress', () => {
+  it('uses the Bull Bitcoin mempool websocket and the same hint-only protocol', () => {
+    const w = watchBitcoinAddress('bc1qaddr', () => {})
+    const ws = FakeWS.instances[0]!
+    expect(ws.url).toBe('wss://mempool.bullbitcoin.com/api/v1/ws')
+    ws.emit('open')
+    expect(ws.sent).toEqual([JSON.stringify({ 'track-address': 'bc1qaddr' })])
+    w.close()
   })
 })

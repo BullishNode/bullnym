@@ -57,7 +57,7 @@
   } from '$lib/status'
   import { availableRails } from '$lib/rails'
   import { liquidUri, bitcoinPayload } from '$lib/payloads'
-  import { watchLiquidAddress } from '$lib/liquid-ws'
+  import { watchBitcoinAddress, watchLiquidAddress } from '$lib/liquid-ws'
   import {
     beginBitcoinRiskAcknowledgementScope,
     mayRequestBitcoinQuote,
@@ -941,6 +941,41 @@
   $effect(() => {
     if (!liquidWatchable || !liquidWatchAddress) return
     const watcher = watchLiquidAddress(liquidWatchAddress, () => void poll())
+    return () => watcher.close()
+  })
+
+  // Direct Bitcoin uses the same hint-only contract as Liquid. Chain-swap
+  // addresses are deliberately excluded: their provider/webhook lifecycle is
+  // authoritative, while this socket only accelerates the direct BTC watcher.
+  const fiatBitcoinAddress = $derived.by(() => {
+    const snapshot = quoteState.rails.bitcoin
+    return snapshot?.instruction.kind === 'bitcoin_direct' &&
+      quoteNowMs < snapshot.quote.expires_at_unix * 1_000
+      ? snapshot.instruction.address
+      : null
+  })
+  const satBitcoinAddress = $derived(
+    satInstructionState.rails.bitcoin?.instruction.kind === 'bitcoin_direct' &&
+      satPayerInstructionPresentation(
+        satInstructionState,
+        'bitcoin',
+        quoteNowMs,
+        config.liquid_btc_asset_id,
+      )
+      ? satInstructionState.rails.bitcoin.instruction.address
+      : null,
+  )
+  const bitcoinWatchAddress = $derived(
+    isFiatFixed ? fiatBitcoinAddress : (isSatPayerDemand ? satBitcoinAddress : currentBitcoinDirectAddress),
+  )
+  const bitcoinWatchable = $derived(
+    showsRails(view) &&
+      (latest?.quote_rail_availability?.bitcoin ?? latest?.accept_btc ?? true) &&
+      !!bitcoinWatchAddress,
+  )
+  $effect(() => {
+    if (!bitcoinWatchable || !bitcoinWatchAddress) return
+    const watcher = watchBitcoinAddress(bitcoinWatchAddress, () => void poll())
     return () => watcher.close()
   })
 

@@ -392,6 +392,9 @@ fn test_state_with_provider_limits(
         pwa_shells: Arc::new(PwaShells::load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pwa/dist"),
         )),
+        direct_watcher_wakeups: Arc::new(
+            pay_service::watcher_wakeup::DirectWatcherWakeups::default(),
+        ),
         recovery_manifest_runtime_v1: None,
         swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
     }

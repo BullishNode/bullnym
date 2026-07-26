@@ -85,6 +85,7 @@ pub mod validators;
 pub mod version;
 pub mod wallet_backup;
 pub(crate) mod watcher_schedule;
+pub mod watcher_wakeup;
 
 use std::sync::Arc;
 
@@ -111,6 +112,9 @@ pub struct AppState {
     pub fee_runtime: Arc<fee_runtime::FeeRuntime>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
+    /// Coalesced scheduling hints from active payer status reads. These do not
+    /// carry evidence; direct watchers remain the sole chain authorities.
+    pub direct_watcher_wakeups: Arc<watcher_wakeup::DirectWatcherWakeups>,
     /// Protected off-host manifest capability. Absence is fail-closed for new
     /// chain-swap creation but must not stop existing-obligation recovery.
     pub recovery_manifest_runtime_v1: Option<Arc<swap_manifest_runtime::RecoveryManifestRuntimeV1>>,
