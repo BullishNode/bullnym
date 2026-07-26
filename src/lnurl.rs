@@ -305,6 +305,7 @@ async fn fiat_only_lnurl_instruction(
     let request = FiatOnlyInstructionRequest {
         owner_npub: &user.npub,
         invoice_id: None,
+        invoice_quote_version_id: None,
         product: Product::LightningAddress,
         credential_id: setting.credential_id,
         request_key: &request_key,

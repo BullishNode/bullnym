@@ -848,6 +848,22 @@ pub async fn create_or_reuse_current_invoice_quote(
         ));
     }
 
+    let provider_payment_observed: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM bull_bitcoin_settlements \
+              WHERE invoice_id = $1 AND purpose = 'fiat_only' \
+                AND actual_received_sat IS NOT NULL \
+         )",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if provider_payment_observed {
+        return Err(sqlx::Error::Protocol(
+            "invoice has Bull Bitcoin payment evidence; payer admission is closed".into(),
+        ));
+    }
+
     if let Some(quote) = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
         "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
            FROM invoice_quote_versions \
@@ -874,7 +890,13 @@ pub async fn create_or_reuse_current_invoice_quote(
                      OR fiat_credited_minor IS NULL \
                      OR fiat_credit_policy IS NULL \
                      OR fiat_valued_at IS NULL \
-                     OR (source NOT IN ('bitcoin_direct', 'liquid_direct') \
+                     OR fiat_valuation_quote_version_id IS NULL \
+                     OR (source = 'bull_bitcoin_fiat' \
+                         AND (invoice_quote_version_id IS NULL \
+                              OR invoice_quote_offer_id IS NOT NULL)) \
+                     OR (source NOT IN ( \
+                             'bitcoin_direct', 'liquid_direct', 'bull_bitcoin_fiat' \
+                         ) \
                          AND (invoice_quote_version_id IS NULL \
                               OR invoice_quote_offer_id IS NULL))) \
          )",
@@ -1410,6 +1432,34 @@ pub async fn current_invoice_quote<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Immutable invoice-creation reference rate (R1). Only fiat-priced invoices
+/// have this accounting estimate; sat-priced invoices deliberately return
+/// `None`. Version 1 is append-only and must never be replaced by a later
+/// payer-instruction or late-observation quote.
+pub async fn invoice_creation_rate_minor_per_btc<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<Option<i64>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND quote.rate_minor_per_btc > 0 \
+                      AND quote.fiat_currency = invoice.fiat_currency \
+                     THEN quote.rate_minor_per_btc END \
+           FROM invoices invoice \
+      LEFT JOIN invoice_quote_versions quote \
+             ON quote.invoice_id = invoice.id \
+            AND quote.version_number = 1 \
+          WHERE invoice.id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(executor)
+    .await
+    .map(Option::flatten)
+}
+
 /// Recomputed fiat projection used by every payment reducer. Immutable event
 /// deltas remain audit evidence; current accounting and presentation are
 /// derived cumulatively per quote so split payments and reorgs are order-safe.
@@ -1467,41 +1517,31 @@ where
                         presentation_eligible_sat > merchant_amount_sat \
                     ), FALSE) AS presentation_overpaid \
                FROM per_quote \
-         ), bull_bitcoin AS ( \
-             SELECT COALESCE(SUM(e.fiat_credited_minor) FILTER (WHERE \
-                        e.accounting_state IN ('active', 'legacy_unverified') \
-                    ), 0)::BIGINT AS active_credit_minor, \
-                    COALESCE(SUM(e.fiat_credited_minor) FILTER (WHERE \
-                        e.accounting_state <> 'superseded' \
-                    ), 0)::BIGINT AS presentation_credit_minor \
-               FROM invoice_payment_events e \
-              WHERE e.invoice_id = $1 AND e.source = 'bull_bitcoin_fiat' \
          ) \
          SELECT i.fiat_amount_minor::BIGINT AS face_minor, \
-                projected.active_credit_minor + bull_bitcoin.active_credit_minor \
-                    AS active_credit_minor, \
-                projected.presentation_credit_minor + bull_bitcoin.presentation_credit_minor \
-                    AS presentation_credit_minor, \
-                (projected.active_overpaid \
-                 OR projected.active_credit_minor + bull_bitcoin.active_credit_minor \
-                    > i.fiat_amount_minor) AS active_overpaid, \
-                (projected.presentation_overpaid \
-                 OR projected.presentation_credit_minor + bull_bitcoin.presentation_credit_minor \
-                    > i.fiat_amount_minor) \
-                    AS presentation_overpaid, \
+                projected.active_credit_minor, \
+                projected.presentation_credit_minor, \
+                projected.active_overpaid, \
+                projected.presentation_overpaid, \
                 EXISTS ( \
                     SELECT 1 FROM invoice_payment_events e \
                      WHERE e.invoice_id = i.id \
-                       AND e.source <> 'bull_bitcoin_fiat' \
                        AND (e.quote_first_observed_at IS NULL \
                             OR e.fiat_credited_minor IS NULL \
                             OR e.fiat_credit_policy IS NULL \
                             OR e.fiat_valued_at IS NULL \
-                            OR (e.source NOT IN ('bitcoin_direct', 'liquid_direct') \
+                            OR e.fiat_valuation_quote_version_id IS NULL \
+                            OR (e.source = 'bull_bitcoin_fiat' \
+                                AND (e.invoice_quote_version_id IS NULL \
+                                     OR e.invoice_quote_offer_id IS NOT NULL)) \
+                            OR (e.source NOT IN ( \
+                                    'bitcoin_direct', 'liquid_direct', \
+                                    'bull_bitcoin_fiat' \
+                                ) \
                                 AND (e.invoice_quote_version_id IS NULL \
                                      OR e.invoice_quote_offer_id IS NULL))) \
                 ) AS unresolved_evidence \
-           FROM invoices i CROSS JOIN projected CROSS JOIN bull_bitcoin \
+           FROM invoices i CROSS JOIN projected \
           WHERE i.id = $1 AND i.pricing_mode = 'fiat_fixed' \
             AND i.fiat_amount_minor IS NOT NULL",
     )
@@ -2224,9 +2264,6 @@ pub struct InvoicePaymentEvidence<'a> {
     /// The referenced local row, rather than a generic order response, is the
     /// durable authority for this event.
     pub bull_bitcoin_settlement_id: Option<Uuid>,
-    /// Exact balance credit reported by Bull Bitcoin, in the selected
-    /// currency's minor units. Never derived from Bullnym's quote rate.
-    pub bull_bitcoin_credited_fiat_minor: Option<i64>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2435,7 +2472,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.address.is_none()
                     || self.boltz_swap_id.is_some()
                     || self.bull_bitcoin_settlement_id.is_some()
-                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "bitcoin_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
@@ -2449,7 +2485,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.address.is_none()
                     || self.boltz_swap_id.is_some()
                     || self.bull_bitcoin_settlement_id.is_some()
-                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "liquid_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
@@ -2461,7 +2496,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.boltz_swap_id.is_none()
                     || self.vout.is_some()
                     || self.bull_bitcoin_settlement_id.is_some()
-                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "lightning_boltz_reverse evidence requires txid, boltz_swap_id, and no vout".into(),
@@ -2473,7 +2507,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.boltz_swap_id.is_none()
                     || self.vout.is_some()
                     || self.bull_bitcoin_settlement_id.is_some()
-                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                 {
                     return Err(sqlx::Error::Protocol(
                         "bitcoin_boltz_chain evidence requires txid, boltz_swap_id, and no vout"
@@ -2491,9 +2524,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.vout.is_some()
                     || self.boltz_swap_id.is_some()
                     || self.address.is_some()
-                    || self
-                        .bull_bitcoin_credited_fiat_minor
-                        .is_none_or(|amount| amount <= 0)
                     || self.event_key != format!("bull_bitcoin_fiat:{settlement_id}")
                 {
                     return Err(sqlx::Error::Protocol(
@@ -2512,7 +2542,6 @@ impl InvoicePaymentEvidence<'_> {
                     || self.vout != Some(1)
                     || self.boltz_swap_id.is_some()
                     || self.address.is_some()
-                    || self.bull_bitcoin_credited_fiat_minor.is_some()
                     || self.event_key != format!("bull_bitcoin_mixed_output:{settlement_id}")
                 {
                     return Err(sqlx::Error::Protocol(
@@ -3025,7 +3054,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
     .bind(attribution.map(|(_, first_observed_at_unix_micros)| first_observed_at_unix_micros))
     .bind(evidence.bull_bitcoin_settlement_id)
-    .bind(evidence.bull_bitcoin_credited_fiat_minor)
+    // Fiat credit is assigned by the database from immutable quote authority.
+    // Provider payout currency never enters the invoice-face reducer.
+    .bind(Option::<i64>::None)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -3041,10 +3072,13 @@ async fn record_invoice_payment_with_optional_quote_attribution(
                AND vout IS NOT DISTINCT FROM $7::INTEGER \
                AND boltz_swap_id IS NOT DISTINCT FROM $8::TEXT \
                AND address IS NOT DISTINCT FROM $9::TEXT \
-               AND invoice_quote_version_id IS NOT DISTINCT FROM $10::UUID \
-               AND invoice_quote_offer_id IS NOT DISTINCT FROM $11::UUID \
+               AND ($4 = 'bull_bitcoin_fiat' OR ( \
+                    invoice_quote_version_id IS NOT DISTINCT FROM $10::UUID \
+                    AND invoice_quote_offer_id IS NOT DISTINCT FROM $11::UUID \
+               )) \
                AND bull_bitcoin_settlement_id IS NOT DISTINCT FROM $12::UUID \
-               AND fiat_credited_minor IS NOT DISTINCT FROM $13::BIGINT",
+               AND ($4 = 'bull_bitcoin_fiat' \
+                    OR fiat_credited_minor IS NOT DISTINCT FROM $13::BIGINT)",
         )
         .bind(id)
         .bind(evidence.event_key)
@@ -3058,7 +3092,7 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         .bind(attribution.map(|(attribution, _)| attribution.quote_version_id))
         .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
         .bind(evidence.bull_bitcoin_settlement_id)
-        .bind(evidence.bull_bitcoin_credited_fiat_minor)
+        .bind(Option::<i64>::None)
         .fetch_optional(&mut *tx)
         .await?;
         existing.ok_or_else(|| {

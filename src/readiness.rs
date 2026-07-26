@@ -1407,6 +1407,30 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'execution_rate_minor_per_btc' \
+                   AND data_type = 'bigint' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'invoice_quote_version_id' \
+                   AND data_type = 'uuid' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'quote_payment_first_observed_at' \
+                   AND data_type = 'timestamp with time zone' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
                    AND table_name = 'invoice_payment_events' \
                    AND column_name = 'bull_bitcoin_settlement_id' \
                    AND data_type = 'uuid' \
@@ -1422,6 +1446,11 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_fkey'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_shape_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_first_observation_shape_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funded_instruction_closed_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_status_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_swap_binding_chk'), \
@@ -1466,6 +1495,8 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                      'bull_bitcoin_settlements_sync_invoice_status'), \
                     ('bull_bitcoin_settlements', \
                      'bull_bitcoin_settlements_guard_swap_binding'), \
+                    ('bull_bitcoin_settlements', \
+                     'bull_bitcoin_settlements_guard_fiat_only_quote'), \
                     ('swap_fiat_settlement_policies', \
                      'swap_fiat_settlement_policies_guard_insert'), \
                     ('swap_fiat_settlement_policies', \
@@ -1476,6 +1507,10 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                      'bull_bitcoin_claim_outputs_reject_mutation'), \
                     ('invoice_payment_events', \
                      'invoice_payment_events_guard_bull_bitcoin'), \
+                    ('invoice_payment_events', \
+                     'invoice_payment_events_guard_bull_bitcoin_fiat'), \
+                    ('invoice_quote_versions', \
+                     'invoice_quote_versions_reject_funded_bull_bitcoin'), \
                     ('invoice_payment_events', \
                      'invoice_payment_events_guard_mixed_reverse'), \
                     ('invoice_fiat_settlement_policies', \
@@ -1490,6 +1525,49 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                        AND NOT trigger_info.tgisinternal \
                        AND trigger_info.tgenabled = 'O' \
                  ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
+                           'enforce_invoice_quote_version_insert' \
+                   AND pg_get_functiondef(function_info.oid) LIKE \
+                           '%bull_bitcoin_settlements provider_observation%' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
+                           'guard_fiat_only_quote_authority' \
+                   AND function_info.prosecdef \
+                   AND array_to_string(function_info.proconfig, ',') LIKE \
+                           '%search_path=pg_catalog, public%' \
+                   AND POSITION( \
+                       'new.quote_payment_first_observed_at := clock_timestamp()' \
+                       IN LOWER(pg_get_functiondef(function_info.oid)) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'bull_bitcoin_settlements_first_observation_immutable' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'bull_bitcoin_settlements_funded_insert_forbidden' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'bullnym-invoice-quote-offer-v1' \
+                       IN pg_get_functiondef(function_info.oid) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'fiat-fixed bull bitcoin settlement requires a payer quote' \
+                       IN LOWER(pg_get_functiondef(function_info.oid)) \
+                   ) > 0 \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
+                           'sync_invoice_bull_bitcoin_settlement_status' \
+                   AND function_info.prosecdef \
+                   AND array_to_string(function_info.proconfig, ',') LIKE \
+                           '%search_path=pg_catalog, public%' \
             ) \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \

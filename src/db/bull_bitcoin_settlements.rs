@@ -24,6 +24,7 @@ impl From<sqlx::Error> for BullBitcoinSettlementStoreError {
 pub struct NewBullBitcoinSettlement<'a> {
     pub owner_npub: &'a str,
     pub invoice_id: Option<Uuid>,
+    pub invoice_quote_version_id: Option<Uuid>,
     pub reverse_swap_id: Option<Uuid>,
     pub chain_swap_id: Option<Uuid>,
     pub credential_id: Uuid,
@@ -41,6 +42,7 @@ pub struct StoredBullBitcoinSettlement {
     pub id: Uuid,
     pub owner_npub: String,
     pub invoice_id: Option<Uuid>,
+    pub invoice_quote_version_id: Option<Uuid>,
     pub reverse_swap_id: Option<Uuid>,
     pub chain_swap_id: Option<Uuid>,
     pub credential_id: Uuid,
@@ -63,8 +65,10 @@ pub struct StoredBullBitcoinSettlement {
     pub retention_until_unix: Option<i64>,
     pub reconcile_attempts: i32,
     pub actual_received_sat: Option<i64>,
+    pub quote_payment_first_observed_at_unix_micros: Option<i64>,
     pub credited_fiat_minor: Option<i64>,
     pub quoted_fiat_minor: Option<i64>,
+    pub execution_rate_minor_per_btc: Option<i64>,
     pub provider_final: bool,
 }
 
@@ -148,8 +152,9 @@ struct ReverseMixedSettlementAccountingRow {
 
 /// Privacy-minimal, local-only projection for the signed merchant invoice
 /// list. It deliberately excludes payer instructions, transaction identifiers,
-/// account identity, rates, and raw provider state. The one Bitcoin amount is
-/// the exact merchant output needed to explain a mixed settlement.
+/// account identity, and raw provider state. It includes only the immutable
+/// invoice reference rate and provider-final execution rate needed for the
+/// merchant accounting contract.
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
 pub struct InvoiceBullBitcoinSettlementProjection {
     pub invoice_id: Uuid,
@@ -157,8 +162,11 @@ pub struct InvoiceBullBitcoinSettlementProjection {
     pub bull_bitcoin_order_id: Option<Uuid>,
     pub fiat_currency: String,
     pub settlement_status: String,
+    pub creation_rate_minor_per_btc: Option<i64>,
+    pub creation_rate_currency: Option<String>,
     pub credited_fiat_minor: Option<i64>,
     pub quoted_fiat_minor: Option<i64>,
+    pub execution_rate_minor_per_btc: Option<i64>,
     pub fiat_percentage: Option<i16>,
     pub funding_route: Option<String>,
     pub fallback_category: Option<String>,
@@ -183,7 +191,8 @@ pub struct LightningAddressBullBitcoinSettlementProjection {
     pub merchant_bitcoin_settled: bool,
 }
 
-const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
+const SETTLEMENT_PROJECTION: &str =
+    "id, owner_npub, invoice_id, invoice_quote_version_id, reverse_swap_id, chain_swap_id, \
      credential_id, product, purpose, payer_rail, \
      request_key, fiat_percentage, fiat_currency, provider_state, \
      funding_route, fallback_category, settlement_status, requested_bitcoin_sat, \
@@ -191,7 +200,11 @@ const SETTLEMENT_PROJECTION: &str = "id, owner_npub, invoice_id, reverse_swap_id
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
      extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
-     actual_received_sat, credited_fiat_minor, quoted_fiat_minor, provider_final";
+     actual_received_sat, \
+     (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+         AS quote_payment_first_observed_at_unix_micros, \
+     credited_fiat_minor, quoted_fiat_minor, \
+     execution_rate_minor_per_btc, provider_final";
 
 /// Copy an invoice's immutable mixed policy onto the reverse swap in the same
 /// transaction that makes the Boltz obligation durable. A 0%/100% policy does
@@ -433,8 +446,23 @@ where
     sqlx::query_as(
         "SELECT settlement.invoice_id, settlement.purpose, \
                 settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
-                settlement.settlement_status, settlement.credited_fiat_minor, \
-                settlement.quoted_fiat_minor, settlement.fiat_percentage, \
+                settlement.settlement_status, \
+                CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND creation_quote.rate_minor_per_btc > 0 \
+                      AND creation_quote.fiat_currency = invoice.fiat_currency \
+                     THEN creation_quote.rate_minor_per_btc END \
+                    AS creation_rate_minor_per_btc, \
+                CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                      AND creation_quote.rate_minor_per_btc > 0 \
+                      AND creation_quote.fiat_currency = invoice.fiat_currency \
+                     THEN creation_quote.fiat_currency END \
+                    AS creation_rate_currency, \
+                settlement.credited_fiat_minor, \
+                settlement.quoted_fiat_minor, \
+                CASE WHEN settlement.provider_final \
+                     THEN settlement.execution_rate_minor_per_btc END \
+                    AS execution_rate_minor_per_btc, \
+                settlement.fiat_percentage, \
                 settlement.funding_route, settlement.fallback_category, \
                 merchant.authorized_amount_sat AS merchant_bitcoin_sat, \
                 EXISTS ( \
@@ -450,6 +478,9 @@ where
            FROM bull_bitcoin_settlements settlement \
            JOIN invoices invoice ON invoice.id = settlement.invoice_id \
             AND invoice.npub_owner = settlement.owner_npub \
+           LEFT JOIN invoice_quote_versions creation_quote \
+             ON creation_quote.invoice_id = invoice.id \
+            AND creation_quote.version_number = 1 \
            LEFT JOIN bull_bitcoin_claim_outputs merchant \
              ON merchant.settlement_id = settlement.id \
             AND merchant.role = 'merchant' \
@@ -543,6 +574,28 @@ pub async fn reserve_bull_bitcoin_settlement(
             _ => BullBitcoinSettlementStoreError::CredentialUnavailable,
         })?;
 
+    if let Some(invoice_id) = settlement.invoice_id {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(super::invoice_lightning_lock_key(invoice_id))
+            .execute(&mut *transaction)
+            .await?;
+        if settlement.purpose == "fiat_only" {
+            let payment_already_observed: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM bull_bitcoin_settlements \
+                      WHERE invoice_id = $1 AND purpose = 'fiat_only' \
+                        AND actual_received_sat IS NOT NULL \
+                 )",
+            )
+            .bind(invoice_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if payment_already_observed {
+                return Err(BullBitcoinSettlementStoreError::IllegalState);
+            }
+        }
+    }
+
     let select_sql = format!(
         "SELECT {SETTLEMENT_PROJECTION} FROM bull_bitcoin_settlements \
           WHERE owner_npub = $1 AND request_key = $2"
@@ -600,15 +653,16 @@ pub async fn reserve_bull_bitcoin_settlement(
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO bull_bitcoin_settlements ( \
-             id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id, \
+             id, owner_npub, invoice_id, invoice_quote_version_id, reverse_swap_id, chain_swap_id, \
              credential_id, product, purpose, \
              payer_rail, request_key, fiat_percentage, fiat_currency, \
              requested_bitcoin_sat \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(settlement.owner_npub)
     .bind(settlement.invoice_id)
+    .bind(settlement.invoice_quote_version_id)
     .bind(settlement.reverse_swap_id)
     .bind(settlement.chain_swap_id)
     .bind(settlement.credential_id)
@@ -1014,13 +1068,28 @@ pub async fn record_bull_bitcoin_observation(
     observation: &OrderObservation,
     next_poll_secs: i64,
     late_watch_poll_secs: i64,
+    valuation_candidate: Option<&super::NewInvoiceQuoteVersion<'_>>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let mut transaction = pool.begin().await?;
+    let invoice_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT invoice_id FROM bull_bitcoin_settlements WHERE id = $1")
+            .bind(settlement_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if let Some(invoice_id) = invoice_id {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(super::invoice_lightning_lock_key(invoice_id))
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let persisted_observation: Option<(Option<Uuid>, Option<Uuid>, Option<i64>)> = sqlx::query_as(
         "UPDATE bull_bitcoin_settlements \
             SET order_status = $2, payin_status = $3, payout_status = $4, \
                 actual_received_sat = COALESCE($5, actual_received_sat), \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
+                execution_rate_minor_per_btc = COALESCE( \
+                    $11, execution_rate_minor_per_btc), \
                 provider_final = $7, \
                 settlement_status = CASE \
                     WHEN $7 THEN 'settled' \
@@ -1028,9 +1097,11 @@ pub async fn record_bull_bitcoin_observation(
                     ELSE 'pending' END, \
                 terminal_at = CASE WHEN $7 THEN now() ELSE NULL END, \
                 payer_instruction = CASE \
-                    WHEN $7 OR $8 THEN NULL ELSE payer_instruction END, \
+                    WHEN $7 OR $8 OR COALESCE($5, actual_received_sat) IS NOT NULL \
+                    THEN NULL ELSE payer_instruction END, \
                 instruction_kind = CASE \
-                    WHEN $7 OR $8 THEN NULL ELSE instruction_kind END, \
+                    WHEN $7 OR $8 OR COALESCE($5, actual_received_sat) IS NOT NULL \
+                    THEN NULL ELSE instruction_kind END, \
                 last_checked_at = now(), reconcile_attempts = 0, \
                 next_attempt_at = CASE WHEN $7 OR $8 THEN NULL \
                     ELSE now() + make_interval(secs => (CASE \
@@ -1046,12 +1117,16 @@ pub async fn record_bull_bitcoin_observation(
                                     SELECT 1 FROM invoice_payment_events event \
                                      WHERE event.invoice_id = invoice.id \
                                 ) \
-                         ) THEN GREATEST($9, $11) \
+                         ) THEN GREATEST($9, $12) \
                         ELSE $9 END)::DOUBLE PRECISION) END, \
                 updated_at = now() \
           WHERE id = $1 AND provider_state = 'bound' \
             AND funding_route = 'bull_bitcoin' \
-            AND settlement_status = 'pending'",
+            AND settlement_status = 'pending' \
+         RETURNING invoice_id, \
+                   invoice_quote_version_id AS instruction_quote_version_id, \
+                   (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+                       AS first_observed_at_unix_micros",
     )
     .bind(settlement_id)
     .bind(&observation.order_status)
@@ -1071,9 +1146,38 @@ pub async fn record_bull_bitcoin_observation(
             .quoted_fiat_minor
             .map(|amount| amount.as_minor()),
     )
+    .bind(
+        observation
+            .execution_rate_minor_per_btc
+            .map(|amount| amount.as_minor()),
+    )
     .bind(late_watch_poll_secs)
-    .execute(pool)
+    .fetch_optional(&mut *transaction)
     .await?;
+    if let (
+        Some(candidate),
+        Some((Some(invoice_id), Some(instruction_quote_version_id), Some(first_observed_at))),
+    ) = (valuation_candidate, persisted_observation)
+    {
+        let captured = super::capture_late_observation_candidate_locked(
+            &mut transaction,
+            super::PersistedInvoiceQuoteObservation {
+                invoice_id,
+                instruction_quote_version_id,
+                first_observed_at_unix_micros: first_observed_at,
+            },
+            candidate,
+        )
+        .await?;
+        if !captured {
+            tracing::warn!(
+                event = "invoice_bull_bitcoin_observation_rate_not_covering",
+                %settlement_id,
+                "Bull Bitcoin funds were recorded without fiat valuation because the pre-fetched rate did not cover the exact first observation"
+            );
+        }
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1240,6 +1344,7 @@ fn validate_reservation_identity(
 ) -> Result<(), BullBitcoinSettlementStoreError> {
     if stored.owner_npub != requested.owner_npub
         || stored.invoice_id != requested.invoice_id
+        || stored.invoice_quote_version_id != requested.invoice_quote_version_id
         || stored.reverse_swap_id != requested.reverse_swap_id
         || stored.chain_swap_id != requested.chain_swap_id
         || stored.credential_id != requested.credential_id

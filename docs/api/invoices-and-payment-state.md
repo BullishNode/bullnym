@@ -217,6 +217,7 @@ are. Treat invoice URLs as shareable secrets.
   "fiat_currency": null,
   "remaining_amount_sat": 10000,
   "payment_tolerance_sat": 1,
+  "creation_rate_minor_per_btc": null,
   "rate_minor_per_btc": null,
   "rate_locks_until_unix": 1760003600,
   "expires_at_unix": 1760003600,
@@ -246,6 +247,14 @@ rate and its five-minute expiry. A sat-fixed invoice also has a null rate, but
 retains `rate_locks_until_unix == expires_at_unix` as its never-refresh
 sentinel. Clients must distinguish these cases by `pricing_mode`, not by the
 nullable rate alone.
+
+`creation_rate_minor_per_btc` is the immutable invoice-creation reference rate
+(R1) from quote version 1. It is a strictly positive integer only for a
+`fiat_fixed` invoice after that first quote exists, and otherwise JSON `null`.
+It never changes when a later payer instruction is refreshed. Its denomination
+is the response's existing `fiat_currency`; it is an estimate for merchant
+accounting, not Bull Bitcoin's execution rate. `rate_minor_per_btc` retains its
+existing meaning as the current invoice quote and is not reinterpreted.
 
 `lightning_pr`/`lightning_amount_sat`,
 `liquid_address`/`liquid_amount_sat`, `bitcoin_address`, and the
@@ -336,6 +345,8 @@ documented in [`get-paid-transaction-history.md`](get-paid-transaction-history.m
 {
   "kind": "fiat",
   "fiat_percentage": 100,
+  "creation_rate_minor_per_btc": 6416000,
+  "creation_rate_currency": "USD",
   "fiat": [
     {
       "amount_minor": null,
@@ -353,10 +364,17 @@ documented in [`get-paid-transaction-history.md`](get-paid-transaction-history.m
   the settlement and reused — never re-read from the merchant's current product
   config. It is an integer `1..=100` (`100` for `fiat`, `1..=99` for `mixed`),
   or `null` for a settlement predating the captured column.
+- `creation_rate_minor_per_btc` and `creation_rate_currency` are paired R1
+  fields from immutable quote version 1. They are present only for fiat-priced
+  invoices; both are absent for sat-priced and legacy rows. The currency is the
+  invoice face currency and may differ from a fiat leg's currency.
 - Each fiat leg's `amount_minor` is the credited amount (present only once
   `settled`); `quoted_amount_minor` is the fiat amount locked at order creation
   and is present while `pending` as well as `settled`. Both are `null` rather
   than fabricated when unknown.
+- A settled fiat leg may additionally carry `execution_rate_minor_per_btc`
+  (R2), Bull Bitcoin's explicit execution rate denominated in that leg's
+  `currency`. It is absent while pending and for legacy rows.
 
 ## `POST /api/v1/invoices/:id/lightning`
 

@@ -19,12 +19,15 @@ pub struct GetPaidTransaction {
     pub comment: Option<String>,
     pub settlement_present: bool,
     pub fiat_policy_present: bool,
+    pub creation_rate_minor_per_btc: Option<i64>,
+    pub creation_rate_currency: Option<String>,
     pub settlement_purpose: Option<String>,
     pub settlement_order_id: Option<Uuid>,
     pub settlement_currency: Option<String>,
     pub settlement_status_detail: Option<String>,
     pub settlement_credited_fiat_minor: Option<i64>,
     pub settlement_quoted_fiat_minor: Option<i64>,
+    pub settlement_execution_rate_minor_per_btc: Option<i64>,
     pub settlement_fiat_percentage: Option<i16>,
     pub settlement_funding_route: Option<String>,
     pub settlement_fallback_category: Option<String>,
@@ -130,11 +133,24 @@ pub async fn list_get_paid_transactions(
                         SELECT 1 FROM invoice_fiat_settlement_policies policy \
                          WHERE policy.invoice_id = event.invoice_id \
                            AND policy.owner_npub = invoice.npub_owner \
-                    ) AS fiat_policy_present \
+                    ) AS fiat_policy_present, \
+                    CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                          AND creation_quote.rate_minor_per_btc > 0 \
+                          AND creation_quote.fiat_currency = invoice.fiat_currency \
+                         THEN creation_quote.rate_minor_per_btc END \
+                        AS creation_rate_minor_per_btc, \
+                    CASE WHEN invoice.pricing_mode = 'fiat_fixed' \
+                          AND creation_quote.rate_minor_per_btc > 0 \
+                          AND creation_quote.fiat_currency = invoice.fiat_currency \
+                         THEN creation_quote.fiat_currency END \
+                        AS creation_rate_currency \
                FROM invoice_payment_events event \
                JOIN invoices invoice ON invoice.id = event.invoice_id \
           LEFT JOIN invoice_payment_observations observation \
                  ON observation.id = event.observation_id \
+          LEFT JOIN invoice_quote_versions creation_quote \
+                 ON creation_quote.invoice_id = invoice.id \
+                AND creation_quote.version_number = 1 \
               WHERE invoice.npub_owner = $1 \
                 AND event.amount_sat > 0 \
                 AND event.source IS NOT NULL \
@@ -171,12 +187,17 @@ pub async fn list_get_paid_transactions(
                     FALSE AS late, comment.comment, \
                     settlement.id IS NOT NULL AS settlement_present, \
                     swap_policy.id IS NOT NULL AS fiat_policy_present, \
+                    NULL::BIGINT AS creation_rate_minor_per_btc, \
+                    NULL::TEXT AS creation_rate_currency, \
                     settlement.purpose AS settlement_purpose, \
                     settlement.bull_bitcoin_order_id AS settlement_order_id, \
                     settlement.fiat_currency AS settlement_currency, \
                     settlement.settlement_status AS settlement_status_detail, \
                     settlement.credited_fiat_minor AS settlement_credited_fiat_minor, \
                     settlement.quoted_fiat_minor AS settlement_quoted_fiat_minor, \
+                    CASE WHEN settlement.provider_final \
+                         THEN settlement.execution_rate_minor_per_btc END \
+                        AS settlement_execution_rate_minor_per_btc, \
                     settlement.fiat_percentage AS settlement_fiat_percentage, \
                     settlement.funding_route AS settlement_funding_route, \
                     settlement.fallback_category AS settlement_fallback_category, \
@@ -213,9 +234,11 @@ pub async fn list_get_paid_transactions(
                     NULL::UUID, settlement.actual_received_sat, \
                     (EXTRACT(EPOCH FROM settlement.terminal_at) * 1000000)::BIGINT, \
                     settlement.payer_rail, 'settled'::TEXT, FALSE, NULL::TEXT, \
-                    TRUE, TRUE, settlement.purpose, settlement.bull_bitcoin_order_id, \
+                    TRUE, TRUE, NULL::BIGINT, NULL::TEXT, settlement.purpose, \
+                    settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
                     settlement.credited_fiat_minor, settlement.quoted_fiat_minor, \
+                    settlement.execution_rate_minor_per_btc, \
                     settlement.fiat_percentage, settlement.funding_route, \
                     settlement.fallback_category, NULL::BIGINT, NULL::TEXT \
                FROM bull_bitcoin_settlements settlement \
@@ -230,9 +253,11 @@ pub async fn list_get_paid_transactions(
              SELECT event.transaction_id, event.source, event.source_rank, \
                     event.invoice_id, event.amount_sat, event.received_at_unix_micros, \
                     event.rail, event.settlement_state, event.late, event.comment, \
-                    FALSE, event.fiat_policy_present, NULL::TEXT, NULL::UUID, \
+                    FALSE, event.fiat_policy_present, \
+                    event.creation_rate_minor_per_btc, event.creation_rate_currency, \
+                    NULL::TEXT, NULL::UUID, \
                     NULL::TEXT, NULL::TEXT, \
-                    NULL::BIGINT, NULL::BIGINT, NULL::SMALLINT, NULL::TEXT, \
+                    NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::SMALLINT, NULL::TEXT, \
                     NULL::TEXT, NULL::BIGINT, NULL::TEXT \
                FROM invoice_events event \
               WHERE event.bull_bitcoin_settlement_id IS NULL \
@@ -257,9 +282,12 @@ pub async fn list_get_paid_transactions(
              SELECT settlement.id, event.source, event.source_rank, event.invoice_id, \
                     event.amount_sat, event.received_at_unix_micros, event.rail, \
                     event.settlement_state, event.late, event.comment, TRUE, TRUE, \
+                    event.creation_rate_minor_per_btc, event.creation_rate_currency, \
                     settlement.purpose, settlement.bull_bitcoin_order_id, \
                     settlement.fiat_currency, settlement.settlement_status, \
                     settlement.credited_fiat_minor, settlement.quoted_fiat_minor, \
+                    CASE WHEN settlement.provider_final \
+                         THEN settlement.execution_rate_minor_per_btc END, \
                     settlement.fiat_percentage, settlement.funding_route, \
                     settlement.fallback_category, NULL::BIGINT, NULL::TEXT \
                FROM bull_bitcoin_settlements settlement \
@@ -283,10 +311,15 @@ pub async fn list_get_paid_transactions(
                               OR settlement.settlement_status <> 'settled') THEN 'pending' \
                         ELSE event.settlement_state \
                     END::TEXT, \
-                    event.late, event.comment, TRUE, TRUE, settlement.purpose, \
+                    event.late, event.comment, TRUE, TRUE, \
+                    event.creation_rate_minor_per_btc, event.creation_rate_currency, \
+                    settlement.purpose, \
                     settlement.bull_bitcoin_order_id, settlement.fiat_currency, \
                     settlement.settlement_status, settlement.credited_fiat_minor, \
-                    settlement.quoted_fiat_minor, settlement.fiat_percentage, \
+                    settlement.quoted_fiat_minor, \
+                    CASE WHEN settlement.provider_final \
+                         THEN settlement.execution_rate_minor_per_btc END, \
+                    settlement.fiat_percentage, \
                     settlement.funding_route, settlement.fallback_category, \
                     outputs.merchant_amount_sat, event.settlement_state \
                FROM bull_bitcoin_settlements settlement \
@@ -308,9 +341,11 @@ pub async fn list_get_paid_transactions(
          SELECT transaction_id, source, source_rank, invoice_id, amount_sat, \
                 received_at_unix_micros, rail, settlement_state, late, comment, \
                 settlement_present, fiat_policy_present, settlement_purpose, \
+                creation_rate_minor_per_btc, creation_rate_currency, \
                 settlement_order_id, \
                 settlement_currency, settlement_status_detail, \
                 settlement_credited_fiat_minor, settlement_quoted_fiat_minor, \
+                settlement_execution_rate_minor_per_btc, \
                 settlement_fiat_percentage, settlement_funding_route, \
                 settlement_fallback_category, settlement_bitcoin_amount_sat, \
                 settlement_bitcoin_status \

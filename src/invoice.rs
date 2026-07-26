@@ -357,7 +357,6 @@ pub async fn flip_invoice_on_lightning_settlement(
             boltz_swap_id: Some(boltz_swap_id),
             address: None,
             bull_bitcoin_settlement_id: None,
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -423,7 +422,6 @@ pub async fn record_mixed_bull_bitcoin_output(
             boltz_swap_id: None,
             address: None,
             bull_bitcoin_settlement_id: Some(settlement_id),
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -541,7 +539,6 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
             boltz_swap_id: Some(boltz_swap_id),
             address: None,
             bull_bitcoin_settlement_id: None,
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -1607,6 +1604,9 @@ pub struct InvoiceStatusResponse {
     pub fiat_currency: Option<String>,
     pub remaining_amount_sat: i64,
     pub payment_tolerance_sat: i64,
+    /// Immutable invoice-creation reference rate (R1), available only for
+    /// fiat-priced invoices. This is distinct from the current payer quote.
+    pub creation_rate_minor_per_btc: Option<i64>,
     pub rate_minor_per_btc: Option<i64>,
     pub rate_locks_until_unix: i64,
     pub expires_at_unix: i64,
@@ -1720,6 +1720,8 @@ pub async fn status(
             .ok_or_else(|| AppError::InvoiceNotFound(id.to_string()))?;
     }
     let fiat_settlement_policy = db::invoice_fiat_settlement_policy(&mut *snapshot, inv.id).await?;
+    let creation_rate_minor_per_btc =
+        db::invoice_creation_rate_minor_per_btc(&mut *snapshot, inv.id).await?;
     pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::StatusAfterInvoiceRead)
         .await;
 
@@ -1793,6 +1795,7 @@ pub async fn status(
         fiat_currency: inv.fiat_currency,
         remaining_amount_sat: remaining_sat,
         payment_tolerance_sat: tolerance_sat,
+        creation_rate_minor_per_btc,
         rate_minor_per_btc: inv.rate_minor_per_btc,
         rate_locks_until_unix: inv.rate_locks_until_unix,
         expires_at_unix: inv.expires_at_unix,
@@ -2020,6 +2023,7 @@ pub async fn payer_demand_quote(
             &state,
             &invoice,
             policy,
+            None,
             request.rail,
             amount_sat,
             &request_key,
@@ -2496,6 +2500,7 @@ async fn versioned_instruction_for_rail(
             state,
             invoice,
             policy,
+            Some(quote.id),
             rail,
             quote.merchant_amount_sat,
             &request_key,
@@ -2605,6 +2610,7 @@ async fn fiat_only_instruction(
     state: &AppState,
     invoice: &db::Invoice,
     policy: &db::InvoiceFiatSettlementPolicy,
+    invoice_quote_version_id: Option<Uuid>,
     rail: PayerQuoteRail,
     amount_sat: i64,
     request_key: &str,
@@ -2631,6 +2637,7 @@ async fn fiat_only_instruction(
     let request = FiatOnlyInstructionRequest {
         owner_npub: &policy.owner_npub,
         invoice_id: Some(invoice.id),
+        invoice_quote_version_id,
         product,
         credential_id: policy.credential_id,
         request_key,
@@ -5028,6 +5035,8 @@ pub struct InvoiceListItem {
 pub struct MerchantFiatSettlementEntry {
     pub amount_minor: Option<i64>,
     pub quoted_amount_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_rate_minor_per_btc: Option<i64>,
     pub currency: String,
     pub order_id: Uuid,
     pub status: String,
@@ -5045,10 +5054,18 @@ pub struct MerchantBitcoinSettlementEntry {
 pub enum MerchantSettlementDetails {
     Fiat {
         fiat_percentage: Option<i16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creation_rate_minor_per_btc: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creation_rate_currency: Option<String>,
         fiat: Vec<MerchantFiatSettlementEntry>,
     },
     Mixed {
         fiat_percentage: Option<i16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creation_rate_minor_per_btc: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creation_rate_currency: Option<String>,
         bitcoin: Vec<MerchantBitcoinSettlementEntry>,
         fiat: Vec<MerchantFiatSettlementEntry>,
     },
@@ -5068,6 +5085,11 @@ struct MerchantInvoiceSettlementProjection {
     /// The split captured on the settlement row at payment time. Reused, never
     /// re-read from current product config; null for rows predating the column.
     fiat_percentage: Option<i16>,
+    /// Immutable version-1 quote rate for fiat-priced invoices. Null for
+    /// sat-priced and legacy invoices.
+    creation_rate_minor_per_btc: Option<i64>,
+    creation_rate_currency: Option<String>,
+    accounting_integrity_error: bool,
     fallback_reasons: Vec<String>,
 }
 
@@ -5109,11 +5131,43 @@ fn merchant_invoice_settlement_projections(
         projection.fiat_percentage = projection.fiat_percentage.or(row
             .fiat_percentage
             .filter(|percentage| (1..=100).contains(percentage)));
+        match (
+            row.creation_rate_minor_per_btc,
+            row.creation_rate_currency.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(rate), Some(currency))
+                if rate > 0
+                    && matches!(
+                        currency,
+                        "ARS" | "CAD" | "COP" | "CRC" | "EUR" | "MXN" | "USD"
+                    ) =>
+            {
+                if projection
+                    .creation_rate_minor_per_btc
+                    .is_some_and(|stored| stored != rate)
+                    || projection
+                        .creation_rate_currency
+                        .as_deref()
+                        .is_some_and(|stored| stored != currency)
+                {
+                    projection.accounting_integrity_error = true;
+                } else {
+                    projection.creation_rate_minor_per_btc = Some(rate);
+                    projection.creation_rate_currency = Some(currency.to_owned());
+                }
+            }
+            _ => projection.accounting_integrity_error = true,
+        }
         let fiat = MerchantFiatSettlementEntry {
             amount_minor: (status == "settled")
                 .then_some(row.credited_fiat_minor)
                 .flatten(),
             quoted_amount_minor: row.quoted_fiat_minor.filter(|amount| *amount > 0),
+            execution_rate_minor_per_btc: (status == "settled")
+                .then_some(row.execution_rate_minor_per_btc)
+                .flatten()
+                .filter(|rate| *rate > 0),
             currency: row.fiat_currency,
             order_id,
             status: status.to_owned(),
@@ -5266,21 +5320,26 @@ pub async fn list_signed(
             // With no binding, rows are ordered oldest-first and the latest
             // durable fallback decision is the effective projection.
             let fallback_reason = projection.effective_fallback_reason().map(str::to_owned);
-            let settlement_details =
-                if !projection.mixed_bitcoin.is_empty() && !projection.mixed_fiat.is_empty() {
-                    Some(MerchantSettlementDetails::Mixed {
-                        fiat_percentage: projection.fiat_percentage,
-                        bitcoin: projection.mixed_bitcoin,
-                        fiat: projection.mixed_fiat,
-                    })
-                } else if !projection.fiat_only.is_empty() {
-                    Some(MerchantSettlementDetails::Fiat {
-                        fiat_percentage: projection.fiat_percentage,
-                        fiat: projection.fiat_only,
-                    })
-                } else {
-                    None
-                };
+            let settlement_details = if projection.accounting_integrity_error {
+                None
+            } else if !projection.mixed_bitcoin.is_empty() && !projection.mixed_fiat.is_empty() {
+                Some(MerchantSettlementDetails::Mixed {
+                    fiat_percentage: projection.fiat_percentage,
+                    creation_rate_minor_per_btc: projection.creation_rate_minor_per_btc,
+                    creation_rate_currency: projection.creation_rate_currency,
+                    bitcoin: projection.mixed_bitcoin,
+                    fiat: projection.mixed_fiat,
+                })
+            } else if !projection.fiat_only.is_empty() {
+                Some(MerchantSettlementDetails::Fiat {
+                    fiat_percentage: projection.fiat_percentage,
+                    creation_rate_minor_per_btc: projection.creation_rate_minor_per_btc,
+                    creation_rate_currency: projection.creation_rate_currency,
+                    fiat: projection.fiat_only,
+                })
+            } else {
+                None
+            };
             InvoiceListItem {
                 id: inv.id,
                 nym_owner: inv.nym_owner,

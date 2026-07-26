@@ -73,6 +73,8 @@ unavailable presentation.
 {
   "kind": "mixed",
   "fiat_percentage": 40,
+  "creation_rate_minor_per_btc": 6416000,
+  "creation_rate_currency": "USD",
   "bitcoin": [
     {
       "amount_sat": 60000,
@@ -84,6 +86,7 @@ unavailable presentation.
     {
       "amount_minor": 12345,
       "quoted_amount_minor": 12345,
+      "execution_rate_minor_per_btc": 6390000,
       "currency": "CAD",
       "order_id": "40000000-0000-4000-8000-000000000001",
       "status": "settled"
@@ -114,6 +117,17 @@ The detail invariants are:
   merchant's current product config. It is an integer `1..=100` (`100` for a
   `fiat` kind, `1..=99` for `mixed`) and applies to both `fiat` and `mixed`
   kinds. It is JSON `null` for a legacy row predating the captured column.
+- `creation_rate_minor_per_btc` and `creation_rate_currency` are the immutable
+  invoice-creation reference rate (R1) from quote version 1 and its invoice
+  face currency. They are emitted together, as a strictly positive integer and
+  supported currency, only for `fiat_fixed` invoice payments. Both are absent
+  for sat-priced, Lightning Address, and legacy rows. R1 is an estimate for the
+  Bitcoin leg; it is not Bull Bitcoin's execution rate.
+- `execution_rate_minor_per_btc` is Bull Bitcoin's explicit API-Orders
+  execution rate (R2), denominated in that fiat leg's `currency`. It is emitted
+  only for a `settled` leg when the authoritative provider observation carried
+  a strictly positive rate. It is absent for pending and legacy legs and is
+  never derived from rounded received/payout totals.
 - An invalid or internally inconsistent set of legs produces the top-level
   `unavailable` classification without partial details.
 
@@ -128,6 +142,11 @@ exposed `quoted_amount_minor` tracks any repricing; the `settled`
 `amount_minor` remains the exact credited amount. Clients should show
 `quoted_amount_minor` while a leg is `pending` and the credited `amount_minor`
 once it is `settled`.
+
+R1, R2, the exact Bitcoin-leg sats, and the exact credited fiat amount describe
+different accounting facts at different moments. Clients must not require the
+estimated Bitcoin value plus the fiat credit to equal the invoice face amount;
+rate movement and the provider spread make that equality generally false.
 
 `fiat_conversion` is present only with `settlement_kind: "bitcoin"` when an
 attempted conversion was overridden before a Bull Bitcoin destination became
@@ -170,14 +189,25 @@ time, or payment state fails the entire request instead of silently omitting a
 payment from the merchant's history.
 
 The canonical response fixtures are in
-[`fixtures/get-paid-transactions-settlement-v2.json`](fixtures/get-paid-transactions-settlement-v2.json).
-Server and client contract tests must parse those values without rewriting the
-field names, enum strings, nulls, or array shapes. The superseded version-one
-fixtures remain at
+[`fixtures/get-paid-transactions-settlement-v3.json`](fixtures/get-paid-transactions-settlement-v3.json).
+Server and client contract tests must parse those values byte-for-byte without
+rewriting field names, enum strings, nulls, omissions, or array shapes. The
+superseded version-two and version-one fixtures remain at
+[`fixtures/get-paid-transactions-settlement-v2.json`](fixtures/get-paid-transactions-settlement-v2.json)
+and
 [`fixtures/get-paid-transactions-settlement-v1.json`](fixtures/get-paid-transactions-settlement-v1.json)
 for historical reference only.
 
 ## Changelog
+
+### v3 (bullnym release 0.3) — additive accounting contract
+
+For `fiat` and `mixed` invoice settlements, v3 adds the paired
+`creation_rate_minor_per_btc`/`creation_rate_currency` R1 fields to
+`settlement_details`. Each settled fiat leg may also add
+`execution_rate_minor_per_btc` as authoritative R2 provider evidence. The new
+fields are absent when their evidence is unavailable. Existing amount, quote,
+split, status, exactness, and fail-closed rules are unchanged.
 
 ### v2 (bullnym release 0.2) — contract-breaking
 

@@ -157,6 +157,10 @@ async fn route_unfunded_mixed_with_log(
 pub struct FiatOnlyInstructionRequest<'a> {
     pub owner_npub: &'a str,
     pub invoice_id: Option<Uuid>,
+    /// Immutable Bullnym payer quote which denominates an invoice pay-in.
+    /// Fiat-fixed invoice instructions require it; sat-fixed invoices and
+    /// Lightning Address settlements deliberately have no quote authority.
+    pub invoice_quote_version_id: Option<Uuid>,
     pub product: Product,
     pub credential_id: Uuid,
     pub request_key: &'a str,
@@ -339,6 +343,7 @@ pub async fn replay_fiat_only_instruction(
                     let persisted_request = FiatOnlyInstructionRequest {
                         owner_npub,
                         invoice_id: None,
+                        invoice_quote_version_id: None,
                         product,
                         credential_id: existing.credential_id,
                         request_key,
@@ -372,6 +377,7 @@ async fn create_fiat_only_instruction_locked(
     let reservation = NewBullBitcoinSettlement {
         owner_npub: request.owner_npub,
         invoice_id: request.invoice_id,
+        invoice_quote_version_id: request.invoice_quote_version_id,
         reverse_swap_id: None,
         chain_swap_id: None,
         credential_id: request.credential_id,
@@ -734,6 +740,7 @@ async fn prepare_mixed_settlement_locked(
     let reservation = NewBullBitcoinSettlement {
         owner_npub: &policy.owner_npub,
         invoice_id: policy.invoice_id,
+        invoice_quote_version_id: None,
         reverse_swap_id: policy.reverse_swap_id,
         chain_swap_id: policy.chain_swap_id,
         credential_id: policy.credential_id,
@@ -1039,6 +1046,11 @@ fn stored_outcome(
         stored.funding_route.as_deref(),
     ) {
         ("bound", Some("bull_bitcoin")) => {
+            if stored.actual_received_sat.is_some() {
+                // A provider funding observation permanently closes payer
+                // admission even while payout reconciliation is still pending.
+                return Err(SettlementServiceError::StoredState);
+            }
             let order_id = stored
                 .bull_bitcoin_order_id
                 .ok_or(SettlementServiceError::StoredState)?;
@@ -1309,6 +1321,26 @@ async fn reconcile_settlement(
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
             } else {
+                let prefetched_rate = if settlement.actual_received_sat.is_none()
+                    && observation.actual_received_sat.is_some()
+                {
+                    match settlement.invoice_id {
+                        Some(invoice_id) => {
+                            crate::invoice::prefetch_provider_observation_rate(
+                                state,
+                                invoice_id,
+                                settlement.invoice_quote_version_id,
+                            )
+                            .await
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let valuation_candidate = prefetched_rate
+                    .as_ref()
+                    .and_then(crate::invoice::quote_candidate_from_rate);
                 db::record_bull_bitcoin_observation(
                     &state.db,
                     settlement.id,
@@ -1316,6 +1348,7 @@ async fn reconcile_settlement(
                     i64::try_from(state.config.bull_bitcoin.reconcile_interval_secs)
                         .map_err(|_| SettlementServiceError::StoredState)?,
                     late_payment_watch_delay_secs(state),
+                    valuation_candidate.as_ref(),
                 )
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
@@ -1393,7 +1426,7 @@ async fn record_final_invoice_payment(
         .actual_received_sat
         .filter(|amount| *amount > 0)
         .ok_or(SettlementServiceError::StoredState)?;
-    let credited_fiat_minor = settlement
+    settlement
         .credited_fiat_minor
         .filter(|amount| *amount > 0)
         .ok_or(SettlementServiceError::StoredState)?;
@@ -1411,7 +1444,6 @@ async fn record_final_invoice_payment(
             boltz_swap_id: None,
             address: None,
             bull_bitcoin_settlement_id: Some(settlement.id),
-            bull_bitcoin_credited_fiat_minor: Some(credited_fiat_minor),
         },
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
     )
@@ -1468,6 +1500,7 @@ mod tests {
             id: Uuid::new_v4(),
             owner_npub: "owner-secret-canary".into(),
             invoice_id: Some(Uuid::new_v4()),
+            invoice_quote_version_id: None,
             reverse_swap_id: Some(Uuid::new_v4()),
             chain_swap_id: None,
             credential_id: Uuid::new_v4(),
@@ -1490,8 +1523,10 @@ mod tests {
             retention_until_unix: None,
             reconcile_attempts: 0,
             actual_received_sat: None,
+            quote_payment_first_observed_at_unix_micros: None,
             credited_fiat_minor: Some(500),
             quoted_fiat_minor: Some(500),
+            execution_rate_minor_per_btc: None,
             provider_final: false,
         }
     }
