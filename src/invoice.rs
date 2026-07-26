@@ -357,7 +357,6 @@ pub async fn flip_invoice_on_lightning_settlement(
             boltz_swap_id: Some(boltz_swap_id),
             address: None,
             bull_bitcoin_settlement_id: None,
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -423,7 +422,6 @@ pub async fn record_mixed_bull_bitcoin_output(
             boltz_swap_id: None,
             address: None,
             bull_bitcoin_settlement_id: Some(settlement_id),
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -541,7 +539,6 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
             boltz_swap_id: Some(boltz_swap_id),
             address: None,
             bull_bitcoin_settlement_id: None,
-            bull_bitcoin_credited_fiat_minor: None,
         },
         tolerances,
     )
@@ -1984,6 +1981,7 @@ pub async fn payer_demand_quote(
             &state,
             &invoice,
             policy,
+            None,
             request.rail,
             amount_sat,
             &request_key,
@@ -2460,6 +2458,7 @@ async fn versioned_instruction_for_rail(
             state,
             invoice,
             policy,
+            Some(quote.id),
             rail,
             quote.merchant_amount_sat,
             &request_key,
@@ -2569,6 +2568,7 @@ async fn fiat_only_instruction(
     state: &AppState,
     invoice: &db::Invoice,
     policy: &db::InvoiceFiatSettlementPolicy,
+    invoice_quote_version_id: Option<Uuid>,
     rail: PayerQuoteRail,
     amount_sat: i64,
     request_key: &str,
@@ -2595,6 +2595,7 @@ async fn fiat_only_instruction(
     let request = FiatOnlyInstructionRequest {
         owner_npub: &policy.owner_npub,
         invoice_id: Some(invoice.id),
+        invoice_quote_version_id,
         product,
         credential_id: policy.credential_id,
         request_key,

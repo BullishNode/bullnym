@@ -254,7 +254,7 @@ the timestamp column, immutable stamping trigger, indexes, and runtime read
 privilege before serving traffic. The endpoint reads existing swap and invoice
 payment evidence; it does not create or mutate accounting events.
 
-## Migrations 067-074 Bull Bitcoin fiat settlement
+## Migrations 067-075 Bull Bitcoin fiat settlement
 
 Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `068_bull_bitcoin_invoice_accounting.sql`,
@@ -262,19 +262,59 @@ Apply `067_bull_bitcoin_fiat_settlement.sql`,
 `070_bull_bitcoin_quoted_fiat.sql`,
 `071_mixed_invoice_payin_valuation.sql`,
 `072_mixed_invoice_blinding_key_invariant.sql`,
-`073_unfunded_provider_watch.sql`, and
-`074_bull_bitcoin_execution_rate.sql` in order as the privileged schema owner
+`073_unfunded_provider_watch.sql`,
+`074_bull_bitcoin_execution_rate.sql`, and
+`075_fiat_only_quote_accounting.sql` in order as the privileged schema owner
 with `--set runtime_role=bullnym_app` while every Bullnym writer is stopped.
 For a first deployment from schema 066, take and validate a schema-066 backup
 first. For the 0.2-to-0.3 upgrade, verify schema 070, take and validate a fresh
-schema-070 backup, then apply only migrations 071 through 074. Keep
+schema-070 backup, then apply only migrations 071 through 075. Keep
 `features.bull_bitcoin_fiat_settlement = false` throughout migration and
 initial service verification.
 
 Migration 074 adds one nullable, positive-only execution-rate column and does
-not backfill legacy orders or change runtime grants. Start only a matching
-schema-074 binary after it is applied. Readiness verifies both the column and
-its validated constraint before the service accepts traffic.
+not backfill legacy orders or change runtime grants. Migration 075 binds new
+fiat-fixed, fiat-only orders to the immutable Bullnym payer quote, stores the
+first provider-funds observation, and derives invoice-face credit from that
+quote instead of the provider payout currency. It deterministically recovers
+the quote only for still-unfunded legacy orders whose request-key commitment
+proves the exact quote; it never invents quote or observation evidence for a
+funded legacy row. It also removes every payer instruction from an already
+funded row and prevents any new quote or fiat-only order for that invoice.
+Start only a matching schema-075 binary after it is applied. Readiness verifies
+the columns, constraints, and admission/accounting triggers before the service
+accepts traffic.
+
+Never apply migrations 067-075 as `bullnym_app`. After migration and before
+starting the service, record these stopped-writer certification counts:
+
+```sql
+SELECT
+    COUNT(*) FILTER (
+        WHERE source = 'bull_bitcoin_mixed_output'
+          AND fiat_valuation_quote_version_id IS NOT NULL
+    ) AS valued_mixed_events,
+    (SELECT COUNT(*) FROM invoice_mixed_valuation_exceptions)
+        AS unresolved_mixed_events
+FROM invoice_payment_events;
+
+SELECT COUNT(*) AS funded_instructions
+FROM bull_bitcoin_settlements
+WHERE actual_received_sat IS NOT NULL
+  AND (payer_instruction IS NOT NULL OR instruction_kind IS NOT NULL);
+
+SELECT COUNT(*) AS current_fiat_events_without_quote
+FROM invoice_payment_events event
+JOIN bull_bitcoin_settlements settlement
+  ON settlement.id = event.bull_bitcoin_settlement_id
+WHERE event.source = 'bull_bitcoin_fiat'
+  AND settlement.invoice_quote_version_id IS NOT NULL
+  AND event.fiat_valuation_quote_version_id IS NULL;
+```
+
+The latter two counts must be zero. A nonzero unresolved mixed count is a
+visible integrity exception to investigate; do not invent a rate to force it
+to zero. Preserve all three query results in the deployment record.
 
 Deploy the compatible API-Orders release before Bullnym. Its scoped contract
 must provide `validateSellToBalance`, `sellToBalance`, and same-key
@@ -285,7 +325,7 @@ URL and a fresh root-only `BULL_BITCOIN_CREDENTIAL_ENCRYPTION_KEY` containing
 exactly 32 random bytes encoded as 64 lowercase hexadecimal characters. Never
 copy a production credential or encryption key into staging.
 
-Start only the schema-074 binary. Require `/ready`, `/version`, the installed
+Start only the schema-075 binary. Require `/ready`, `/version`, the installed
 artifact digest, and the release record to agree while admission remains off.
 Then test one eligible scoped key, one benchmark-ineligible account, one
 wrong-scope key, and one unavailable-API response before enabling the feature.
@@ -295,11 +335,11 @@ eligibility call must create no Bull Bitcoin order.
 Automatic rollback across migration 067 is refused. To return to a pre-067
 release, stop every writer and restore the validated schema-066 database with
 its matching binary, PWA, release record, and configuration. Migrations 071
-through 074 also form a stopped-writer boundary: 071 changes mixed-payment
+through 075 also form a stopped-writer boundary: 071 changes mixed-payment
 valuation triggers and may populate previously null accounting evidence. Do
 not run a schema-070-or-older binary after those migrations commit. Restore the
 validated immediate pre-071 backup with its matching 0.2 binary/PWA/release
-record, or repair and roll forward with a schema-074 build.
+record, or repair and roll forward with a schema-075 build.
 
 ## Migration 053 privileged-owner boundary
 
