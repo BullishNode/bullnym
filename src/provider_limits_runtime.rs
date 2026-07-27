@@ -1,23 +1,24 @@
-//! One process-local cache for the exact BTC -> L-BTC reverse-pair limits.
+//! Process-local caches for the exact BTC -> L-BTC reverse and chain limits.
 //!
 //! Only the periodic refresh path performs provider I/O. Metadata and callback
-//! readers clone one small validated state under a standard-library read lock.
+//! readers clone small, independently validated states under standard-library
+//! read locks. One endpoint's limits never authorize the other endpoint.
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use boltz_client::swaps::boltz::ReversePair;
+use boltz_client::swaps::boltz::{ChainPair, ReversePair};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider_limits::{
     effective_lightning_address_range, fixed_checkout_reverse_quote,
-    revalidate_lightning_address_creation, EffectiveLightningAddressRange,
-    FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError, LightningAddressCreationError,
-    LightningAddressUnavailable, ProviderAsset, ProviderLimitMode, ProviderZeroConfLimit,
-    ReversePairObservation, ReversePairSnapshotState, ReversePairSource,
-    ReversePairValidationError,
+    revalidate_lightning_address_creation, ChainAmountEligibility, ChainPairSnapshotState,
+    ChainPairValidationError, EffectiveLightningAddressRange, FixedCheckoutReverseQuote,
+    FixedCheckoutReverseQuoteError, LightningAddressCreationError, LightningAddressUnavailable,
+    ProviderAsset, ProviderLimitMode, ProviderZeroConfLimit, ReversePairObservation,
+    ReversePairSnapshotState, ReversePairSource, ReversePairValidationError,
 };
 
 pub const PROVIDER_LIMIT_REFRESH_CADENCE: Duration = Duration::from_secs(30);
@@ -30,10 +31,18 @@ pub enum ProviderLimitRefreshOutcome {
     FetchFailed,
 }
 
-/// Shared, cheap-to-read state for Lightning Address limit decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainProviderLimitRefreshOutcome {
+    Updated,
+    Invalid(ChainPairValidationError),
+    FetchFailed,
+}
+
+/// Shared, cheap-to-read state for Lightning and Bitcoin payer-rail limits.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderLimitsRuntime {
-    state: Arc<RwLock<ReversePairSnapshotState>>,
+    reverse_state: Arc<RwLock<ReversePairSnapshotState>>,
+    chain_state: Arc<RwLock<ChainPairSnapshotState>>,
 }
 
 impl ProviderLimitsRuntime {
@@ -43,7 +52,14 @@ impl ProviderLimitsRuntime {
 
     /// Clone the current safe value without provider or other external I/O.
     pub fn snapshot(&self) -> ReversePairSnapshotState {
-        match self.state.read() {
+        match self.reverse_state.read() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn chain_snapshot(&self) -> ChainPairSnapshotState {
+        match self.chain_state.read() {
             Ok(state) => state.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
@@ -121,6 +137,36 @@ impl ProviderLimitsRuntime {
         )
     }
 
+    /// In-memory eligibility for the exact BTC -> L-BTC chain endpoint.
+    /// Missing, invalid, future, and stale observations fail closed.
+    pub fn bitcoin_chain_amount_eligibility(&self, amount_sat: u64) -> ChainAmountEligibility {
+        self.chain_snapshot().amount_eligibility(
+            amount_sat,
+            Instant::now(),
+            PROVIDER_LIMIT_MAXIMUM_AGE,
+        )
+    }
+
+    pub fn record_successful_chain_refresh(
+        &self,
+        pair: Option<ChainPair>,
+        completed_at: Instant,
+    ) -> ChainProviderLimitRefreshOutcome {
+        let state = match pair {
+            Some(pair) => ChainPairSnapshotState::from_pair(pair, completed_at),
+            None => ChainPairSnapshotState::Invalid(ChainPairValidationError::ExactPairMissing),
+        };
+        let outcome = match &state {
+            ChainPairSnapshotState::Available(_) => ChainProviderLimitRefreshOutcome::Updated,
+            ChainPairSnapshotState::Invalid(error) => {
+                ChainProviderLimitRefreshOutcome::Invalid(*error)
+            }
+            ChainPairSnapshotState::Missing => unreachable!("refresh never creates missing state"),
+        };
+        self.replace_chain(state);
+        outcome
+    }
+
     fn lightning_address_range_at(
         &self,
         product_minimum_msat: u64,
@@ -156,7 +202,14 @@ impl ProviderLimitsRuntime {
     }
 
     fn replace(&self, replacement: ReversePairSnapshotState) {
-        match self.state.write() {
+        match self.reverse_state.write() {
+            Ok(mut state) => *state = replacement,
+            Err(poisoned) => *poisoned.into_inner() = replacement,
+        }
+    }
+
+    fn replace_chain(&self, replacement: ChainPairSnapshotState) {
+        match self.chain_state.write() {
             Ok(mut state) => *state = replacement,
             Err(poisoned) => *poisoned.into_inner() = replacement,
         }
@@ -170,6 +223,17 @@ impl ProviderLimitsRuntime {
         match result {
             Ok(pair) => self.record_successful_refresh(pair, completed_at),
             Err(()) => ProviderLimitRefreshOutcome::FetchFailed,
+        }
+    }
+
+    pub(crate) fn record_chain_fetch_result(
+        &self,
+        result: Result<Option<ChainPair>, ()>,
+        completed_at: Instant,
+    ) -> ChainProviderLimitRefreshOutcome {
+        match result {
+            Ok(pair) => self.record_successful_chain_refresh(pair, completed_at),
+            Err(()) => ChainProviderLimitRefreshOutcome::FetchFailed,
         }
     }
 }
@@ -223,13 +287,62 @@ pub(crate) async fn run_periodic_refresh<F, Fut, C>(
     }
 }
 
+pub(crate) async fn run_periodic_chain_refresh<F, Fut, C>(
+    runtime: ProviderLimitsRuntime,
+    cancel: CancellationToken,
+    mut fetch: F,
+    completed_at: C,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<ChainPair>, ()>>,
+    C: Fn() -> Instant,
+{
+    let mut tick = tokio::time::interval(PROVIDER_LIMIT_REFRESH_CADENCE);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = fetch() => result,
+        };
+        match runtime.record_chain_fetch_result(result, completed_at()) {
+            ChainProviderLimitRefreshOutcome::Updated => {
+                tracing::debug!(event = "chain_provider_limits_refresh_updated");
+            }
+            ChainProviderLimitRefreshOutcome::Invalid(error) => {
+                tracing::error!(
+                    event = "chain_provider_limits_refresh_invalid",
+                    reason = %error,
+                    "Bitcoin chain payer availability snapshot closed"
+                );
+            }
+            ChainProviderLimitRefreshOutcome::FetchFailed => {
+                tracing::warn!(
+                    event = "chain_provider_limits_refresh_failed",
+                    "retaining the last chain-limit snapshot until its fixed freshness limit"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use boltz_client::swaps::boltz::{PairMinerFees, ReverseFees, ReverseLimits};
+    use boltz_client::swaps::boltz::{
+        ChainFees, ChainMinerFees, PairLimits, PairMinerFees, ReverseFees, ReverseLimits,
+    };
 
     use super::*;
 
@@ -248,6 +361,28 @@ mod tests {
                 miner_fees: PairMinerFees {
                     lockup: 27,
                     claim: 20,
+                },
+            },
+        }
+    }
+
+    fn chain_pair(minimum_sat: u64, maximum_sat: u64) -> ChainPair {
+        ChainPair {
+            hash: HASH.to_owned(),
+            rate: 1.0,
+            limits: PairLimits {
+                minimal: minimum_sat,
+                maximal: maximum_sat,
+                maximal_zero_conf: maximum_sat,
+            },
+            fees: ChainFees {
+                percentage: 0.25,
+                miner_fees: ChainMinerFees {
+                    server: 20,
+                    user: PairMinerFees {
+                        lockup: 27,
+                        claim: 20,
+                    },
                 },
             },
         }
@@ -278,6 +413,70 @@ mod tests {
             assert_eq!(range.limits_msat(), (100_000, 1_000_000));
             assert_eq!(range.snapshot_evidence().2, completed_at);
         }
+    }
+
+    #[test]
+    fn chain_refresh_is_independent_and_enforces_inclusive_boundaries() {
+        let runtime = ProviderLimitsRuntime::new();
+        let completed_at = Instant::now();
+        assert_eq!(
+            runtime.record_successful_chain_refresh(
+                Some(chain_pair(25_000, 1_000_000)),
+                completed_at,
+            ),
+            ChainProviderLimitRefreshOutcome::Updated
+        );
+        assert_eq!(
+            runtime.chain_snapshot().amount_eligibility(
+                24_999,
+                completed_at,
+                PROVIDER_LIMIT_MAXIMUM_AGE,
+            ),
+            ChainAmountEligibility::BelowMinimum
+        );
+        assert_eq!(
+            runtime.chain_snapshot().amount_eligibility(
+                25_000,
+                completed_at,
+                PROVIDER_LIMIT_MAXIMUM_AGE,
+            ),
+            ChainAmountEligibility::Eligible
+        );
+        assert!(matches!(
+            runtime.snapshot(),
+            ReversePairSnapshotState::Missing
+        ));
+    }
+
+    #[test]
+    fn chain_refresh_failure_retains_good_until_stale_and_invalid_success_closes() {
+        let runtime = ProviderLimitsRuntime::new();
+        let observed_at = Instant::now();
+        runtime.record_successful_chain_refresh(Some(chain_pair(25_000, 1_000_000)), observed_at);
+        assert_eq!(
+            runtime.record_chain_fetch_result(Err(()), observed_at + Duration::from_secs(30)),
+            ChainProviderLimitRefreshOutcome::FetchFailed
+        );
+        assert_eq!(
+            runtime.chain_snapshot().amount_eligibility(
+                25_000,
+                observed_at + PROVIDER_LIMIT_MAXIMUM_AGE,
+                PROVIDER_LIMIT_MAXIMUM_AGE,
+            ),
+            ChainAmountEligibility::Eligible
+        );
+        assert_eq!(
+            runtime.chain_snapshot().amount_eligibility(
+                25_000,
+                observed_at + PROVIDER_LIMIT_MAXIMUM_AGE + Duration::from_nanos(1),
+                PROVIDER_LIMIT_MAXIMUM_AGE,
+            ),
+            ChainAmountEligibility::SnapshotUnavailable
+        );
+        assert_eq!(
+            runtime.record_successful_chain_refresh(None, observed_at),
+            ChainProviderLimitRefreshOutcome::Invalid(ChainPairValidationError::ExactPairMissing)
+        );
     }
 
     #[test]
