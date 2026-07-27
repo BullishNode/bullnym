@@ -3532,6 +3532,13 @@ async fn ensure_versioned_bitcoin_chain_offer(
         {
             Ok(result) => result,
             Err(error) => {
+                // A provider minimum rejection is deterministic and already
+                // mapped to a stable client error. It is not evidence that
+                // the POST outcome is ambiguous, so do not quarantine this
+                // quote attempt as provider_outcome_unknown.
+                if crate::boltz::is_btc_to_lbtc_below_minimum_app_error(&error) {
+                    return Err(error);
+                }
                 db::record_invoice_quote_provider_integrity_hold(
                     permit.connection_mut(),
                     provider_attempt.id,

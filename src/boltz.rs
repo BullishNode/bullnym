@@ -290,6 +290,60 @@ fn invalid_reverse_response(reason: impl Into<String>) -> AppError {
     AppError::BoltzError(format!("invalid reverse swap response: {}", reason.into()))
 }
 
+/// Stable client-facing reason for a BTC-to-L-BTC amount rejected by Boltz's
+/// current pair minimum. Keep this provider-independent: the provider's
+/// response text is diagnostic input, not an API contract.
+pub(crate) const BTC_TO_LBTC_BELOW_MINIMUM_REASON: &str =
+    "Bitcoin amount is below the current provider minimum.";
+
+fn validate_chain_create_amount(
+    pair: &ChainPair,
+    merchant_amount_sat: u64,
+) -> Result<(), AppError> {
+    let user_lock_amount_sat = expected_chain_user_lock_amount(pair, merchant_amount_sat)?;
+    if user_lock_amount_sat < pair.limits.minimal {
+        return Err(AppError::InvalidAmount(
+            BTC_TO_LBTC_BELOW_MINIMUM_REASON.into(),
+        ));
+    }
+    if user_lock_amount_sat > pair.limits.maximal {
+        return Err(AppError::InvalidAmount(
+            "Bitcoin amount exceeds the current provider maximum.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_btc_to_lbtc_below_minimum_error(error: &boltz_client::error::Error) -> bool {
+    match error {
+        boltz_client::error::Error::HTTPStatusNotSuccess(status, body)
+            if status.is_client_error() =>
+        {
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| {
+                    exact_u64_bound_message(message, " is less than minimal of ")
+                })
+        }
+        _ => false,
+    }
+}
+
+fn map_chain_create_provider_error(error: boltz_client::error::Error) -> AppError {
+    if is_btc_to_lbtc_below_minimum_error(&error) {
+        AppError::InvalidAmount(BTC_TO_LBTC_BELOW_MINIMUM_REASON.into())
+    } else {
+        AppError::BoltzError(format!("{error}"))
+    }
+}
+
+pub(crate) fn is_btc_to_lbtc_below_minimum_app_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::InvalidAmount(reason) if reason == BTC_TO_LBTC_BELOW_MINIMUM_REASON
+    )
+}
+
 fn validate_exact_reverse_leaf(
     name: &str,
     actual: &Leaf,
@@ -1416,6 +1470,12 @@ impl BoltzService {
             .get_btc_to_lbtc_pair()
             .ok_or_else(|| AppError::BoltzError("BTC/L-BTC chain pair is unavailable".into()))?;
 
+        // Reject known deterministic limit failures before reserving a
+        // provider attempt or crossing its irreversible dispatch boundary.
+        // The provider still validates the request, so submit-time mapping
+        // below remains necessary if its limits change between these reads.
+        validate_chain_create_amount(&pair, amount_sat)?;
+
         // Heights are captured before the mutating request and bound the
         // timeout-order validation. A block arriving during the request only
         // makes the resulting windows more conservative by one block.
@@ -1518,6 +1578,7 @@ impl BoltzService {
                 "persisted chain create authority is invalid".into(),
             ));
         }
+        validate_chain_create_amount(&authority.pair, authority.merchant_amount_sat)?;
         Ok(PreparedChainCreate {
             authority,
             claim_keypair,
@@ -1538,7 +1599,7 @@ impl BoltzService {
                 .err()
                 .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
         );
-        let response = provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?;
+        let response = provider_result.map_err(map_chain_create_provider_error)?;
         self.complete_btc_to_lbtc_chain_swap(prepared, response)
     }
 
@@ -1845,6 +1906,47 @@ mod tests {
             let body = serde_json::json!({ "error": rejected }).to_string();
             assert_eq!(classify_chain_swap_quote_protocol_error(&body), None);
         }
+    }
+
+    #[test]
+    fn btc_to_lbtc_minimum_is_a_stable_invalid_amount_not_provider_error() {
+        let below = boltz_client::error::Error::HTTPStatusNotSuccess(
+            reqwest::StatusCode::BAD_REQUEST,
+            json!({ "error": "2084 is less than minimal of 25000" }),
+        );
+        assert!(is_btc_to_lbtc_below_minimum_error(&below));
+        assert_eq!(
+            map_chain_create_provider_error(below).to_string(),
+            format!("invalid amount: {BTC_TO_LBTC_BELOW_MINIMUM_REASON}")
+        );
+
+        let server_error = boltz_client::error::Error::HTTPStatusNotSuccess(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": "2084 is less than minimal of 25000" }),
+        );
+        assert!(!is_btc_to_lbtc_below_minimum_error(&server_error));
+        assert!(matches!(
+            map_chain_create_provider_error(server_error),
+            AppError::BoltzError(_)
+        ));
+
+        let malformed = boltz_client::error::Error::HTTPStatusNotSuccess(
+            reqwest::StatusCode::BAD_REQUEST,
+            json!({ "error": "2.084 is less than minimal of 25000" }),
+        );
+        assert!(!is_btc_to_lbtc_below_minimum_error(&malformed));
+    }
+
+    #[test]
+    fn btc_to_lbtc_pair_minimum_is_rejected_before_dispatch() {
+        let (mut pair, _, _, _, _, _) = live_chain_creation_fixture();
+        pair.limits.minimal = 25_000;
+        let error = validate_chain_create_amount(&pair, 2_000).unwrap_err();
+        assert!(is_btc_to_lbtc_below_minimum_app_error(&error));
+        assert_eq!(
+            error.to_string(),
+            format!("invalid amount: {BTC_TO_LBTC_BELOW_MINIMUM_REASON}")
+        );
     }
 
     #[test]
