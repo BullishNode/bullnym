@@ -23,6 +23,7 @@ BEGIN
         )
            OR settlement.order_correlation_source <> 'legacy_bound'
            OR settlement.order_correlated_at IS DISTINCT FROM snapshot.updated_at
+           OR settlement.expected_instruction_script_len IS NOT NULL
     ) OR (
         SELECT COUNT(*) FROM migration_077_bound_snapshot
     ) <> (
@@ -30,6 +31,37 @@ BEGIN
          WHERE order_correlation_source = 'legacy_bound'
     ) THEN
         RAISE EXCEPTION 'migration 077 changed or incompletely correlated a bound order';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'bull_bitcoin_settlements'
+           AND column_name = 'expected_instruction_script_len'
+           AND data_type = 'integer'
+           AND is_nullable = 'YES'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'bull_bitcoin_settlements'::REGCLASS
+           AND conname =
+               'bull_bitcoin_settlements_expected_instruction_shape_chk'
+           AND convalidated
+    ) OR NOT EXISTS (
+        SELECT 1
+          FROM pg_class index_info
+          JOIN pg_index index_state ON index_state.indexrelid = index_info.oid
+         WHERE index_info.oid = to_regclass(
+                   'bull_bitcoin_settlements_ambiguous_dispatch_due_idx'
+               )
+           AND index_state.indrelid = 'bull_bitcoin_settlements'::REGCLASS
+           AND index_state.indisvalid
+           AND index_state.indisready
+           AND pg_get_expr(index_state.indpred, index_state.indrelid)
+               LIKE '%provider_state%dispatch_started%funding_route IS NULL%'
+           AND pg_get_indexdef(index_info.oid)
+               LIKE '%COALESCE(next_attempt_at, updated_at)%'
+    ) THEN
+        RAISE EXCEPTION 'migration 077 instruction-shape or due-work boundary is incomplete';
     END IF;
 
     SELECT oid INTO STRICT runtime_role_oid

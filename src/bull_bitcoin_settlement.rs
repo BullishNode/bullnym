@@ -460,6 +460,7 @@ async fn create_fiat_only_instruction_locked(
         fiat_percentage: 100,
         fiat_currency: request.fiat_currency.as_str(),
         requested_bitcoin_sat: request.bitcoin_amount.as_sat(),
+        expected_instruction_script_len: None,
     };
     let mut stored = db::reserve_bull_bitcoin_settlement(connection, &reservation)
         .await
@@ -817,6 +818,10 @@ async fn prepare_mixed_settlement_locked(
         fiat_percentage: policy.fiat_percentage,
         fiat_currency: currency.as_str(),
         requested_bitcoin_sat: bull_bitcoin_amount_sat,
+        expected_instruction_script_len: Some(
+            i32::try_from(basis.additional_output_script_len)
+                .map_err(|_| SettlementServiceError::StoredState)?,
+        ),
     };
     let mut stored = if let Some(existing) = existing {
         let address_shape_changed = existing.provider_state == "bound"
@@ -940,12 +945,8 @@ async fn prepare_mixed_settlement_locked(
             if liquid_script_pubkey_len(&confidential_address)
                 != Some(basis.additional_output_script_len)
             {
-                abandon_dispatch_with_log(connection, &stored, FallbackCategory::InvalidSplit)
-                    .await?;
-                return Ok(Some(MixedSettlementPreparation::BitcoinFallback {
-                    settlement_id: stored.id,
-                    category: FallbackCategory::InvalidSplit,
-                }));
+                preserve_ambiguous_dispatch(connection, &stored, Some(order_id)).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
             }
             let retention_secs =
                 i64::try_from(state.config.bull_bitcoin.late_payment_retention_secs)
@@ -1409,6 +1410,16 @@ async fn reconcile_ambiguous_dispatch(
         || order.network != network
         || order.requested_bitcoin != request.bitcoin_amount
         || instruction_network(&order.instruction) != network
+        || (settlement.purpose == "mixed"
+            && settlement
+                .expected_instruction_script_len
+                .and_then(|expected| usize::try_from(expected).ok())
+                != match &order.instruction {
+                    PayerInstruction::Liquid {
+                        confidential_address,
+                    } => liquid_script_pubkey_len(confidential_address),
+                    _ => None,
+                })
     {
         return Err(SettlementServiceError::StoredState);
     }
@@ -1729,6 +1740,7 @@ mod tests {
             bull_bitcoin_order_id: None,
             order_correlation_source: None,
             order_correlated_at_unix_micros: None,
+            expected_instruction_script_len: None,
             instruction_kind: Some("liquid".into()),
             payer_instruction: Some("payer-instruction-secret-canary".into()),
             instruction_expires_at_unix: None,

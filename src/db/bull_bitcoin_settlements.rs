@@ -35,6 +35,7 @@ pub struct NewBullBitcoinSettlement<'a> {
     pub fiat_percentage: i16,
     pub fiat_currency: &'a str,
     pub requested_bitcoin_sat: i64,
+    pub expected_instruction_script_len: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
@@ -60,6 +61,7 @@ pub struct StoredBullBitcoinSettlement {
     pub bull_bitcoin_order_id: Option<Uuid>,
     pub order_correlation_source: Option<String>,
     pub order_correlated_at_unix_micros: Option<i64>,
+    pub expected_instruction_script_len: Option<i32>,
     pub instruction_kind: Option<String>,
     pub payer_instruction: Option<String>,
     pub instruction_expires_at_unix: Option<i64>,
@@ -201,6 +203,7 @@ const SETTLEMENT_PROJECTION: &str =
      bull_bitcoin_order_id, order_correlation_source, \
      (EXTRACT(EPOCH FROM order_correlated_at) * 1000000)::BIGINT \
          AS order_correlated_at_unix_micros, \
+     expected_instruction_script_len, \
      instruction_kind, payer_instruction, \
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
@@ -661,8 +664,10 @@ pub async fn reserve_bull_bitcoin_settlement(
              id, owner_npub, invoice_id, invoice_quote_version_id, reverse_swap_id, chain_swap_id, \
              credential_id, product, purpose, \
              payer_rail, request_key, fiat_percentage, fiat_currency, \
-             requested_bitcoin_sat \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             requested_bitcoin_sat, expected_instruction_script_len \
+         ) VALUES ( \
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
+         )",
     )
     .bind(id)
     .bind(settlement.owner_npub)
@@ -678,6 +683,7 @@ pub async fn reserve_bull_bitcoin_settlement(
     .bind(settlement.fiat_percentage)
     .bind(settlement.fiat_currency)
     .bind(settlement.requested_bitcoin_sat)
+    .bind(settlement.expected_instruction_script_len)
     .execute(&mut *transaction)
     .await?;
 
@@ -1427,6 +1433,8 @@ fn validate_reservation_identity(
         || stored.fiat_percentage != requested.fiat_percentage
         || stored.fiat_currency != requested.fiat_currency
         || stored.requested_bitcoin_sat != requested.requested_bitcoin_sat
+        || (stored.expected_instruction_script_len.is_some()
+            && stored.expected_instruction_script_len != requested.expected_instruction_script_len)
     {
         return Err(BullBitcoinSettlementStoreError::RequestKeyConflict);
     }

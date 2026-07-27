@@ -1447,6 +1447,26 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'expected_instruction_script_len' \
+                   AND data_type = 'integer' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_class index_info \
+                JOIN pg_index index_state ON index_state.indexrelid = index_info.oid \
+                 WHERE index_info.oid = to_regclass( \
+                    'public.bull_bitcoin_settlements_ambiguous_dispatch_due_idx' \
+                 ) \
+                   AND index_state.indrelid = \
+                       to_regclass('public.bull_bitcoin_settlements') \
+                   AND index_state.indisvalid \
+                   AND index_state.indisready \
+                   AND index_state.indpred IS NOT NULL \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
                    AND table_name = 'invoice_payment_events' \
                    AND column_name = 'bull_bitcoin_settlement_id' \
                    AND data_type = 'uuid' \
@@ -1461,6 +1481,7 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('invoices', 'invoices_id_npub_owner_key'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_order_correlation_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_expected_instruction_shape_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \

@@ -43,7 +43,7 @@ use pay_service::bull_bitcoin::{
 };
 use pay_service::bull_bitcoin_settlement::{
     FallbackCategory, FiatOnlyInstructionOutcome, FiatOnlyInstructionRequest, MixedClaimBasis,
-    MixedSettlementPreparation,
+    MixedSettlementPreparation, SettlementServiceError,
 };
 use pay_service::chain_fault_harness::{
     ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
@@ -3018,6 +3018,7 @@ async fn bull_bitcoin_create_failures_never_redispatch_ambiguous_attempts() {
         fiat_percentage: 100,
         fiat_currency: "CAD",
         requested_bitcoin_sat: 25_000,
+        expected_instruction_script_len: None,
     };
     let mut connection = pool.acquire().await.unwrap();
     let row = pay_service::db::reserve_bull_bitcoin_settlement(&mut connection, &reservation)
@@ -4159,17 +4160,15 @@ async fn bull_bitcoin_mixed_uses_net_fee_basis_and_does_not_resize_a_bound_order
 }
 
 #[tokio::test]
-async fn bull_bitcoin_mixed_rejects_an_unmeasured_liquid_script_shape() {
+async fn bull_bitcoin_mixed_incompatible_liquid_shape_retains_order_without_fallback() {
     const CONFIDENTIAL_P2TR: &str = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let fake = ScriptedBullBitcoinApi::default();
-    fake.push_create(Ok(scripted_liquid_order_at(
-        Uuid::new_v4(),
-        40_000,
-        CONFIDENTIAL_P2TR.into(),
-    )))
-    .await;
+    let order_id = Uuid::new_v4();
+    let incompatible_order = scripted_liquid_order_at(order_id, 40_000, CONFIDENTIAL_P2TR.into());
+    fake.push_create(Ok(incompatible_order.clone())).await;
+    fake.push_recovery(Ok(incompatible_order)).await;
     let fixture =
         mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-script", 100_000, 40).await;
     let expected_len = mixed_claim_basis(100_000).additional_output_script_len;
@@ -4184,30 +4183,54 @@ async fn bull_bitcoin_mixed_rejects_an_unmeasured_liquid_script_shape() {
         fixture.reverse_swap_id,
         mixed_claim_basis(100_000),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
     assert!(matches!(
         result,
-        MixedSettlementPreparation::BitcoinFallback {
-            category: FallbackCategory::InvalidSplit,
-            ..
-        }
+        Err(SettlementServiceError::ProviderCreateAmbiguous)
     ));
     assert_eq!(fake.create_call_count(), 1);
-    let stored = sqlx::query_as::<_, (String, String, bool, bool)>(
+    let stored = sqlx::query_as::<_, (String, Option<String>, bool, Uuid, Option<String>, i32)>(
         "SELECT provider_state, funding_route, payer_instruction IS NULL, \
-                bull_bitcoin_order_id IS NULL \
+                bull_bitcoin_order_id, order_correlation_source, \
+                expected_instruction_script_len \
            FROM bull_bitcoin_settlements WHERE reverse_swap_id = $1",
     )
     .bind(fixture.reverse_swap_id)
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert_eq!(stored.0, "dispatch_started");
+    assert_eq!(stored.1, None);
+    assert!(stored.2);
+    assert_eq!(stored.3, order_id);
+    assert_eq!(stored.4.as_deref(), Some("provider_response"));
+    assert_eq!(usize::try_from(stored.5).unwrap(), expected_len);
+
     assert_eq!(
-        stored,
-        ("abandoned".into(), "bitcoin_fallback".into(), true, true)
+        pay_service::bull_bitcoin_settlement::run_reconciliation_once(&fixture.state).await,
+        Err(SettlementServiceError::StoredState)
     );
+    assert_eq!(fake.recovery_call_count(), 1);
+    let retry = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
+        &fixture.state,
+        fixture.reverse_swap_id,
+        mixed_claim_basis(100_000),
+    )
+    .await;
+    assert!(matches!(
+        retry,
+        Err(SettlementServiceError::ProviderCreateAmbiguous)
+    ));
+    assert_eq!(fake.create_call_count(), 1);
+    let unchanged: (String, Option<String>, Uuid) = sqlx::query_as(
+        "SELECT provider_state, funding_route, bull_bitcoin_order_id \
+           FROM bull_bitcoin_settlements WHERE reverse_swap_id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, ("dispatch_started".into(), None, order_id));
 
     cleanup_db(&pool).await;
 }
@@ -6211,6 +6234,23 @@ async fn bull_bitcoin_create_correlation_readiness_rejects_boundary_drift() {
         "ALTER TABLE bull_bitcoin_settlements RENAME CONSTRAINT \
          bull_bitcoin_settlements_order_correlation_chk_before_readiness_test TO \
          bull_bitcoin_settlements_order_correlation_chk",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query(
+        "ALTER INDEX bull_bitcoin_settlements_ambiguous_dispatch_due_idx \
+         RENAME TO bull_bitcoin_settlements_ambiguous_dispatch_due_idx_before_readiness_test",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(!readiness::schema_and_journal_ready(&runtime).await.unwrap());
+    sqlx::query(
+        "ALTER INDEX bull_bitcoin_settlements_ambiguous_dispatch_due_idx_before_readiness_test \
+         RENAME TO bull_bitcoin_settlements_ambiguous_dispatch_due_idx",
     )
     .execute(&admin)
     .await

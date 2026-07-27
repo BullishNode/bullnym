@@ -406,7 +406,8 @@ GROUP BY provider_state, bull_bitcoin_order_id IS NOT NULL, fallback_category
 ORDER BY provider_state, has_order_id, fallback_category;
 ```
 
-Migration 077 adds only local correlation provenance. Existing bound order IDs,
+Migration 077 adds only local correlation and mixed-instruction validation
+evidence, plus a partial due-work index. Existing bound order IDs,
 instructions, money fields, provider states, and timestamps remain unchanged;
 their correlation source is backfilled as `legacy_bound`. The migration does
 not redispatch, abandon, bind, fund, or query a provider order.
@@ -421,8 +422,9 @@ that both economic paths can be funded is a financial integrity case requiring
 manual accounting resolution.
 
 Start only a matching schema-077 binary. Readiness requires both correlation
-columns, the validated correlation constraint, its immutable-provenance
-trigger, and the owner-only recovery function with no runtime or PUBLIC
+columns, the expected-instruction-shape column and constraint, the partial
+ambiguous-dispatch index, the immutable-provenance trigger, and the owner-only
+recovery function with no runtime or PUBLIC
 `EXECUTE` authority. Confirm those properties before reopening admission:
 
 ```sql

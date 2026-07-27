@@ -173,7 +173,8 @@ get_created_order(key, order_id)
 The production implementation uses JSON-RPC 2.0 at the configured
 `/ak/api-orders` endpoint with `X-API-Key`. It has bounded connect/request
 timeouts and no automatic retry of `sellToBalance`. The create request uses the
-durable settlement UUID as its JSON-RPC ID and accepts only an exact echoed ID.
+durable settlement UUID as both its JSON-RPC ID and HTTP `X-Request-ID`, and
+accepts only an exact echoed JSON-RPC ID.
 Reads may retry with bounded backoff.
 
 The adapter deserializes only the fields Bullnym needs:
@@ -453,8 +454,8 @@ transaction held across HTTP:
    Bitcoin instruction for a row routed to fallback;
 3. otherwise insert/reuse `reserved` and commit it;
 4. atomically advance it to `dispatch_started` and commit **before** the one
-   `sellToBalance` call; use the settlement UUID as the JSON-RPC request ID and
-   require the response to echo it exactly;
+   `sellToBalance` call; use the settlement UUID as both the JSON-RPC request
+   ID and HTTP `X-Request-ID`, and require the response to echo it exactly;
 5. validate a successful response's order ID, network-specific instruction,
    amount, and currency;
 6. in a short transaction, revalidate the invoice/intent and bind the exact
@@ -468,8 +469,9 @@ transaction held across HTTP:
 If a correlated response contains a syntactically valid order UUID but fails
 some other validation, Bullnym durably retains that UUID as correlation
 evidence and reads that exact order with the same credential. It binds only
-after the order's currency, network, amount, and payer instruction all match
-the committed request. If no order UUID was safely received, an operator must
+after the order's currency, network, amount, payer instruction, and any
+persisted mixed-claim Liquid script shape all match the committed request. If
+no order UUID was safely received, an operator must
 correlate the provider request using the settlement UUID and use the
 schema-owner-only recovery boundary to attach the candidate UUID. That boundary
 does not bind or fund the order; ordinary reconciliation performs the same
@@ -496,7 +498,8 @@ instruction. Order creation then has two phases.
    invalid, commit the full-Bitcoin route without calling Bull Bitcoin;
 4. otherwise commit `dispatch_started`, release any database transaction, and
    call `sellToBalance` once for a `liquid` order with the fixed fiat share,
-   using the settlement UUID as the exact JSON-RPC request ID;
+   using the settlement UUID as the exact JSON-RPC request ID and HTTP
+   `X-Request-ID`;
 5. on a definite minimum or other proven pre-create rejection, mark the attempt
    abandoned and commit the full-Bitcoin route; on success, revalidate the same
    funded swap and commit `bound`; any uncertain outcome remains
@@ -796,8 +799,8 @@ without pretending to own Bull Bitcoin's blinding key.
 
 - exact sat-to-BTC JSON encoding and fiat-decimal-to-minor conversion;
 - all seven currencies and all three Bull Bitcoin input networks;
-- JSON-RPC request method, `X-API-Key`, Bitcoin-only amount, Payjoin flag, and
-  same-order read shape;
+- JSON-RPC request method, `X-API-Key`, create-only `X-Request-ID`, Bitcoin-only
+  amount, Payjoin flag, and same-order read shape;
 - minimum, maximum, authentication, malformed, wrong-ID, wrong-currency,
   timeout, and 5xx classification;
 - encryption round trip, associated-data binding, corruption failure,

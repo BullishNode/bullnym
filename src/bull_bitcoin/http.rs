@@ -54,19 +54,21 @@ impl HttpBullBitcoinApi {
         key: &ScopedApiKey,
         body: String,
         expected_response_id: &str,
+        request_id_header: Option<&str>,
         call_kind: RpcCallKind,
     ) -> Result<Value, BullBitcoinError> {
         let api_key =
             HeaderValue::from_str(key.expose()).map_err(|_| BullBitcoinError::InvalidApiKey)?;
-        let response = self
+        let mut request = self
             .client
             .post(self.endpoint.clone())
             .header(CONTENT_TYPE, "application/json")
             .header("X-API-Key", api_key)
-            .body(body)
-            .send()
-            .await
-            .map_err(classify_transport_error)?;
+            .body(body);
+        if let Some(request_id) = request_id_header {
+            request = request.header("X-Request-ID", request_id);
+        }
+        let response = request.send().await.map_err(classify_transport_error)?;
         let status = response.status();
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(BullBitcoinError::Authentication);
@@ -108,7 +110,13 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
     async fn validate_sell_to_balance(&self, key: &ScopedApiKey) -> Result<(), BullBitcoinError> {
         let body = "{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{\"version\":1}}".to_owned();
         let result = self
-            .post_rpc(key, body, "bullnym", RpcCallKind::EligibilityPreflight)
+            .post_rpc(
+                key,
+                body,
+                "bullnym",
+                None,
+                RpcCallKind::EligibilityPreflight,
+            )
             .await?;
         match result.as_object() {
             Some(object)
@@ -132,7 +140,13 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
         let body = build_create_body(request);
         let response_id = request.request_id.to_string();
         let result = self
-            .post_rpc(key, body, &response_id, RpcCallKind::CreateOrder)
+            .post_rpc(
+                key,
+                body,
+                &response_id,
+                Some(&response_id),
+                RpcCallKind::CreateOrder,
+            )
             .await
             .map_err(CreateSellFailure::from)?;
         let order_id = result
@@ -153,7 +167,7 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
             "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrder\",\"params\":{{\"orderId\":\"{order_id}\"}}}}"
         );
         let result = self
-            .post_rpc(key, body, "bullnym", RpcCallKind::ReadOrder)
+            .post_rpc(key, body, "bullnym", None, RpcCallKind::ReadOrder)
             .await?;
         let order = result.get("element").unwrap_or(&result);
         // A provider order may still be payable after its original quote or
@@ -176,7 +190,7 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
             "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrder\",\"params\":{{\"orderId\":\"{order_id}\"}}}}"
         );
         let result = self
-            .post_rpc(key, body, "bullnym", RpcCallKind::ReadOrder)
+            .post_rpc(key, body, "bullnym", None, RpcCallKind::ReadOrder)
             .await?;
         let order = result.get("element").unwrap_or(&result);
         let observation = parse_order_observation(order)?;
@@ -652,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_call_is_exactly_scoped_and_uses_x_api_key() {
+    async fn create_call_uses_exact_durable_body_and_header_correlation() {
         let (client, capture, task) = test_client().await;
         let request_id = Uuid::new_v4();
         let request = CreateSellRequest {
@@ -677,6 +691,10 @@ mod tests {
 
         let (headers, body) = capture.0.lock().await.take().unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
+        assert_eq!(
+            headers.get("x-request-id").unwrap(),
+            request_id.to_string().as_str()
+        );
         assert_eq!(body["method"], "sellToBalance");
         assert_eq!(body["id"], request_id.to_string());
         assert_eq!(body["params"]["bitcoinAmount"], 0.001);
@@ -758,6 +776,7 @@ mod tests {
 
         let (headers, body) = capture.0.lock().await.take().unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
+        assert!(headers.get("x-request-id").is_none());
         assert_eq!(body["method"], "validateSellToBalance");
         assert_eq!(body["params"], serde_json::json!({"version": 1}));
         task.abort();

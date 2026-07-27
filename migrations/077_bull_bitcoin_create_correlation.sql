@@ -56,7 +56,8 @@ $$;
 
 ALTER TABLE bull_bitcoin_settlements
     ADD COLUMN order_correlation_source TEXT,
-    ADD COLUMN order_correlated_at TIMESTAMPTZ;
+    ADD COLUMN order_correlated_at TIMESTAMPTZ,
+    ADD COLUMN expected_instruction_script_len INTEGER;
 
 -- Existing bound rows already have authoritative provider identities. Record
 -- only their local provenance; do not change any order, money, or instruction
@@ -90,7 +91,21 @@ ALTER TABLE bull_bitcoin_settlements
             AND (order_correlation_source <> 'legacy_bound'
                  OR provider_state = 'bound')
         )
+    ),
+    ADD CONSTRAINT bull_bitcoin_settlements_expected_instruction_shape_chk CHECK (
+        expected_instruction_script_len IS NULL
+        OR (
+            purpose = 'mixed'
+            AND expected_instruction_script_len BETWEEN 1 AND 10000
+        )
     );
+
+CREATE INDEX bull_bitcoin_settlements_ambiguous_dispatch_due_idx
+    ON bull_bitcoin_settlements (
+        (COALESCE(next_attempt_at, updated_at)), id
+    )
+    INCLUDE (updated_at, bull_bitcoin_order_id)
+    WHERE provider_state = 'dispatch_started' AND funding_route IS NULL;
 
 CREATE FUNCTION guard_bull_bitcoin_order_correlation()
 RETURNS TRIGGER
@@ -108,6 +123,13 @@ BEGIN
         RAISE EXCEPTION 'Bull Bitcoin order correlation time is immutable'
             USING ERRCODE = '23514',
                   CONSTRAINT = 'bull_bitcoin_settlements_correlation_time_immutable';
+    END IF;
+    IF OLD.expected_instruction_script_len IS NOT NULL
+       AND NEW.expected_instruction_script_len
+            IS DISTINCT FROM OLD.expected_instruction_script_len THEN
+        RAISE EXCEPTION 'Bull Bitcoin expected instruction shape is immutable'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'bull_bitcoin_settlements_instruction_shape_immutable';
     END IF;
     RETURN NEW;
 END
@@ -191,6 +213,8 @@ COMMENT ON COLUMN bull_bitcoin_settlements.order_correlation_source IS
     'Local provenance for a retained provider order UUID; never provider account data.';
 COMMENT ON COLUMN bull_bitcoin_settlements.order_correlated_at IS
     'First durable time at which Bullnym retained the provider order UUID.';
+COMMENT ON COLUMN bull_bitcoin_settlements.expected_instruction_script_len IS
+    'Immutable expected Liquid payer-output script length for a mixed claim; null for fiat-only and legacy rows.';
 COMMENT ON FUNCTION attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID) IS
     'Owner-only attachment of an externally correlated order UUID to an unfunded ambiguous dispatch.';
 
