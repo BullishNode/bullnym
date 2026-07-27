@@ -341,7 +341,13 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
     wallet.accept_btc = true;
     wallet.bitcoin_address = Some("bc1qstable".to_string());
     assert_eq!(
-        payer_quote_rail_availability(&wallet, None).map(|rails| rails.bitcoin),
+        payer_quote_rail_availability(
+            &wallet,
+            None,
+            Some(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
         Some(true)
     );
 
@@ -356,7 +362,81 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
     checkout.bitcoin_address = None;
     checkout.liquid_address = Some("lq1merchant".to_string());
     assert_eq!(
-        payer_quote_rail_availability(&checkout, None).map(|rails| rails.bitcoin),
+        payer_quote_rail_availability(
+            &checkout,
+            None,
+            Some(crate::provider_limits::ChainAmountEligibility::Eligible),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
+        Some(true)
+    );
+    assert_eq!(
+        payer_quote_rail_availability(
+            &checkout,
+            None,
+            Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
+        Some(false)
+    );
+}
+
+#[test]
+fn chain_minimum_only_gates_routes_that_actually_use_boltz_chain() {
+    let mut checkout = invoice_fixture();
+    checkout.pricing_mode = "fiat_fixed".to_string();
+    checkout.fiat_amount_minor = Some(1_000);
+    checkout.fiat_currency = Some("USD".to_string());
+    checkout.amount_sat = 0;
+    checkout.origin = "checkout".to_string();
+    checkout.nym_owner = Some("merchant".to_string());
+    checkout.liquid_address = Some("lq1merchant".to_string());
+    let policy = |fiat_percentage| db::InvoiceFiatSettlementPolicy {
+        invoice_id: checkout.id,
+        owner_npub: checkout.npub_owner.clone(),
+        credential_id: Uuid::new_v4(),
+        product: "payment".to_string(),
+        fiat_percentage,
+        fiat_currency: "CAD".to_string(),
+        allowed_rail_mask: FIAT_SETTLEMENT_RAIL_BITCOIN
+            | FIAT_SETTLEMENT_RAIL_LIGHTNING
+            | FIAT_SETTLEMENT_RAIL_LIQUID,
+    };
+
+    let provider_direct = policy(100);
+    assert_eq!(
+        payer_quote_rail_availability(
+            &checkout,
+            Some(&provider_direct),
+            Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
+        Some(true),
+        "a direct provider Bitcoin instruction must not borrow the Boltz chain minimum"
+    );
+
+    let mixed = policy(40);
+    assert_eq!(
+        payer_quote_rail_availability(
+            &checkout,
+            Some(&mixed),
+            Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
+        Some(false)
+    );
+    assert_eq!(
+        payer_quote_rail_availability(
+            &checkout,
+            Some(&mixed),
+            Some(crate::provider_limits::ChainAmountEligibility::Eligible),
+            false,
+        )
+        .map(|rails| rails.bitcoin),
         Some(true)
     );
 }

@@ -17945,6 +17945,105 @@ async fn payer_demand_liquid_quote_serializes_and_gets_never_mutate() {
 }
 
 #[tokio::test]
+async fn bitcoin_quote_availability_tracks_exact_chain_minimum_boundaries() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "chainminavailability";
+    let npub = create_test_user(&pool, nym).await;
+    let now = i64::try_from(auth_timestamp()).unwrap();
+
+    let state = test_state(pool.clone());
+    assert_eq!(
+        state
+            .boltz
+            .provider_limits()
+            .record_successful_chain_refresh(Some(issue84_chain_pair()), Instant::now()),
+        pay_service::provider_limits_runtime::ChainProviderLimitRefreshOutcome::Updated
+    );
+    let app = test_app(state);
+
+    for (suffix, rate_minor_per_btc, expected_amount_sat, bitcoin_available) in [
+        ("below", 4_070_170, 24_569, false),
+        ("at", 4_070_005, 24_570, true),
+        ("above", 4_069_839, 24_571, true),
+    ] {
+        let liquid_address = format!("lq1chainminimum{suffix}");
+        let blinding_key = "11".repeat(32);
+        let invoice = pay_service::db::insert_invoice(
+            &pool,
+            &pay_service::db::NewInvoice {
+                nym_owner: Some(nym),
+                public_slug: None,
+                npub_owner: &npub,
+                origin: "checkout",
+                checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+                fiat_amount_minor: Some(1_000),
+                fiat_currency: Some("USD"),
+                amount_sat: 0,
+                rate_minor_per_btc: None,
+                rate_lock_secs: 300,
+                memo: None,
+                accept_btc: false,
+                accept_ln: true,
+                accept_liquid: true,
+                bitcoin_address: None,
+                liquid_address: Some(&liquid_address),
+                liquid_blinding_key_hex: Some(&blinding_key),
+                expires_in_secs: 3_600,
+            },
+        )
+        .await
+        .unwrap();
+        let quote = pay_service::db::create_or_reuse_current_invoice_quote(
+            &pool,
+            invoice.id,
+            &pay_service::db::NewInvoiceQuoteVersion {
+                rate_minor_per_btc,
+                rate_source: "test:chain-minimum",
+                rate_observed_at_unix: now - 1,
+                rate_fetched_at_unix: now,
+                rate_fresh_until_unix: now + 300,
+                minimum_merchant_amount_sat: 1,
+                maximum_merchant_amount_sat: 1_000_000,
+            },
+        )
+        .await
+        .unwrap()
+        .quote;
+        assert_eq!(quote.merchant_amount_sat, expected_amount_sat);
+
+        let (status, body) =
+            get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["quote_rail_availability"],
+            json!({
+                "lightning": true,
+                "liquid": true,
+                "bitcoin": bitcoin_available,
+            })
+        );
+
+        if !bitcoin_available {
+            let (quote_status, quote_body) = post_json(
+                &app,
+                &format!("/api/v1/invoices/{}/quote", invoice.id),
+                json!({ "rail": "bitcoin" }),
+            )
+            .await;
+            assert_eq!(quote_status, StatusCode::BAD_REQUEST, "{quote_body}");
+            assert_eq!(quote_body["code"], "InvalidAmount");
+            assert_eq!(
+                quote_body["reason"],
+                "Bitcoin is unavailable for this amount"
+            );
+        }
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn fiat_wallet_direct_bitcoin_quote_refreshes_over_one_address_without_provider_io() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
