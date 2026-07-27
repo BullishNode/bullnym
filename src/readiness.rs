@@ -1199,6 +1199,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !permanent_public_name_invariants_present(pool).await?
         || !lnurl_private_comment_invariants_present(pool).await?
         || !invoice_quote_foundation_invariants_present(pool).await?
+        || !mixed_claim_fee_authority_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -1323,6 +1324,52 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn mixed_claim_fee_authority_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT \
+            (SELECT COUNT(*) = 4 \
+               FROM information_schema.columns \
+              WHERE table_schema = 'public' \
+                AND column_name IN ('mixed_claim_path', 'mixed_claim_fee_budget_sat') \
+                AND ((table_name = 'swap_records' \
+                      AND data_type IN ('text', 'bigint')) \
+                  OR (table_name = 'chain_swap_records' \
+                      AND data_type IN ('text', 'bigint')))) \
+        AND (SELECT COUNT(*) = 2 \
+               FROM pg_constraint \
+              WHERE conname IN ( \
+                    'swap_records_mixed_claim_fee_authority_chk', \
+                    'chain_swap_records_mixed_claim_fee_authority_chk' \
+              ) \
+                AND convalidated \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_path IS NULL%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_fee_budget_sat IS NULL%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_path = ''script''%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_fee_budget_sat > 0%') \
+        AND (SELECT COUNT(*) = 2 \
+               FROM pg_trigger \
+              WHERE tgname IN ( \
+                    'swap_records_mixed_claim_fee_authority_immutable', \
+                    'chain_swap_records_mixed_claim_fee_authority_immutable' \
+              ) \
+                AND NOT tgisinternal \
+                AND pg_get_triggerdef(oid) LIKE 'CREATE TRIGGER % BEFORE UPDATE OF mixed_claim_path, mixed_claim_fee_budget_sat ON %') \
+        AND EXISTS ( \
+              SELECT 1 \
+                FROM pg_proc function \
+                JOIN pg_namespace namespace ON namespace.oid = function.pronamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND function.proname = 'enforce_mixed_claim_fee_authority_immutability' \
+                 AND pg_get_functiondef(function.oid) LIKE '%mixed claim fee authority is immutable once captured%' \
+                 AND pg_get_functiondef(function.oid) LIKE '%OLD.claim_tx_hex IS NULL%' \
+        )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn get_paid_history_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {

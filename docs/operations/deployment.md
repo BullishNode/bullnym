@@ -455,6 +455,37 @@ stale-dispatch recovery can abandon an uncertain provider create and permit a
 second economic path. Roll forward with the schema-077 build, or stop every
 writer and restore the matching validated schema-076 backup and artifact.
 
+## Migration 078 mixed claim fee authority
+
+Apply `078_mixed_claim_fee_authority.sql` as the privileged owner of both swap
+tables, with `--set runtime_role=bullnym_app`, while every Bullnym writer is
+stopped. Never apply it as `bullnym_app`. Before applying it, verify that no
+columns with these names already exist and retain the result:
+
+```sql
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name IN ('swap_records', 'chain_swap_records')
+  AND column_name IN ('mixed_claim_path', 'mixed_claim_fee_budget_sat')
+ORDER BY table_name, column_name;
+```
+
+The expected pre-migration result is empty. Migration 078 adds nullable paired
+authority only; it does not backfill, relabel, or infer authority for any
+historical swap. The only permitted runtime transition is `NULL/NULL` to
+`script/positive-budget` before claim bytes exist. The pair is immutable after
+capture. Readiness verifies both columns, both paired constraints, and both
+immutability triggers.
+
+After startup and before funded admission, create one mixed Lightning offer and
+one mixed Bitcoin offer. For each, verify that the persisted Liquid source is
+the immutable invoice target plus the stored claim budget, the path is
+`script`, and a repeated offer read returns the identical provider obligation.
+Do not enable funded mixed tests if either authority pair is absent or if an
+exact current fee estimate differs from the stored budget; that state requires
+an explicit repricing or fee-bump policy, never an unaccounted merchant debit.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

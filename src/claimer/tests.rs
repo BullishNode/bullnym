@@ -8,6 +8,184 @@ use tokio::sync::Mutex;
 
 use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
 
+fn liquid_claim_shape_fixture(
+    swap_type: boltz_client::swaps::boltz::SwapType,
+) -> (boltz_client::swaps::liquid::LBtcSwapTx, Keypair) {
+    use boltz_client::bitcoin::hashes::{hash160, Hash};
+    use boltz_client::bitcoin::key::rand::{rngs::OsRng, thread_rng};
+    use boltz_client::bitcoin::PublicKey;
+    use boltz_client::elements::confidential::{Asset, AssetBlindingFactor, ValueBlindingFactor};
+    use boltz_client::elements::secp256k1_zkp::{Keypair as ZkKeypair, Secp256k1, SecretKey};
+    use boltz_client::elements::{
+        Address, AddressParams, AssetId, BlockHash, LockTime, OutPoint, TxOut, TxOutSecrets,
+        TxOutWitness,
+    };
+    use boltz_client::swaps::boltz::{Side, SwapTxKind, SwapType};
+    use boltz_client::swaps::liquid::{LBtcSwapScript, LBtcSwapTx};
+
+    let secp = Secp256k1::new();
+    let mut rng = OsRng;
+    let preimage = Preimage::from_vec([7; 32].to_vec()).unwrap();
+    let receiver = Keypair::new(&secp, &mut thread_rng());
+    let sender = Keypair::new(&secp, &mut thread_rng());
+    let blinder = ZkKeypair::new(&secp, &mut thread_rng());
+    let swap_script = LBtcSwapScript {
+        swap_type,
+        side: (swap_type == SwapType::Chain).then_some(Side::Claim),
+        funding_addrs: None,
+        hashlock: hash160::Hash::hash(&[7; 32]),
+        receiver_pubkey: PublicKey {
+            compressed: true,
+            inner: receiver.public_key(),
+        },
+        locktime: LockTime::from_height(200).unwrap(),
+        sender_pubkey: PublicKey {
+            compressed: true,
+            inner: sender.public_key(),
+        },
+        blinding_key: blinder,
+    };
+    assert_eq!(swap_script.hashlock, preimage.hash160);
+    let funding_spk = swap_script
+        .to_address(LiquidChain::Liquid)
+        .unwrap()
+        .script_pubkey();
+    let asset_id = AssetId::from_slice(&[0x11; 32]).unwrap();
+    let in_abf = AssetBlindingFactor::new(&mut rng);
+    let in_vbf = ValueBlindingFactor::new(&mut rng);
+    let domain = TxOutSecrets {
+        asset: asset_id,
+        asset_bf: AssetBlindingFactor::zero(),
+        value: 100_000,
+        value_bf: ValueBlindingFactor::zero(),
+    };
+    let (asset, surjection_proof) = Asset::Explicit(asset_id)
+        .blind(&mut rng, &secp, in_abf, &[domain])
+        .unwrap();
+    let message = boltz_client::elements::RangeProofMessage {
+        asset: asset_id,
+        bf: in_abf,
+    };
+    let (value, nonce, rangeproof) = boltz_client::elements::confidential::Value::Explicit(100_000)
+        .blind(
+            &secp,
+            in_vbf,
+            swap_script.blinding_key.public_key(),
+            SecretKey::new(&mut rng),
+            &funding_spk,
+            &message,
+        )
+        .unwrap();
+    let funding_utxo = TxOut {
+        script_pubkey: funding_spk,
+        value,
+        asset,
+        nonce,
+        witness: TxOutWitness {
+            surjection_proof: Some(Box::new(surjection_proof)),
+            rangeproof: Some(Box::new(rangeproof)),
+        },
+    };
+    let primary_spend = Keypair::new(&secp, &mut thread_rng());
+    let primary_blinder = ZkKeypair::new(&secp, &mut thread_rng());
+    let output_address = Address::p2wpkh(
+        &PublicKey {
+            compressed: true,
+            inner: primary_spend.public_key(),
+        },
+        Some(primary_blinder.public_key()),
+        &AddressParams::LIQUID,
+    );
+    (
+        LBtcSwapTx {
+            kind: SwapTxKind::Claim,
+            swap_script,
+            output_address,
+            additional_outputs: Vec::new(),
+            funding_outpoint: OutPoint::default(),
+            funding_utxo,
+            genesis_hash: BlockHash::all_zeros(),
+        },
+        receiver,
+    )
+}
+
+#[test]
+fn pinned_mixed_liquid_claim_shapes_cover_the_budget_constants() {
+    use boltz_client::bitcoin::key::rand::thread_rng;
+    use boltz_client::bitcoin::PublicKey;
+    use boltz_client::elements::secp256k1_zkp::{Keypair as ZkKeypair, Secp256k1};
+    use boltz_client::elements::{Address, AddressParams};
+
+    for swap_type in [
+        boltz_client::swaps::boltz::SwapType::ReverseSubmarine,
+        boltz_client::swaps::boltz::SwapType::Chain,
+    ] {
+        let (single, keys) = liquid_claim_shape_fixture(swap_type);
+        let secp = Secp256k1::new();
+        let extra_spend = Keypair::new(&secp, &mut thread_rng());
+        let extra_blinder = ZkKeypair::new(&secp, &mut thread_rng());
+        let extra = Address::p2wpkh(
+            &PublicKey {
+                compressed: true,
+                inner: extra_spend.public_key(),
+            },
+            Some(extra_blinder.public_key()),
+            &AddressParams::LIQUID,
+        );
+        for cooperative in [true, false] {
+            let one = single.size(&keys, cooperative, true).unwrap();
+            let two = single
+                .clone()
+                .with_additional_outputs(vec![(extra.clone(), 1)])
+                .size(&keys, cooperative, true)
+                .unwrap();
+            assert_eq!(two - one, 66);
+            assert_eq!(
+                two,
+                if cooperative {
+                    MIXED_COOPERATIVE_CLAIM_DISCOUNT_VBYTES
+                } else {
+                    MIXED_SCRIPT_CLAIM_DISCOUNT_VBYTES
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn mixed_claim_budget_uses_the_larger_script_shape_at_every_policy_rate() {
+    for (rate, expected_fee) in [(0.1, 29), (0.5, 144), (10.0, 2_870)] {
+        let observation = LiveLiquid::new(
+            SatPerVbyte::try_from(rate).unwrap(),
+            1_000,
+            FeeProvenance::new("mixed-quote-budget").unwrap(),
+        );
+        let decision = LiquidFeePolicy::default()
+            .decide_typed(Some(&observation), None, 1_000)
+            .unwrap();
+        assert_eq!(
+            mixed_liquid_claim_fee_budget_sat(&decision).unwrap(),
+            expected_fee
+        );
+    }
+}
+
+#[test]
+fn funded_mixed_claim_authority_pins_script_path_and_exact_budget() {
+    assert!(!mixed_claim_uses_cooperative(false, Some("script"), Some(29)).unwrap());
+    assert!(!mixed_claim_uses_cooperative(true, Some("script"), Some(29)).unwrap());
+    assert!(mixed_claim_uses_cooperative(false, None, None).unwrap());
+    assert!(!mixed_claim_uses_cooperative(true, None, None).unwrap());
+
+    assert!(validate_funded_mixed_claim_fee("test", Some("script"), Some(29), 29).is_ok());
+    assert!(validate_funded_mixed_claim_fee("test", Some("script"), Some(29), 28).is_err());
+    assert!(validate_funded_mixed_claim_fee("test", Some("script"), Some(29), 30).is_err());
+    assert!(pinned_mixed_claim_fee_budget(Some("cooperative"), Some(29)).is_err());
+    assert!(pinned_mixed_claim_fee_budget(Some("script"), None).is_err());
+    assert!(pinned_mixed_claim_fee_budget(None, Some(29)).is_err());
+}
+
 #[test]
 fn pinned_boltz_client_exposes_fixed_additional_output_options() {
     let _options = TransactionOptions::default()
@@ -16,6 +194,10 @@ fn pinned_boltz_client_exposes_fixed_additional_output_options() {
 
 #[test]
 fn mixed_percentage_is_bound_to_the_final_net_outputs() {
+    assert!(require_exact_mixed_percentage(9_900, 100, 1).is_ok());
+    assert!(require_exact_mixed_percentage(5_000, 5_000, 50).is_ok());
+    assert!(require_exact_mixed_percentage(100, 9_900, 99).is_ok());
+    assert!(require_exact_mixed_percentage(0, 10_000, 100).is_err());
     assert!(require_exact_mixed_percentage(59_400, 39_600, 40).is_ok());
     assert!(require_exact_mixed_percentage(59_399, 39_601, 40).is_err());
     assert!(require_exact_mixed_percentage(60_000, 40_000, 0).is_err());

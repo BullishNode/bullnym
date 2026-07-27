@@ -72,6 +72,8 @@ pub struct ChainCreateRequestAuthorityV1 {
     btc_height: u32,
     liquid_height: u32,
     merchant_amount_sat: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_lock_amount_sat: Option<u64>,
 }
 
 pub struct PreparedFixedCheckoutReverseCreate {
@@ -1256,15 +1258,64 @@ impl BoltzService {
         description_hash: Option<&str>,
         mrh_address: Option<&str>,
     ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
+        self.prepare_fixed_checkout_reverse_swap_with_optional_claim_fee_budget(
+            derived_key,
+            merchant_amount_sat,
+            None,
+            description,
+            description_hash,
+            mrh_address,
+        )
+    }
+
+    /// Prepare a mixed reverse swap whose Liquid lockup reserves the exact
+    /// locally-authorized two-output claim budget rather than the provider's
+    /// ordinary one-output budget.
+    pub fn prepare_fixed_checkout_reverse_swap_with_claim_fee_budget(
+        &self,
+        derived_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        claim_fee_budget_sat: u64,
+        description: Option<&str>,
+        description_hash: Option<&str>,
+        mrh_address: Option<&str>,
+    ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
+        self.prepare_fixed_checkout_reverse_swap_with_optional_claim_fee_budget(
+            derived_key,
+            merchant_amount_sat,
+            Some(claim_fee_budget_sat),
+            description,
+            description_hash,
+            mrh_address,
+        )
+    }
+
+    fn prepare_fixed_checkout_reverse_swap_with_optional_claim_fee_budget(
+        &self,
+        derived_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        claim_fee_budget_sat: Option<u64>,
+        description: Option<&str>,
+        description_hash: Option<&str>,
+        mrh_address: Option<&str>,
+    ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
             return Err(AppError::BoltzError(
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
             ));
         }
-        let quote = self
-            .provider_limits
-            .fixed_checkout_reverse_quote(merchant_amount_sat)
-            .map_err(|error| AppError::BoltzError(error.to_string()))?;
+        let quote = match claim_fee_budget_sat {
+            Some(claim_fee_budget_sat) => self
+                .provider_limits
+                .fixed_checkout_reverse_quote_with_claim_fee_budget(
+                    merchant_amount_sat,
+                    claim_fee_budget_sat,
+                ),
+            None => self
+                .provider_limits
+                .fixed_checkout_reverse_quote(merchant_amount_sat),
+        }
+        .map_err(|error| AppError::BoltzError(error.to_string()))?;
         let DerivedSwapKey { keypair, preimage } = derived_key;
         let claim_public_key = PublicKey::new(keypair.public_key());
         let address_signature = mrh_address
@@ -1481,6 +1532,42 @@ impl BoltzService {
         refund_key: DerivedSwapKey,
         amount_sat: u64,
     ) -> Result<PreparedChainCreate, AppError> {
+        self.prepare_btc_to_lbtc_chain_swap_with_server_lock(
+            claim_key, refund_key, amount_sat, None,
+        )
+        .await
+    }
+
+    /// Prepare a mixed chain swap with a source lockup grossed up for the
+    /// locally-authorized two-output Liquid claim fee. `merchant_amount_sat`
+    /// remains the immutable invoice target; only the provider's L-BTC source
+    /// amount is increased.
+    pub async fn prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(
+        &self,
+        claim_key: DerivedSwapKey,
+        refund_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        claim_fee_budget_sat: u64,
+    ) -> Result<PreparedChainCreate, AppError> {
+        let server_lock_amount_sat = merchant_amount_sat
+            .checked_add(claim_fee_budget_sat)
+            .ok_or_else(|| AppError::InvalidAmount("mixed chain amount exceeds range".into()))?;
+        self.prepare_btc_to_lbtc_chain_swap_with_server_lock(
+            claim_key,
+            refund_key,
+            merchant_amount_sat,
+            Some(server_lock_amount_sat),
+        )
+        .await
+    }
+
+    async fn prepare_btc_to_lbtc_chain_swap_with_server_lock(
+        &self,
+        claim_key: DerivedSwapKey,
+        refund_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        mixed_server_lock_amount_sat: Option<u64>,
+    ) -> Result<PreparedChainCreate, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
             return Err(AppError::BoltzError(
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
@@ -1532,6 +1619,7 @@ impl BoltzService {
         let heights = heights_result
             .map_err(|error| AppError::BoltzError(format!("chain height fetch failed: {error}")))?;
 
+        let server_lock_amount_sat = mixed_server_lock_amount_sat.unwrap_or(merchant_amount_sat);
         let request = CreateChainRequest {
             from: "BTC".to_string(),
             to: "L-BTC".to_string(),
@@ -1548,7 +1636,7 @@ impl BoltzService {
             // (what we credit), and lockup_details.amount = grossed-up payer
             // amount = user_lock_amount_sat.
             user_lock_amount: None,
-            server_lock_amount: Some(amount_sat),
+            server_lock_amount: Some(server_lock_amount_sat),
             pair_hash: Some(pair.hash.clone()),
             referral_id: None,
             webhook: self.webhook_url.as_ref().map(|url| Webhook {
@@ -1572,12 +1660,17 @@ impl BoltzService {
 
         Ok(PreparedChainCreate {
             authority: ChainCreateRequestAuthorityV1 {
-                schema_version: 1,
+                schema_version: if mixed_server_lock_amount_sat.is_some() {
+                    2
+                } else {
+                    1
+                },
                 request,
                 pair,
                 btc_height: heights.btc,
                 liquid_height: heights.lbtc,
-                merchant_amount_sat: amount_sat,
+                merchant_amount_sat,
+                server_lock_amount_sat: mixed_server_lock_amount_sat,
             },
             claim_keypair,
             refund_keypair,
@@ -1604,14 +1697,27 @@ impl BoltzService {
         } = refund_key;
         let claim_public_key = PublicKey::new(claim_keypair.public_key());
         let refund_public_key = PublicKey::new(refund_keypair.public_key());
-        if authority.schema_version != 1
-            || authority.request.from != "BTC"
+        let server_lock_amount_sat =
+            match (authority.schema_version, authority.server_lock_amount_sat) {
+                (1, None) => authority.merchant_amount_sat,
+                (2, Some(server_lock_amount_sat))
+                    if server_lock_amount_sat > authority.merchant_amount_sat =>
+                {
+                    server_lock_amount_sat
+                }
+                _ => {
+                    return Err(AppError::BoltzError(
+                        "persisted chain create authority is invalid".into(),
+                    ))
+                }
+            };
+        if authority.request.from != "BTC"
             || authority.request.to != "L-BTC"
             || authority.request.preimage_hash != preimage.sha256
             || authority.request.claim_public_key != Some(claim_public_key)
             || authority.request.refund_public_key != Some(refund_public_key)
             || authority.request.user_lock_amount.is_some()
-            || authority.request.server_lock_amount != Some(authority.merchant_amount_sat)
+            || authority.request.server_lock_amount != Some(server_lock_amount_sat)
             || authority.request.pair_hash.as_deref() != Some(authority.pair.hash.as_str())
             || authority.merchant_amount_sat == 0
             || authority.btc_height == 0
@@ -1663,7 +1769,10 @@ impl BoltzService {
             btc: authority.btc_height,
             lbtc: authority.liquid_height,
         };
-        if response.claim_details.amount == authority.merchant_amount_sat
+        let server_lock_amount_sat = authority
+            .server_lock_amount_sat
+            .unwrap_or(authority.merchant_amount_sat);
+        if response.claim_details.amount == server_lock_amount_sat
             && response.lockup_details.amount == 0
         {
             // The pinned restore wire type omits the payer-side amount while
@@ -1673,7 +1782,7 @@ impl BoltzService {
             // the explicit restore sentinel before running the ordinary exact
             // response validator. A partially populated response is refused.
             response.lockup_details.amount =
-                expected_chain_user_lock_amount(&authority.pair, authority.merchant_amount_sat)?;
+                expected_chain_user_lock_amount(&authority.pair, server_lock_amount_sat)?;
         }
 
         let (creation_terms, canonical_response_json) = validate_chain_creation_response(
@@ -1682,7 +1791,7 @@ impl BoltzService {
             preimage.hash160,
             &claim_public_key,
             &refund_public_key,
-            authority.merchant_amount_sat,
+            server_lock_amount_sat,
             &response,
         )?;
         let preimage = preimage
@@ -2670,6 +2779,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_fixed_checkout_binds_the_larger_claim_budget_before_dispatch() {
+        let master = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+        let claim_keypair = master.derive_swapkey(42).unwrap();
+        let preimage = Preimage::from_swap_key(&claim_keypair);
+        let mut response = reverse_creation_response(ReverseCreationMutation::Valid);
+        response.invoice = Some(reverse_creation_invoice(preimage.sha256, 1_059));
+        response.onchain_amount = 1_029;
+        let fixture =
+            spawn_reverse_creation_value_fixture(serde_json::to_value(&response).unwrap()).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+
+        let prepared = service
+            .prepare_fixed_checkout_reverse_swap_with_claim_fee_budget(
+                service.derive_swap_key(42).unwrap(),
+                1_000,
+                29,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (authority_json, _) = prepared.canonical_authority().unwrap();
+        let authority: Value = serde_json::from_str(&authority_json).unwrap();
+        assert_eq!(authority["merchantAmountSat"], 1_000);
+        assert_eq!(authority["claimFeeBudgetSat"], 29);
+        assert_eq!(authority["onchainAmountSat"], 1_029);
+        assert_eq!(authority["payerAmountSat"], 1_059);
+
+        let result = service
+            .submit_fixed_checkout_reverse_swap(prepared)
+            .await
+            .unwrap();
+        assert_eq!(result.payer_amount_sat, 1_059);
+        assert_eq!(result.onchain_amount_sat, 1_029);
+        assert_eq!(result.claim_fee_budget_sat, 29);
+        assert_eq!(fixture.requests()[0]["onchainAmount"], 1_029);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fixed_checkout_mrh_binds_address_signature_invoice_and_restore() {
         const MRH_ADDRESS: &str =
             "lq1qqexamplepaymentpageaddress000000000000000000000000000000000000000000";
@@ -3535,6 +3688,57 @@ mod tests {
             ]
         );
         assert_eq!(transport.remaining_steps(), 0);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_chain_authority_keeps_invoice_target_separate_from_gross_source_lock() {
+        const CLAIM_INDEX: u64 = 8_200;
+        const REFUND_INDEX: u64 = 8_201;
+        let key_source = test_service(TEST_MNEMONIC);
+        let claim_key = key_source.derive_swap_key(CLAIM_INDEX).unwrap();
+        let refund_key = key_source.derive_swap_key(REFUND_INDEX).unwrap();
+        let claim_public_key = PublicKey::new(claim_key.keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_key.keypair.public_key());
+        let (pair, heights, _, _, _, _) = live_chain_creation_fixture();
+        let response = dynamic_chain_creation_response(
+            &pair,
+            &heights,
+            claim_key.preimage.hash160,
+            claim_public_key,
+            refund_public_key,
+            25_029,
+            "bitcoin:provider-field-is-not-authority",
+        );
+        let fixture =
+            spawn_chain_transport_fixture(&pair, &heights, &response, StatusCode::OK).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        let prepared = service
+            .prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(claim_key, refund_key, 25_000, 29)
+            .await
+            .unwrap();
+        let (authority_json, authority_sha256) = prepared.canonical_authority().unwrap();
+        let authority: Value = serde_json::from_str(&authority_json).unwrap();
+        assert_eq!(authority["schemaVersion"], 2);
+        assert_eq!(authority["merchantAmountSat"], 25_000);
+        assert_eq!(authority["serverLockAmountSat"], 25_029);
+        assert_eq!(authority["request"]["serverLockAmount"], 25_029);
+
+        let restored = service
+            .restore_prepared_btc_to_lbtc_chain_swap(
+                service.derive_swap_key(CLAIM_INDEX).unwrap(),
+                service.derive_swap_key(REFUND_INDEX).unwrap(),
+                &authority_json,
+                &authority_sha256,
+            )
+            .unwrap();
+        let result = service
+            .submit_btc_to_lbtc_chain_swap(restored)
+            .await
+            .unwrap();
+        assert_eq!(result.server_lock_amount_sat, 25_029);
+        assert!(result.user_lock_amount_sat > result.server_lock_amount_sat);
+        assert_eq!(fixture.request()["serverLockAmount"], 25_029);
         fixture.shutdown().await;
     }
 }

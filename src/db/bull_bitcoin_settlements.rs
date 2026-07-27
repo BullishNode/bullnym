@@ -221,6 +221,7 @@ pub async fn capture_invoice_reverse_mixed_policy(
     tx: &mut Transaction<'_, Postgres>,
     reverse_swap_id: Uuid,
     invoice_id: Uuid,
+    mixed_claim_fee_budget_sat: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
@@ -237,7 +238,39 @@ pub async fn capture_invoice_reverse_mixed_policy(
     .bind(invoice_id)
     .execute(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    // Historical/manual fixtures predate the funded claim authority. They may
+    // still capture the immutable split policy with NULL authority so their
+    // existing dynamic claim behavior remains recoverable. Every newly
+    // payer-exposed mixed offer passes Some below.
+    let Some(budget) = mixed_claim_fee_budget_sat else {
+        return Ok(true);
+    };
+    if budget <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "mixed reverse policy has an invalid funded claim budget".into(),
+        ));
+    }
+    let authority = sqlx::query(
+        "UPDATE swap_records \
+            SET mixed_claim_path = 'script', mixed_claim_fee_budget_sat = $2 \
+          WHERE (id = $1 AND mixed_claim_path IS NULL \
+            AND mixed_claim_fee_budget_sat IS NULL) \
+             OR (id = $1 AND mixed_claim_path = 'script' \
+            AND mixed_claim_fee_budget_sat = $2)",
+    )
+    .bind(reverse_swap_id)
+    .bind(budget)
+    .execute(&mut **tx)
+    .await?;
+    if authority.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "mixed reverse policy could not bind its claim authority".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Chain-swap counterpart to [`capture_invoice_reverse_mixed_policy`].
@@ -245,6 +278,7 @@ pub async fn capture_invoice_chain_mixed_policy(
     tx: &mut Transaction<'_, Postgres>,
     chain_swap_id: Uuid,
     invoice_id: Uuid,
+    mixed_claim_fee_budget_sat: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
@@ -261,7 +295,35 @@ pub async fn capture_invoice_chain_mixed_policy(
     .bind(invoice_id)
     .execute(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    let Some(budget) = mixed_claim_fee_budget_sat else {
+        return Ok(true);
+    };
+    if budget <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "mixed chain policy has an invalid funded claim budget".into(),
+        ));
+    }
+    let authority = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET mixed_claim_path = 'script', mixed_claim_fee_budget_sat = $2 \
+          WHERE (id = $1 AND mixed_claim_path IS NULL \
+            AND mixed_claim_fee_budget_sat IS NULL) \
+             OR (id = $1 AND mixed_claim_path = 'script' \
+            AND mixed_claim_fee_budget_sat = $2)",
+    )
+    .bind(chain_swap_id)
+    .bind(budget)
+    .execute(&mut **tx)
+    .await?;
+    if authority.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "mixed chain policy could not bind its claim authority".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Capture the current Lightning Address mixed policy after a Boltz response

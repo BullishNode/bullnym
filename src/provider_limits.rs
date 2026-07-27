@@ -505,13 +505,39 @@ pub fn fixed_checkout_reverse_quote(
     now: Instant,
     maximum_age: Duration,
 ) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
+    fixed_checkout_reverse_quote_with_claim_fee_budget(
+        state,
+        merchant_amount_sat,
+        None,
+        now,
+        maximum_age,
+    )
+}
+
+/// Price a fixed checkout while reserving an explicit Liquid claim budget.
+///
+/// Ordinary one-output claims use the provider packet's claim fee. Mixed
+/// claims pass the larger locally-authorized two-output fee so adding the
+/// provider output cannot reduce the immutable merchant target. The provider
+/// fee remains a floor: callers can never use this seam to undercut the pair
+/// packet that was accepted for the request.
+pub fn fixed_checkout_reverse_quote_with_claim_fee_budget(
+    state: &ReversePairSnapshotState,
+    merchant_amount_sat: u64,
+    claim_fee_budget_sat: Option<u64>,
+    now: Instant,
+    maximum_age: Duration,
+) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
     if merchant_amount_sat == 0 {
         return Err(FixedCheckoutReverseQuoteError::MerchantAmountZero);
     }
     let snapshot = current_snapshot(state, now, maximum_age)
         .map_err(FixedCheckoutReverseQuoteError::SnapshotUnavailable)?;
+    let claim_fee_budget_sat = claim_fee_budget_sat
+        .unwrap_or(snapshot.claim_fee_sat)
+        .max(snapshot.claim_fee_sat);
     let onchain_amount_sat = merchant_amount_sat
-        .checked_add(snapshot.claim_fee_sat)
+        .checked_add(claim_fee_budget_sat)
         .ok_or(FixedCheckoutReverseQuoteError::AmountOverflow)?;
     let numerator = onchain_amount_sat
         .checked_add(snapshot.lockup_fee_sat)
@@ -566,7 +592,7 @@ pub fn fixed_checkout_reverse_quote(
         merchant_amount_sat,
         payer_amount_sat,
         onchain_amount_sat,
-        claim_fee_budget_sat: snapshot.claim_fee_sat,
+        claim_fee_budget_sat,
     })
 }
 
@@ -873,6 +899,41 @@ mod tests {
         assert_eq!(quote.payer_amount_sat(), 1_050);
         // ceil(1_050 * 0.25%) = 3; 1_050 - 3 - 27 = 1_020.
         assert_eq!(1_050 - 3 - 27, quote.onchain_amount_sat());
+    }
+
+    #[test]
+    fn mixed_fixed_checkout_reserves_the_larger_claim_budget_without_undercutting_provider_fee() {
+        let now = Instant::now();
+        let snapshot = state(
+            now,
+            100,
+            25_000_000,
+            ProviderZeroConfLimit::NotReportedByReversePairContract,
+        );
+        let mixed = fixed_checkout_reverse_quote_with_claim_fee_budget(
+            &snapshot,
+            1_000,
+            Some(29),
+            now,
+            FRESH_FOR,
+        )
+        .unwrap();
+        assert_eq!(mixed.merchant_amount_sat(), 1_000);
+        assert_eq!(mixed.claim_fee_budget_sat(), 29);
+        assert_eq!(mixed.onchain_amount_sat(), 1_029);
+        assert_eq!(mixed.payer_amount_sat(), 1_059);
+        assert_eq!(1_059 - 3 - 27, mixed.onchain_amount_sat());
+
+        let attempted_underbudget = fixed_checkout_reverse_quote_with_claim_fee_budget(
+            &snapshot,
+            1_000,
+            Some(10),
+            now,
+            FRESH_FOR,
+        )
+        .unwrap();
+        assert_eq!(attempted_underbudget.claim_fee_budget_sat(), 20);
+        assert_eq!(attempted_underbudget.onchain_amount_sat(), 1_020);
     }
 
     #[test]

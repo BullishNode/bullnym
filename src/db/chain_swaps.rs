@@ -516,6 +516,10 @@ pub struct ChainSwapRecord {
     pub claim_attempts: i32,
     pub last_claim_error: Option<String>,
     pub cooperative_refused: bool,
+    /// New mixed offers pin the script-path two-output fee before payer
+    /// exposure. Legacy/non-mixed rows keep both fields NULL.
+    pub mixed_claim_path: Option<String>,
+    pub mixed_claim_fee_budget_sat: Option<i64>,
     /// Immutable creation evidence, absent only for rows created before
     /// migration 051.
     #[sqlx(json(nullable))]
@@ -606,6 +610,7 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
      claim_fee_decision_policy_floor_sat_vb, \
      claim_fee_decision_policy_cap_sat_vb, claim_fee_decision_policy_version, \
      claim_attempts, last_claim_error, cooperative_refused, \
+     mixed_claim_path, mixed_claim_fee_budget_sat, \
      CASE WHEN pinned_pair_hash IS NULL THEN NULL ELSE jsonb_build_object( \
          'pinned_pair_hash', pinned_pair_hash, \
          'canonical_pair_quote_json', canonical_pair_quote_json, \
@@ -943,15 +948,19 @@ pub async fn latest_payable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
     amount_sat: i64,
 ) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        // Match on server_lock_amount_sat (the L-BTC settled to the merchant,
-        // = the invoice/remaining amount) NOT user_lock_amount_sat: under
-        // payer-pays gross-up pricing the user lockup is grossed up above the
-        // invoice, so matching user_lock would never find the swap and the BTC
-        // rail would silently vanish from the payment page + status API.
+        // Match the invoice target, never user_lock_amount_sat. Ordinary rows
+        // use the server lock directly; new mixed rows reserve the exact
+        // script-claim fee inside that source, so their target is source minus
+        // the immutable funded budget.
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
          WHERE invoice_id = $1 \
            AND status = 'pending' \
-           AND server_lock_amount_sat = $2 \
+           AND ( \
+                 server_lock_amount_sat = $2 \
+                 OR (mixed_claim_path = 'script' \
+                     AND mixed_claim_fee_budget_sat > 0 \
+                     AND server_lock_amount_sat - mixed_claim_fee_budget_sat = $2) \
+           ) \
          ORDER BY created_at DESC \
          LIMIT 1"
     ))
@@ -978,7 +987,12 @@ pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecut
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
          WHERE invoice_id = $1 \
            AND status = 'pending' \
-           AND server_lock_amount_sat = $2 \
+           AND ( \
+                 server_lock_amount_sat = $2 \
+                 OR (mixed_claim_path = 'script' \
+                     AND mixed_claim_fee_budget_sat > 0 \
+                     AND server_lock_amount_sat - mixed_claim_fee_budget_sat = $2) \
+           ) \
            AND EXISTS ( \
                  SELECT 1 FROM chain_swap_manifest_deliveries delivery \
                   WHERE delivery.chain_swap_id = chain_swap_records.id \

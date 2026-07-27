@@ -5918,7 +5918,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "077_bull_bitcoin_create_correlation"
+        "078_mixed_claim_fee_authority"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -6159,7 +6159,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "077_bull_bitcoin_create_correlation"
+        "078_mixed_claim_fee_authority"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -6168,11 +6168,13 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
         .unwrap();
     runtime.close().await;
     let runtime = readiness_runtime_role_test_pool(&admin).await;
-    let app = test_app(test_state(runtime));
+    let app = test_app(test_state(runtime.clone()));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
     assert_eq!(restored_body["ready"], true);
 
+    drop(app);
+    runtime.close().await;
     cleanup_db(&admin).await;
 }
 
@@ -6346,6 +6348,39 @@ async fn bull_bitcoin_create_correlation_readiness_rejects_boundary_drift() {
     .await
     .unwrap();
     assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+}
+
+#[tokio::test]
+async fn mixed_claim_fee_authority_readiness_requires_both_immutability_triggers() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    sqlx::query("DROP TRIGGER swap_records_mixed_claim_fee_authority_immutable ON swap_records")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (missing_status, missing_body) = get_path(&app, "/ready").await;
+    assert_eq!(missing_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_body["ready"], false);
+
+    sqlx::query(
+        "CREATE TRIGGER swap_records_mixed_claim_fee_authority_immutable \
+         BEFORE UPDATE OF mixed_claim_path, mixed_claim_fee_budget_sat ON swap_records \
+         FOR EACH ROW EXECUTE FUNCTION enforce_mixed_claim_fee_authority_immutability()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
+    assert_eq!(restored_body["ready"], true);
+
+    drop(app);
+    runtime.close().await;
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]
@@ -18989,7 +19024,7 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
         .unwrap() as u64;
     let provider = spawn_successful_reverse_barrier_server(
         "MIXED_FIAT_LIGHTNING_QUOTE",
-        10_073,
+        10_082,
         first_key_index,
     )
     .await;
@@ -19020,7 +19055,9 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
         "{body}"
     );
     assert_eq!(body["quote"]["merchant_amount_sat"], 10_000);
-    assert_eq!(body["instruction"]["payer_amount_sat"], 10_073);
+    // The payer source includes the script-path-safe two-output Liquid claim
+    // budget. The immutable invoice target remains exactly 10,000 sats.
+    assert_eq!(body["instruction"]["payer_amount_sat"], 10_082);
     assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
 
     let captured: (i64, i16, String) = sqlx::query_as(

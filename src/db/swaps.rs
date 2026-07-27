@@ -384,6 +384,10 @@ pub struct SwapRecord {
     /// or known refusal substrings). Future attempts skip cooperative and
     /// take the script path.
     pub cooperative_refused: bool,
+    /// New mixed offers pin the script-path two-output fee before payer
+    /// exposure. Legacy/non-mixed rows keep both fields NULL.
+    pub mixed_claim_path: Option<String>,
+    pub mixed_claim_fee_budget_sat: Option<i64>,
     /// When this swap is the Lightning offer for an invoice, the claimer
     /// records a payment event against this invoice only after the
     /// merchant-side claim succeeds. NULL for LNURL Lightning Address
@@ -427,7 +431,8 @@ const SWAP_RECORD_COLUMNS: &str =
      claim_fee_decision_policy_floor_sat_vb, \
      claim_fee_decision_policy_cap_sat_vb, claim_fee_decision_policy_version, \
      claim_path, claim_attempts, \
-     last_claim_error, cooperative_refused, invoice_id, \
+     last_claim_error, cooperative_refused, mixed_claim_path, \
+     mixed_claim_fee_budget_sat, invoice_id, \
      invoice_quote_version_id, invoice_quote_offer_id";
 
 pub async fn get_swap_by_boltz_id(

@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=77
+EXPECTED_MIGRATION_COUNT=78
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "077_bull_bitcoin_create_correlation.sql" ]] \
-  || die "unexpected migration-077 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "078_mixed_claim_fee_authority.sql" ]] \
+  || die "unexpected migration-078 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -401,7 +401,8 @@ apply_migrations() {
        || "$base" == "074_bull_bitcoin_execution_rate" \
        || "$base" == "075_fiat_only_quote_accounting" \
        || "$base" == "076_unified_wallet_backup_stream" \
-       || "$base" == "077_bull_bitcoin_create_correlation" ]]; then
+       || "$base" == "077_bull_bitcoin_create_correlation" \
+       || "$base" == "078_mixed_claim_fee_authority" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

@@ -14,11 +14,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider_limits::{
     effective_lightning_address_range, fixed_checkout_reverse_quote,
-    revalidate_lightning_address_creation, ChainAmountEligibility, ChainPairSnapshotState,
-    ChainPairValidationError, EffectiveLightningAddressRange, FixedCheckoutReverseQuote,
-    FixedCheckoutReverseQuoteError, LightningAddressCreationError, LightningAddressUnavailable,
-    ProviderAsset, ProviderLimitMode, ProviderZeroConfLimit, ReversePairObservation,
-    ReversePairSnapshotState, ReversePairSource, ReversePairValidationError,
+    fixed_checkout_reverse_quote_with_claim_fee_budget, revalidate_lightning_address_creation,
+    ChainAmountEligibility, ChainPairSnapshotState, ChainPairValidationError,
+    EffectiveLightningAddressRange, FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError,
+    LightningAddressCreationError, LightningAddressUnavailable, ProviderAsset, ProviderLimitMode,
+    ProviderZeroConfLimit, ReversePairObservation, ReversePairSnapshotState, ReversePairSource,
+    ReversePairValidationError,
 };
 
 pub const PROVIDER_LIMIT_REFRESH_CADENCE: Duration = Duration::from_secs(30);
@@ -147,6 +148,22 @@ impl ProviderLimitsRuntime {
         self.chain_snapshot().amount_eligibility(
             amount_sat,
             additional_server_lock_sat,
+            Instant::now(),
+            PROVIDER_LIMIT_MAXIMUM_AGE,
+        )
+    }
+
+    /// Fixed-checkout quote with a caller-authorized Liquid claim budget.
+    /// The provider packet's ordinary claim fee remains the minimum.
+    pub fn fixed_checkout_reverse_quote_with_claim_fee_budget(
+        &self,
+        merchant_amount_sat: u64,
+        claim_fee_budget_sat: u64,
+    ) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
+        fixed_checkout_reverse_quote_with_claim_fee_budget(
+            &self.snapshot(),
+            merchant_amount_sat,
+            Some(claim_fee_budget_sat),
             Instant::now(),
             PROVIDER_LIMIT_MAXIMUM_AGE,
         )

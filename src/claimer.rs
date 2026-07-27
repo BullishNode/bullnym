@@ -60,7 +60,7 @@ use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
-use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy};
+use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy, SatPerVbyte};
 use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
 use crate::ip_whitelist;
@@ -73,6 +73,12 @@ use crate::validators;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+/// Discounted vbytes for the pinned boltz-client two-confidential-output
+/// Liquid claim shape. Both reverse and chain claims have the same measured
+/// size; the script path is the larger safe budget used before payer exposure.
+#[cfg(test)]
+const MIXED_COOPERATIVE_CLAIM_DISCOUNT_VBYTES: usize = 247;
+const MIXED_SCRIPT_CLAIM_DISCOUNT_VBYTES: usize = 287;
 const REVERSE_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed reverse response without persisted claim bytes";
 const CHAIN_TEST_GUARD_REJECTED: &str =
@@ -3038,6 +3044,12 @@ async fn prepare_reverse_mixed_claim(
             &builder_fee,
         )
         .await?;
+        validate_funded_mixed_claim_fee(
+            "mixed reverse claim",
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+            claim_fee_sat,
+        )?;
         let net_settlement_sat = response
             .onchain_amount
             .checked_sub(claim_fee_sat)
@@ -3046,6 +3058,24 @@ async fn prepare_reverse_mixed_claim(
             .ok_or_else(|| {
                 AppError::ClaimError("mixed reverse claim has no positive net settlement".into())
             })?;
+        if let Some(budget) = pinned_mixed_claim_fee_budget(
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )? {
+            let expected_target = response
+                .onchain_amount
+                .checked_sub(budget)
+                .and_then(|target| i64::try_from(target).ok())
+                .ok_or_else(|| {
+                    AppError::ClaimError("mixed reverse funded target is invalid".into())
+                })?;
+            if expected_target != swap.amount_sat || net_settlement_sat != swap.amount_sat {
+                return Err(AppError::ClaimError(
+                    "mixed reverse funded source no longer equals invoice target plus claim fee"
+                        .into(),
+                ));
+            }
+        }
         let basis = bull_bitcoin_settlement::MixedClaimBasis {
             net_settlement_sat,
             additional_output_script_len: confidential_liquid_script_len(&output_address)?,
@@ -3152,6 +3182,12 @@ async fn prepare_chain_mixed_claim(
             &builder_fee,
         )
         .await?;
+        validate_funded_mixed_claim_fee(
+            "mixed chain claim",
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+            claim_fee_sat,
+        )?;
         let net_settlement_sat = source_total_sat
             .checked_sub(claim_fee_sat)
             .and_then(|amount| i64::try_from(amount).ok())
@@ -3159,6 +3195,24 @@ async fn prepare_chain_mixed_claim(
             .ok_or_else(|| {
                 AppError::ClaimError("mixed chain claim has no positive net settlement".into())
             })?;
+        if let Some(budget) = pinned_mixed_claim_fee_budget(
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )? {
+            let expected_target = u64::try_from(swap.server_lock_amount_sat)
+                .ok()
+                .and_then(|source| source.checked_sub(budget))
+                .and_then(|target| i64::try_from(target).ok())
+                .ok_or_else(|| {
+                    AppError::ClaimError("mixed chain funded target is invalid".into())
+                })?;
+            if net_settlement_sat != expected_target {
+                return Err(AppError::ClaimError(
+                    "mixed chain funded source no longer equals invoice target plus claim fee"
+                        .into(),
+                ));
+            }
+        }
         let basis = bull_bitcoin_settlement::MixedClaimBasis {
             net_settlement_sat,
             additional_output_script_len: confidential_liquid_script_len(&output_address)?,
@@ -3764,7 +3818,11 @@ async fn claim_swap_inner(
         //     a known cooperative-refusal error (below).
         // Once it flips, the row stays on script-path forever — no
         // ping-pong. `cooperative_refused` is a one-way flag.
-        let use_cooperative = !swap.cooperative_refused;
+        let use_cooperative = mixed_claim_uses_cooperative(
+            swap.cooperative_refused,
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )?;
         let additional_output = match mixed_preparation.as_ref() {
             Some(MixedSettlementPreparation::BullBitcoinOutput {
                 confidential_address,
@@ -5148,7 +5206,11 @@ async fn claim_chain_swap_inner(
         // expiry is interpreted by the shared evidence reducer and cannot flip
         // this execution selector by itself. One-way flag, so no
         // cooperative/script ping-pong. Mirrors claim_swap_inner (reverse path).
-        let use_cooperative = !swap.cooperative_refused;
+        let use_cooperative = mixed_claim_uses_cooperative(
+            swap.cooperative_refused,
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )?;
         let additional_output = match mixed_preparation.as_ref() {
             Some(MixedSettlementPreparation::BullBitcoinOutput {
                 confidential_address,
@@ -5702,13 +5764,68 @@ fn exact_relative_fee_sat(
     vsize: usize,
     fee_decision: &LiquidBuilderFeeDecision,
 ) -> Result<u64, AppError> {
-    let fee = vsize as f64 * fee_decision.rate().as_f64();
+    exact_liquid_fee_sat(vsize, fee_decision.rate())
+}
+
+fn exact_liquid_fee_sat(vsize: usize, rate: SatPerVbyte) -> Result<u64, AppError> {
+    let fee = vsize as f64 * rate.as_f64();
     if vsize == 0 || !fee.is_finite() || fee <= 0.0 || fee.ceil() > u64::MAX as f64 {
         return Err(AppError::ClaimError(
             "Liquid claim fee estimate is outside the supported range".into(),
         ));
     }
     Ok(fee.ceil() as u64)
+}
+
+/// Reserve enough source value for either supported mixed claim path before a
+/// payer instruction is exposed. The live claim still records and verifies
+/// its exact actual fee; this value is a payer-side source budget, not an
+/// accounting credit or tolerance.
+pub(crate) fn mixed_liquid_claim_fee_budget_sat(
+    decision: &LiquidFeeDecision,
+) -> Result<u64, AppError> {
+    exact_liquid_fee_sat(MIXED_SCRIPT_CLAIM_DISCOUNT_VBYTES, decision.rate())
+}
+
+fn pinned_mixed_claim_fee_budget(
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+) -> Result<Option<u64>, AppError> {
+    match (path, budget_sat) {
+        (None, None) => Ok(None),
+        (Some("script"), Some(budget_sat)) if budget_sat > 0 => {
+            u64::try_from(budget_sat).map(Some).map_err(|_| {
+                AppError::ClaimError("mixed claim fee budget exceeds supported range".into())
+            })
+        }
+        _ => Err(AppError::ClaimError(
+            "mixed claim has incomplete or unsupported funded fee authority".into(),
+        )),
+    }
+}
+
+fn mixed_claim_uses_cooperative(
+    cooperative_refused: bool,
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+) -> Result<bool, AppError> {
+    Ok(pinned_mixed_claim_fee_budget(path, budget_sat)?.is_none() && !cooperative_refused)
+}
+
+fn validate_funded_mixed_claim_fee(
+    context: &str,
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+    actual_fee_sat: u64,
+) -> Result<(), AppError> {
+    if let Some(budget_sat) = pinned_mixed_claim_fee_budget(path, budget_sat)? {
+        if actual_fee_sat != budget_sat {
+            return Err(AppError::ClaimError(format!(
+                "{context} requires {actual_fee_sat} sat but its payer-funded authority is {budget_sat} sat; explicit repricing or fee-bump policy is required"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn confidential_liquid_script_len(address: &str) -> Result<usize, AppError> {
@@ -5760,13 +5877,18 @@ async fn estimate_reverse_mixed_claim_fee_sat(
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
+    let use_cooperative = mixed_claim_uses_cooperative(
+        swap.cooperative_refused,
+        swap.mixed_claim_path.as_deref(),
+        swap.mixed_claim_fee_budget_sat,
+    )?;
     let options = TransactionOptions::default()
-        .with_cooperative(!swap.cooperative_refused)
+        .with_cooperative(use_cooperative)
         .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: output_address.to_owned(),
-        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        fee: liquid_claim_fee(fee_decision, use_cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
@@ -5901,14 +6023,19 @@ async fn estimate_chain_mixed_claim_fee_sat(
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
+    let use_cooperative = mixed_claim_uses_cooperative(
+        swap.cooperative_refused,
+        swap.mixed_claim_path.as_deref(),
+        swap.mixed_claim_fee_budget_sat,
+    )?;
     let options = TransactionOptions::default()
         .with_chain_claim(refund_keypair, lockup_script)
-        .with_cooperative(!swap.cooperative_refused)
+        .with_cooperative(use_cooperative)
         .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
     let params = SwapTransactionParams {
         keys: claim_keypair,
         output_address: output_address.to_owned(),
-        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        fee: liquid_claim_fee(fee_decision, use_cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
