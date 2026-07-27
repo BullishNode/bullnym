@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=75
+EXPECTED_MIGRATION_COUNT=76
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "075_fiat_only_quote_accounting.sql" ]] \
-  || die "unexpected migration-075 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "076_unified_wallet_backup_stream.sql" ]] \
+  || die "unexpected migration-076 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -283,6 +283,38 @@ assert_private_invoice_cutover_refusal() {
   echo "test-db: migration 065 refused an existing wallet invoice transactionally"
 }
 
+assert_wallet_backup_migration_owner_boundary() {
+  local database="$1"
+  local migration="$2"
+  local runtime_scratch="${database}_migration_076_runtime_role"
+  local refusal_output rollback_state
+
+  docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$runtime_scratch"
+  docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$runtime_scratch"
+  if refusal_output="$(
+    {
+      printf 'SET ROLE %s;\n' "$RUNTIME_ROLE"
+      cat "$migration"
+    } | docker exec --interactive "$CONTAINER" \
+          psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" \
+            --dbname "$runtime_scratch" --set "runtime_role=$RUNTIME_ROLE" 2>&1
+  )"; then
+    die "migration 076 unexpectedly ran as the runtime role"
+  fi
+  [[ "$refusal_output" == *"must run as the schema owner, not the runtime role"* ]] \
+    || die "migration 076 returned the wrong runtime-role failure: $refusal_output"
+  rollback_state="$(
+    docker exec "$CONTAINER" \
+      psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --username "$PG_USER" --dbname "$runtime_scratch" \
+        --command "SELECT (pg_get_constraintdef(oid) LIKE '%wallet_metadata%')::TEXT || ':' || (pg_get_constraintdef(oid) LIKE '%wallet_backup%')::TEXT FROM pg_constraint WHERE conrelid = 'wallet_backup_blobs'::REGCLASS AND conname = 'wallet_backup_blobs_stream_chk';"
+  )"
+  [[ "$rollback_state" == "true:false" ]] \
+    || die "migration 076 runtime-role refusal mutated the stream contract ($rollback_state)"
+  docker exec "$CONTAINER" dropdb --username "$PG_USER" "$runtime_scratch"
+  echo "test-db: migration 076 refused runtime-role execution transactionally"
+}
+
 apply_migrations() {
   local database="$1"
   local with_hooks="$2"
@@ -307,6 +339,9 @@ apply_migrations() {
     if [[ "$with_hooks" == "true" && "$base" == "065_private_invoice_presentations" ]]; then
       assert_private_invoice_cutover_refusal "$database" "$migration"
     fi
+    if [[ "$with_hooks" == "true" && "$base" == "076_unified_wallet_backup_stream" ]]; then
+      assert_wallet_backup_migration_owner_boundary "$database" "$migration"
+    fi
     if [[ "$base" == "053_recovery_address_commitments" \
        || "$base" == "054_fee_policy_authority" \
        || "$base" == "055_merchant_settlement_lifecycle" \
@@ -329,7 +364,8 @@ apply_migrations() {
        || "$base" == "072_mixed_invoice_blinding_key_invariant" \
        || "$base" == "073_unfunded_provider_watch" \
        || "$base" == "074_bull_bitcoin_execution_rate" \
-       || "$base" == "075_fiat_only_quote_accounting" ]]; then
+       || "$base" == "075_fiat_only_quote_accounting" \
+       || "$base" == "076_unified_wallet_backup_stream" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

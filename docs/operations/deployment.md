@@ -351,6 +351,41 @@ not run a schema-070-or-older binary after those migrations commit. Restore the
 validated immediate pre-071 backup with its matching 0.2 binary/PWA/release
 record, or repair and roll forward with a schema-075 build.
 
+## Migration 076 unified wallet backup stream
+
+Apply `076_unified_wallet_backup_stream.sql` as the privileged owner of
+`wallet_backup_blobs`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Before applying it,
+record this preflight count:
+
+```sql
+SELECT stream, COUNT(*)
+FROM wallet_backup_blobs
+GROUP BY stream
+ORDER BY stream;
+```
+
+Record and retain the result as deployment evidence; both an empty store and
+existing legacy rows are supported. Migration 076 preserves every
+`keychain_manifest` and `wallet_metadata` row under its original stream,
+author, generation, ETag, ciphertext, hash, size, and timestamps. It must never
+relabel a row: legacy and unified signing/encryption keys are independently
+derived. It must never delete a row merely to make the migration pass.
+
+The migration extends the persistence constraint with `wallet_backup` and
+reasserts exactly `SELECT`, `INSERT`, `UPDATE`, and `DELETE` for the runtime
+role. The matching Rust API accepts only `wallet_backup`; retained legacy rows
+are inaccessible through new fetch, store, or delete requests. Readiness
+verifies the coexistence constraint, table ownership separation, absence of
+PUBLIC access, and the exact runtime CRUD grant. Start only a matching
+schema-076 binary.
+
+After startup, certify one signed create, exact replay, byte-exact fetch,
+conditional update, stale-head conflict, and conditional delete using the
+coordinated mobile build. Compare the decoded ciphertext bytes, not parsed or
+re-serialized envelope fields: Bullnym owns no plaintext schema and must never
+rewrite, inject, normalize, or reorder client backup content.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

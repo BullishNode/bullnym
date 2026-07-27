@@ -54,7 +54,7 @@ session.
 | `claimer.rs` | Swap webhooks, claims, renegotiation, and chain-swap refunds |
 | `reconciler.rs` | Provider polling, slow recovery, and settlement repair |
 | `chain_watcher.rs`, `bitcoin_watcher.rs` | Liquid and Bitcoin observations |
-| `wallet_backup.rs`, `db/wallet_backups.rs` | Authenticated opaque current-object storage for independent wallet backup streams |
+| `wallet_backup.rs`, `db/wallet_backups.rs` | Authenticated opaque current-object storage for the unified wallet backup |
 | `db/` | Workflow-specific persistence and guarded state transitions |
 | `config.rs`, `readiness.rs` | Runtime policy and dependency/schema checks |
 

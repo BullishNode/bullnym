@@ -5479,7 +5479,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "075_fiat_only_quote_accounting"
+        "076_unified_wallet_backup_stream"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -5720,7 +5720,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "075_fiat_only_quote_accounting"
+        "076_unified_wallet_backup_stream"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -5778,6 +5778,33 @@ async fn wallet_backup_readiness_requires_runtime_crud_without_table_authority()
     sqlx::query(
         "ALTER TABLE wallet_backup_blobs ADD CONSTRAINT \
          wallet_backup_blobs_generation_positive_chk CHECK (generation > 0)",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE wallet_backup_blobs \
+             DROP CONSTRAINT wallet_backup_blobs_stream_chk, \
+             ADD CONSTRAINT wallet_backup_blobs_stream_chk CHECK ( \
+                 stream IN ('keychain_manifest', 'wallet_metadata') \
+             )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(runtime.clone()));
+    let (missing_unified_status, missing_unified_body) = get_path(&app, "/ready").await;
+    assert_eq!(missing_unified_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_unified_body["schema"]["ok"], false);
+    runtime.close().await;
+    sqlx::query(
+        "ALTER TABLE wallet_backup_blobs \
+             DROP CONSTRAINT wallet_backup_blobs_stream_chk, \
+             ADD CONSTRAINT wallet_backup_blobs_stream_chk CHECK ( \
+                 stream IN ('keychain_manifest', 'wallet_metadata', 'wallet_backup') \
+             )",
     )
     .execute(&admin)
     .await
@@ -39489,6 +39516,138 @@ async fn wallet_backup_authenticated_key_and_distinct_key_limits_are_exact() {
 }
 
 #[tokio::test]
+async fn wallet_backup_shared_fixture_tamper_matrix_reaches_expected_handler_errors() {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+    use pay_service::wallet_backup::{build_signing_message, BackupStream};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/wallet-backup-v1.json")).unwrap();
+    let secret = SecretKey::from_slice(
+        &hex::decode(fixture["test_only_secret_key"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let keypair = Keypair::from_secret_key(&Secp256k1::new(), &secret);
+    let npub = keypair.x_only_public_key().0.to_string();
+    assert_eq!(npub, fixture["npub"].as_str().unwrap());
+
+    let stream = BackupStream::WalletBackup;
+    let ciphertext = [0_u8, 1, 2, 3];
+    let ciphertext_hash = hex::encode(Sha256::digest(ciphertext));
+    let timestamp = auth_timestamp();
+    let baseline_message = build_signing_message(
+        "backup-store",
+        stream,
+        &npub,
+        1,
+        None,
+        Some(&ciphertext_hash),
+        ciphertext.len() as u64,
+        timestamp,
+    );
+    let baseline_signature = sign_with_keypair(&keypair, &baseline_message);
+    let baseline_body = json!({
+        "version": 1,
+        "stream": "wallet_backup",
+        "npub": npub,
+        "generation": 1,
+        "expected_etag": null,
+        "ciphertext": BASE64_STANDARD.encode(ciphertext),
+        "ciphertext_sha256": ciphertext_hash,
+        "ciphertext_bytes": ciphertext.len(),
+        "timestamp": timestamp,
+        "signature": baseline_signature,
+    });
+
+    for tamper_case in fixture["tamper_cases"].as_array().unwrap() {
+        let field = tamper_case["field"].as_str().unwrap();
+        let expected_code = tamper_case["expected_code"].as_str().unwrap();
+        let expected_status = match expected_code {
+            "BackupInvalidRequest" => StatusCode::BAD_REQUEST,
+            "BackupAuthError" => StatusCode::UNAUTHORIZED,
+            other => panic!("unexpected fixture error code: {other}"),
+        };
+
+        let (status, response) = if field == "action" {
+            let expected_etag = "11".repeat(32);
+            let wrong_action_message = build_signing_message(
+                "backup-store",
+                stream,
+                &npub,
+                1,
+                Some(&expected_etag),
+                None,
+                0,
+                timestamp,
+            );
+            let body = json!({
+                "version": 1,
+                "stream": "wallet_backup",
+                "npub": npub,
+                "generation": 1,
+                "expected_etag": expected_etag,
+                "timestamp": timestamp,
+                "signature": sign_with_keypair(&keypair, &wrong_action_message),
+            });
+            delete_json_path(&app, "/api/v1/wallet-backups", body).await
+        } else {
+            let mut body = baseline_body.clone();
+            match field {
+                "stream" => body["stream"] = Value::String("keychain_manifest".to_owned()),
+                "generation" => body["generation"] = Value::from(2),
+                "expected_etag" => body["expected_etag"] = Value::String("22".repeat(32)),
+                "ciphertext_sha256" => {
+                    let tampered_hash = "33".repeat(32);
+                    body["ciphertext_sha256"] = Value::String(tampered_hash.clone());
+                    let message = build_signing_message(
+                        "backup-store",
+                        stream,
+                        &npub,
+                        1,
+                        None,
+                        Some(&tampered_hash),
+                        ciphertext.len() as u64,
+                        timestamp,
+                    );
+                    body["signature"] = Value::String(sign_with_keypair(&keypair, &message));
+                }
+                "ciphertext_bytes" => {
+                    let tampered_bytes = ciphertext.len() as u64 + 1;
+                    body["ciphertext_bytes"] = Value::from(tampered_bytes);
+                    let message = build_signing_message(
+                        "backup-store",
+                        stream,
+                        &npub,
+                        1,
+                        None,
+                        Some(&ciphertext_hash),
+                        tampered_bytes,
+                        timestamp,
+                    );
+                    body["signature"] = Value::String(sign_with_keypair(&keypair, &message));
+                }
+                "timestamp" => body["timestamp"] = Value::from(timestamp + 1),
+                "signature" => {
+                    let signature = body["signature"].as_str().unwrap();
+                    let replacement = if signature.starts_with('0') { "1" } else { "0" };
+                    body["signature"] = Value::String(format!("{replacement}{}", &signature[1..]));
+                }
+                other => panic!("unhandled fixture tamper field: {other}"),
+            }
+            put_json(&app, "/api/v1/wallet-backups", body).await
+        };
+
+        assert_eq!(status, expected_status, "{field}: {response}");
+        assert_eq!(response["code"], expected_code, "{field}: {response}");
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit() {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine;
@@ -39501,7 +39660,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     let secret = SecretKey::from_slice(&[91; 32]).unwrap();
     let keypair = Keypair::from_secret_key(&secp, &secret);
     let npub = keypair.x_only_public_key().0.to_string();
-    let stream = BackupStream::WalletMetadata;
+    let stream = BackupStream::WalletBackup;
     let ciphertext = b"opaque-encrypted-wallet-metadata";
     let ciphertext_hash = hex::encode(Sha256::digest(ciphertext));
     let timestamp = auth_timestamp();
@@ -39517,7 +39676,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let store_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 1,
         "expected_etag": null,
@@ -39612,7 +39771,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let fetch_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "timestamp": fetch_timestamp,
         "signature": sign_with_keypair(&keypair, &fetch_message),
@@ -39642,7 +39801,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let replacement_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 2,
         "expected_etag": first_etag,
@@ -39674,7 +39833,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let delete_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 3,
         "expected_etag": replacement_etag,
@@ -39713,7 +39872,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let second_delete_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 4,
         "expected_etag": tombstone_etag,
@@ -39740,7 +39899,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     );
     let maximum_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 4,
         "expected_etag": tombstone_etag,
@@ -39758,7 +39917,7 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
     let oversized = vec![0u8; pay_service::wallet_backup::MAX_CIPHERTEXT_BYTES + 1];
     let oversized_body = json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": npub,
         "generation": 5,
         "expected_etag": maximum_etag,
@@ -39783,7 +39942,7 @@ async fn wallet_backup_persistence_serializes_first_writers_and_rejects_stale_de
 
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let stream = BackupStream::WalletMetadata;
+    let stream = BackupStream::WalletBackup;
     let stream_name = stream.as_str();
     let author = [0x71u8; 32];
     let npub = hex::encode(author);

@@ -6,7 +6,7 @@ fn signing_message_is_fixed_nul_separated_bytes() {
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let message = build_signing_message(
         STORE_ACTION,
-        BackupStream::WalletMetadata,
+        BackupStream::WalletBackup,
         npub,
         1,
         None,
@@ -16,7 +16,7 @@ fn signing_message_is_fixed_nul_separated_bytes() {
     );
     assert_eq!(message.iter().filter(|&&byte| byte == 0).count(), 8);
     let expected = concat!(
-        "bullbitcoin-wallet-backup-v1\0backup-store\0wallet_metadata\0",
+        "bullbitcoin-wallet-backup-v1\0backup-store\0wallet_backup\0",
         "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\0",
         "1\0\0ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc\0",
         "4\01700000000"
@@ -28,20 +28,20 @@ fn signing_message_is_fixed_nul_separated_bytes() {
 fn etag_is_domain_separated_and_deterministic() {
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let hash = "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc";
-    let first = compute_etag(BackupStream::WalletMetadata, npub, 1, Some(hash));
-    let second = compute_etag(BackupStream::WalletMetadata, npub, 1, Some(hash));
+    let first = compute_etag(BackupStream::WalletBackup, npub, 1, Some(hash));
+    let second = compute_etag(BackupStream::WalletBackup, npub, 1, Some(hash));
     assert_eq!(first, second);
-    assert_ne!(
-        first,
-        compute_etag(BackupStream::KeychainManifest, npub, 1, Some(hash))
+    assert_eq!(
+        hex::encode(first),
+        "f2f8423662b6f766c0f95e57e78e6a969c73a1432d5f622d19acc2fce36112ad"
     );
     assert_ne!(
         first,
-        compute_etag(BackupStream::WalletMetadata, npub, 2, Some(hash))
+        compute_etag(BackupStream::WalletBackup, npub, 2, Some(hash))
     );
     assert_ne!(
         first,
-        compute_etag(BackupStream::WalletMetadata, npub, 1, None)
+        compute_etag(BackupStream::WalletBackup, npub, 1, None)
     );
 }
 
@@ -55,13 +55,15 @@ fn canonical_hex_rejects_uppercase_and_wrong_lengths() {
 #[test]
 fn stream_json_is_closed_and_stable() {
     assert_eq!(
-        serde_json::to_string(&BackupStream::KeychainManifest).unwrap(),
-        "\"keychain_manifest\""
+        serde_json::to_string(&BackupStream::WalletBackup).unwrap(),
+        "\"wallet_backup\""
     );
     assert_eq!(
-        serde_json::from_str::<BackupStream>("\"wallet_metadata\"").unwrap(),
-        BackupStream::WalletMetadata
+        serde_json::from_str::<BackupStream>("\"wallet_backup\"").unwrap(),
+        BackupStream::WalletBackup
     );
+    assert!(serde_json::from_str::<BackupStream>("\"keychain_manifest\"").is_err());
+    assert!(serde_json::from_str::<BackupStream>("\"wallet_metadata\"").is_err());
     assert!(serde_json::from_str::<BackupStream>("\"arbitrary\"").is_err());
 }
 
@@ -69,7 +71,7 @@ fn stream_json_is_closed_and_stable() {
 fn request_shapes_reject_unknown_fields() {
     let request = serde_json::json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         "timestamp": 1_700_000_000u64,
         "signature": "00".repeat(64),
@@ -82,7 +84,7 @@ fn request_shapes_reject_unknown_fields() {
 fn store_requires_explicit_nullable_expected_etag() {
     let mut request = serde_json::json!({
         "version": 1,
-        "stream": "wallet_metadata",
+        "stream": "wallet_backup",
         "npub": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         "generation": 1,
         "expected_etag": null,
@@ -148,8 +150,7 @@ fn shared_contract_fixture_matches_rust_codec_and_bip340() {
 
     for vector in fixture["vectors"].as_array().unwrap() {
         let stream = match vector["stream"].as_str().unwrap() {
-            "keychain_manifest" => BackupStream::KeychainManifest,
-            "wallet_metadata" => BackupStream::WalletMetadata,
+            "wallet_backup" => BackupStream::WalletBackup,
             other => panic!("unexpected fixture stream: {other}"),
         };
         let generation = vector["generation"].as_u64().unwrap();
@@ -196,7 +197,7 @@ fn shared_contract_fixture_matches_rust_codec_and_bip340() {
     let initial = &fixture["vectors"][2];
     let tampered = build_signing_message(
         DELETE_ACTION,
-        BackupStream::WalletMetadata,
+        BackupStream::WalletBackup,
         npub,
         initial["generation"].as_u64().unwrap(),
         None,

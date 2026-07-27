@@ -62,8 +62,8 @@ The server also blocks names that would shadow explicit routes such as
 ## Wallet backup identities
 
 Opaque wallet backups do not reuse the account-owner `npub` contract above.
-Each closed backup stream uses a separate seed-derived BIP-340 signing key and
-an independent client-side encryption key. Requests use the dedicated
+The unified `wallet_backup` object uses one seed-derived BIP-340 signing key
+and an independent client-side encryption key. Requests use the dedicated
 `bullbitcoin-wallet-backup-v1` signing domain, bind the action, stream, key,
 generation, expected head, ciphertext commitment, size, and timestamp, and do
 not establish nym ownership or authorize another product surface. See

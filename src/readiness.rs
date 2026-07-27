@@ -1690,6 +1690,17 @@ async fn wallet_backup_storage_invariants_present(
                  ) \
             ) \
             AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = \
+                           to_regclass('public.wallet_backup_blobs') \
+                   AND constraint_info.conname = \
+                           'wallet_backup_blobs_stream_chk' \
+                   AND constraint_info.contype = 'c' \
+                   AND constraint_info.convalidated \
+                   AND pg_get_constraintdef(constraint_info.oid, TRUE) = \
+                           'CHECK (stream = ANY (ARRAY[''keychain_manifest''::text, ''wallet_metadata''::text, ''wallet_backup''::text]))' \
+            ) \
+            AND EXISTS ( \
                 SELECT 1 FROM pg_indexes \
                  WHERE schemaname = 'public' \
                    AND tablename = 'wallet_backup_blobs' \
