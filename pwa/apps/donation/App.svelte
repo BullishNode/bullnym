@@ -98,7 +98,10 @@
   function backToEntry() {
     amount = ''
     errorMsg = null
-    router.go('/')
+    // This is navigation, not invoice cancellation. Keep it available after
+    // payment evidence and follow the in-app history entry so Back does not
+    // close an externally opened tab.
+    router.backOrReplace('/')
   }
 
   async function pay() {
@@ -142,16 +145,19 @@
   const ratePrecision = $derived(currencies.find((c) => c.code === rate.currency)?.precision ?? 2)
   const hasSocialLinks = $derived(Boolean(config.website || config.twitter || config.instagram))
   const payId = $derived(router.match('/pay/:id')?.id)
+
+  $effect(() => {
+    if (payId) router.ensureBackTarget('/')
+  })
 </script>
 
-{#snippet payHeader(canCancel: boolean)}
+{#snippet payHeader(_canCancel: boolean)}
   <div class="mb-6 flex w-full justify-start">
     <button
       type="button"
       class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold"
       onclick={backToEntry}
-      disabled={!canCancel}
-      aria-label={canCancel ? 'Back' : 'Back unavailable after payment evidence'}
+      aria-label="Back to donation form"
     >
       ← Back
     </button>

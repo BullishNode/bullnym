@@ -71,6 +71,7 @@
   let loaded = $state<CachedInvoice | null>(null)
   let amountLabel = $state('')
   let loadError = $state<string | null>(null)
+  let loadAttempt = $state(0)
   let terminal = $state<TerminalState | null>(null)
   let canCancel = $state(false)
 
@@ -79,7 +80,10 @@
     // but a shared component shouldn't rely on that: guard the async
     // reconstruction so a stale id's response can't overwrite a newer load.
     let cancelled = false
+    loadAttempt
     loadState = 'loading'
+    loaded = null
+    loadError = null
     terminal = null
     canCancel = false
     const cached = getCachedInvoice(id)
@@ -118,6 +122,10 @@
   function handleTerminal(t: TerminalState) {
     canCancel = false
     terminal = t
+  }
+
+  function retryLoad() {
+    loadAttempt += 1
   }
 
   function handleEvidence(status: InvoiceStatus) {
@@ -247,7 +255,7 @@
         <div class="mx-auto max-w-lg rounded-lg bg-[#ffe0d9] p-5 text-[#8c2d28]">
           <h1 class="text-xl font-bold">Could not prepare payment.</h1>
           <p class="mt-2">{loadError}</p>
-          <div class="mt-4"><Button onclick={onExit}>Try Again</Button></div>
+          <div class="mt-4"><Button onclick={retryLoad}>Retry</Button></div>
         </div>
       {:else if loadState === 'loading' || !loaded}
         <div class="grid min-h-[60vh] place-items-center">

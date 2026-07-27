@@ -74,6 +74,7 @@
     captureLightningQuoteAuthority,
     emptyPayerQuoteState,
     formatQuoteCountdown,
+    paymentInstructionPlaceholder,
     quoteAccessibilityState,
     quoteRailPresentation,
     type QuoteRefreshTrigger,
@@ -1029,11 +1030,7 @@
       const accessibility = isFiatFixed
         ? { busy: activeQuoteAccessibility.busy, error: !!quoteState.errors[activeQuoteRail] }
         : satInstructionAccessibility(satInstructionState, activeQuoteRail, quoteNowMs)
-      if (accessibility.busy) return `Refreshing ${railLabels[activeTab]} instruction…`
-      if (accessibility.error) {
-        return `${railLabels[activeTab]} is temporarily unavailable. Choose another rail or retry.`
-      }
-      return `Preparing ${railLabels[activeTab]} instruction…`
+      return paymentInstructionPlaceholder(railLabels[activeTab], accessibility)
     }
     return activeTab === 'lightning' ? 'Loading Lightning offer…' : 'Preparing payment code…'
   })
@@ -1072,6 +1069,7 @@
   const problemView = $derived(
     view.kind === 'needs_review' || view.kind === 'resolution_pending' || view.kind === 'unknown',
   )
+  const awaitingFirstStatus = $derived(latest === null)
 </script>
 
 <div
@@ -1102,7 +1100,11 @@
     {/if}
   </div>
 
-  {#if showsRails(view)}
+  {#if awaitingFirstStatus}
+    <div class="grid min-h-64 place-items-center" role="status" aria-live="polite">
+      <BullSpinner size={72} label="Checking payment status" />
+    </div>
+  {:else if showsRails(view)}
     {#if usesPayerDemand && tabs.length === 0}
       <!-- No rail can be quoted right now (all quote_rail_availability false /
            server 503 "invoice quote is changing"). This is NOT a
