@@ -1940,13 +1940,55 @@ mod tests {
     #[test]
     fn btc_to_lbtc_pair_minimum_is_rejected_before_dispatch() {
         let (mut pair, _, _, _, _, _) = live_chain_creation_fixture();
+        pair.fees.percentage = 0.0;
+        pair.fees.miner_fees.server = 0;
         pair.limits.minimal = 25_000;
-        let error = validate_chain_create_amount(&pair, 2_000).unwrap_err();
+        pair.limits.maximal = 100_000;
+
+        let error = validate_chain_create_amount(&pair, 24_999).unwrap_err();
         assert!(is_btc_to_lbtc_below_minimum_app_error(&error));
         assert_eq!(
             error.to_string(),
             format!("invalid amount: {BTC_TO_LBTC_BELOW_MINIMUM_REASON}")
         );
+        assert!(validate_chain_create_amount(&pair, 25_000).is_ok());
+        assert!(validate_chain_create_amount(&pair, 25_001).is_ok());
+        assert!(validate_chain_create_amount(&pair, 100_000).is_ok());
+        assert!(matches!(
+            validate_chain_create_amount(&pair, 100_001),
+            Err(AppError::InvalidAmount(reason))
+                if reason == "Bitcoin amount exceeds the current provider maximum."
+        ));
+    }
+
+    #[tokio::test]
+    async fn btc_to_lbtc_below_minimum_never_reaches_height_or_create_transport() {
+        let (mut pair, _, _, _, _, _) = live_chain_creation_fixture();
+        pair.limits.minimal = 100_000;
+        let pairs = serde_json::from_value(serde_json::json!({
+            "BTC": {"L-BTC": pair},
+            "L-BTC": {}
+        }))
+        .unwrap();
+        let transport = Arc::new(ScriptedBoltzTransport::new([
+            ScriptedBoltzStep::GetChainPairs(Ok(pairs)),
+        ]));
+        let master = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+        let service =
+            BoltzService::with_transport_for_integration_tests(master, None, transport.clone());
+        let claim = service.derive_swap_key(91_001).unwrap();
+        let refund = service.derive_swap_key(91_002).unwrap();
+
+        let error = match service
+            .create_btc_to_lbtc_chain_swap(claim, refund, 25_000)
+            .await
+        {
+            Ok(_) => panic!("below-minimum chain create unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(is_btc_to_lbtc_below_minimum_app_error(&error));
+        assert_eq!(transport.calls(), vec![ScriptedBoltzCall::GetChainPairs]);
+        assert_eq!(transport.remaining_steps(), 0);
     }
 
     #[test]
