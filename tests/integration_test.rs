@@ -17963,9 +17963,9 @@ async fn bitcoin_quote_availability_tracks_exact_chain_minimum_boundaries() {
     let app = test_app(state);
 
     for (suffix, rate_minor_per_btc, expected_amount_sat, bitcoin_available) in [
-        ("below", 4_000_161, 24_999, false),
-        ("at", 4_000_000, 25_000, true),
-        ("above", 3_999_999, 25_001, true),
+        ("below", 4_070_170, 24_569, false),
+        ("at", 4_070_005, 24_570, true),
+        ("above", 4_069_839, 24_571, true),
     ] {
         let liquid_address = format!("lq1chainminimum{suffix}");
         let blinding_key = "11".repeat(32);
