@@ -1431,6 +1431,42 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'order_correlation_source' \
+                   AND data_type = 'text' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'order_correlated_at' \
+                   AND data_type = 'timestamp with time zone' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'expected_instruction_script_len' \
+                   AND data_type = 'integer' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_class index_info \
+                JOIN pg_index index_state ON index_state.indexrelid = index_info.oid \
+                 WHERE index_info.oid = to_regclass( \
+                    'public.bull_bitcoin_settlements_ambiguous_dispatch_due_idx' \
+                 ) \
+                   AND index_state.indrelid = \
+                       to_regclass('public.bull_bitcoin_settlements') \
+                   AND index_state.indisvalid \
+                   AND index_state.indisready \
+                   AND index_state.indpred IS NOT NULL \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
                    AND table_name = 'invoice_payment_events' \
                    AND column_name = 'bull_bitcoin_settlement_id' \
                    AND data_type = 'uuid' \
@@ -1444,6 +1480,8 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('invoice_fiat_settlement_policies', 'invoice_fiat_settlement_policies_invoice_owner_fkey'), \
                     ('invoices', 'invoices_id_npub_owner_key'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_order_correlation_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_expected_instruction_shape_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \
@@ -1497,6 +1535,8 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                      'bull_bitcoin_settlements_guard_swap_binding'), \
                     ('bull_bitcoin_settlements', \
                      'bull_bitcoin_settlements_guard_fiat_only_quote'), \
+                    ('bull_bitcoin_settlements', \
+                     'bull_bitcoin_settlements_guard_order_correlation'), \
                     ('swap_fiat_settlement_policies', \
                      'swap_fiat_settlement_policies_guard_insert'), \
                     ('swap_fiat_settlement_policies', \
@@ -1568,6 +1608,26 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND function_info.prosecdef \
                    AND array_to_string(function_info.proconfig, ',') LIKE \
                            '%search_path=pg_catalog, public%' \
+            ) \
+            AND to_regprocedure( \
+                'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)' \
+            ) IS NOT NULL \
+            AND NOT has_function_privilege( \
+                current_user, \
+                'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)', \
+                'EXECUTE' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                CROSS JOIN LATERAL aclexplode(COALESCE( \
+                    function_info.proacl, \
+                    acldefault('f', function_info.proowner) \
+                )) acl \
+                 WHERE function_info.oid = to_regprocedure( \
+                    'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)' \
+                 ) \
+                   AND acl.grantee = 0 \
+                   AND acl.privilege_type = 'EXECUTE' \
             ) \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \

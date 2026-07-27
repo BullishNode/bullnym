@@ -11,7 +11,13 @@ dependency health separately.
 - claim attempts, slow-recovery attempts, and next retry timestamps;
 - provider, Electrum, mempool API, and price-source latency/error rates;
 - `bull_bitcoin_fallback_committed` counts by category, selected rail, and
-  transition, with an alert on sustained `ambiguous_create` growth;
+  transition; a new `ambiguous_create` fallback after schema 077 is a policy
+  regression;
+- `bull_bitcoin_create_ambiguous` counts split by whether a candidate order ID
+  was retained, plus the depth and oldest age of `dispatch_started` rows and
+  successful `bull_bitcoin_ambiguous_create_reconciled` transitions; page when
+  a candidate-bearing row does not converge and alert when a row without a
+  candidate emits `bull_bitcoin_create_correlation_required`;
 - unfunded-provider-watch depth, oldest due age, and reconciliation delay,
   separate from funded payout-pending work;
 - `money_admission_creation_circuit_changed` state/reason transitions and its

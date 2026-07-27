@@ -392,10 +392,39 @@ fn validate_canonical_npub(value: &str) -> Result<(), BullBitcoinError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSellRequest {
+    /// Durable local correlation identity. The HTTP adapter sends this as the
+    /// JSON-RPC request ID so a response-lost create can be located without a
+    /// bearer credential or a second create call.
+    pub request_id: Uuid,
     pub currency: FiatCurrency,
     pub network: BitcoinNetwork,
     pub bitcoin_amount: BitcoinAmountSat,
     pub use_payjoin: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateSellFailure {
+    pub error: BullBitcoinError,
+    /// A syntactically valid provider order identity recovered from an
+    /// otherwise invalid create response. Its presence is correlation
+    /// evidence only; callers must not treat the order as bound until every
+    /// immutable request field and payer instruction validates.
+    pub order_id: Option<Uuid>,
+}
+
+impl CreateSellFailure {
+    pub const fn without_order_id(error: BullBitcoinError) -> Self {
+        Self {
+            error,
+            order_id: None,
+        }
+    }
+}
+
+impl From<BullBitcoinError> for CreateSellFailure {
+    fn from(error: BullBitcoinError) -> Self {
+        Self::without_order_id(error)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -444,6 +473,16 @@ pub trait BullBitcoinApi: Send + Sync {
     async fn create_sell_to_balance(
         &self,
         key: &ScopedApiKey,
+        request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, CreateSellFailure>;
+
+    /// Recover the normalized creation response for one already-known order.
+    /// This never creates an order and is used only to resolve a durable
+    /// ambiguous dispatch whose candidate order ID is already persisted.
+    async fn recover_created_sell_to_balance(
+        &self,
+        key: &ScopedApiKey,
+        order_id: Uuid,
         request: &CreateSellRequest,
     ) -> Result<CreatedSellOrder, BullBitcoinError>;
 

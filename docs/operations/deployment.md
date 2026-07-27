@@ -386,6 +386,75 @@ coordinated mobile build. Compare the decoded ciphertext bytes, not parsed or
 re-serialized envelope fields: Bullnym owns no plaintext schema and must never
 rewrite, inject, normalize, or reorder client backup content.
 
+## Migration 077 Bull Bitcoin create correlation
+
+Apply `077_bull_bitcoin_create_correlation.sql` as the privileged owner of
+`bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Take and validate a
+fresh schema-076 backup first, then record these preflight counts:
+
+```sql
+SELECT provider_state,
+       bull_bitcoin_order_id IS NOT NULL AS has_order_id,
+       fallback_category,
+       COUNT(*)
+FROM bull_bitcoin_settlements
+WHERE provider_state = 'dispatch_started'
+   OR bull_bitcoin_order_id IS NOT NULL
+   OR fallback_category = 'ambiguous_create'
+GROUP BY provider_state, bull_bitcoin_order_id IS NOT NULL, fallback_category
+ORDER BY provider_state, has_order_id, fallback_category;
+```
+
+Migration 077 adds only local correlation and mixed-instruction validation
+evidence, plus a partial due-work index. Existing bound order IDs,
+instructions, money fields, provider states, and timestamps remain unchanged;
+their correlation source is backfilled as `legacy_bound`. The migration does
+not redispatch, abandon, bind, fund, or query a provider order.
+
+An existing `abandoned` row categorized as `ambiguous_create` predates this
+boundary and is not safe to reopen automatically: its Bitcoin fallback may
+already have been exposed or funded while an unknown provider order also
+exists. Reconcile each such row against private provider correlation evidence
+and payer/chain evidence as an incident. Do not call the schema-077 attachment
+function for it, create a replacement order, or rewrite its route. Any evidence
+that both economic paths can be funded is a financial integrity case requiring
+manual accounting resolution.
+
+Start only a matching schema-077 binary. Readiness requires both correlation
+columns, the expected-instruction-shape column and constraint, the partial
+ambiguous-dispatch index, the immutable-provenance trigger, and the owner-only
+recovery function with no runtime or PUBLIC
+`EXECUTE` authority. Confirm those properties before reopening admission:
+
+```sql
+SELECT provider_state, order_correlation_source, COUNT(*)
+FROM bull_bitcoin_settlements
+WHERE provider_state = 'dispatch_started'
+   OR bull_bitcoin_order_id IS NOT NULL
+GROUP BY provider_state, order_correlation_source
+ORDER BY provider_state, order_correlation_source;
+
+SELECT has_function_privilege(
+           'bullnym_app',
+           'attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID)',
+           'EXECUTE'
+       ) AS runtime_can_attach;
+```
+
+`runtime_can_attach` must be false. A `dispatch_started` row is a financial
+integrity hold, not a Bitcoin fallback. The matching binary sends each create
+with its durable settlement UUID as JSON-RPC ID, never redispatches an
+ambiguous create, and recovers only an exact validated provider order. Follow
+[Bull Bitcoin ambiguous-create recovery](bull-bitcoin-create-correlation.md)
+when a row has no safely retained order ID. Never guess that an order is absent
+or attach an order based only on amount.
+
+After migration 077 commits, do not start a schema-076-or-older writer: its
+stale-dispatch recovery can abandon an uncertain provider create and permit a
+second economic path. Roll forward with the schema-077 build, or stop every
+writer and restore the matching validated schema-076 backup and artifact.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

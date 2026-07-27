@@ -321,6 +321,11 @@ async fn fiat_only_lnurl_instruction(
             SettlementServiceError::SourceIdentityUnavailable
             | SettlementServiceError::CredentialUnavailable,
         ) => Ok(FiatOnlyLnurlDecision::BitcoinFallback),
+        Err(SettlementServiceError::ProviderCreateAmbiguous) => {
+            // Public LNURL callers must not learn that the recipient uses a
+            // settlement provider or that an operator reconciliation exists.
+            Err(AppError::MoneyAdmissionUnavailable)
+        }
         Err(error) => Err(AppError::ServiceUnavailable(format!(
             "fiat settlement is temporarily unavailable: {error}"
         ))),
