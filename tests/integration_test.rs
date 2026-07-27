@@ -2913,7 +2913,7 @@ async fn fiat_only_lnurl_comments_are_accepted_and_discarded_on_both_rails() {
     let callback = metadata["callback"].as_str().unwrap();
     let metadata_origin = "https://test.example.com";
     let callback_path = callback
-        .strip_prefix(&metadata_origin)
+        .strip_prefix(metadata_origin)
         .expect("callback uses configured metadata origin");
 
     let comment = "private settlement probe";
