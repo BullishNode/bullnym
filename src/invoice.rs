@@ -3345,19 +3345,6 @@ async fn ensure_versioned_bitcoin_chain_offer(
     requested_quote: &db::InvoiceQuoteVersion,
     capture_mixed_policy: bool,
 ) -> Result<(Uuid, BitcoinChainOffer), AppError> {
-    let liquid_address = invoice.liquid_address.as_deref().ok_or_else(|| {
-        AppError::InvalidAmount("invoice does not support Bitcoin-to-Liquid payment".into())
-    })?;
-    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
-        .map_err(|error| {
-            AppError::BoltzError(format!(
-                "chain swap invoice has an invalid Liquid destination: {error}"
-            ))
-        })?;
-    let nym = invoice.nym_owner.as_deref().ok_or_else(|| {
-        AppError::InvalidAmount("invoice does not support a Bitcoin chain offer".into())
-    })?;
-
     let mut lookup_connection = state.db.acquire().await?;
     if let ReusableVersionedBitcoinOffer::Ready { offer_id, offer } =
         reusable_versioned_bitcoin_chain_offer(&mut lookup_connection, invoice, requested_quote)
@@ -3366,6 +3353,34 @@ async fn ensure_versioned_bitcoin_chain_offer(
         return Ok((offer_id, offer));
     }
     drop(lookup_connection);
+    // Reject a new offer before touching recovery ownership or provider
+    // mutation. Existing payer-exposable offers returned above remain
+    // replayable regardless of current limit freshness.
+    match state
+        .boltz
+        .provider_limits()
+        .bitcoin_chain_amount_eligibility(
+            u64::try_from(requested_quote.merchant_amount_sat).map_err(|_| {
+                AppError::InvalidAmount("Bitcoin is unavailable for this amount".into())
+            })?,
+            0,
+        ) {
+        crate::provider_limits::ChainAmountEligibility::Eligible => {}
+        crate::provider_limits::ChainAmountEligibility::BelowMinimum
+        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => {
+            return Err(AppError::InvalidAmount(
+                "Bitcoin is unavailable for this amount".into(),
+            ));
+        }
+        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
+            return Err(AppError::ServiceUnavailable(
+                "Bitcoin is temporarily unavailable; retry shortly".into(),
+            ));
+        }
+    }
+    let nym = invoice.nym_owner.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support a Bitcoin chain offer".into())
+    })?;
 
     state
         .admission
@@ -3449,31 +3464,15 @@ async fn ensure_versioned_bitcoin_chain_offer(
         }
         ReusableVersionedBitcoinOffer::Missing => {}
     }
-    // Only a new provider offer is subject to the current chain-limit
-    // snapshot. Durable payer-exposable offers above remain replayable even
-    // if the provider later changes its limits or the snapshot is stale.
-    match state
-        .boltz
-        .provider_limits()
-        .bitcoin_chain_amount_eligibility(
-            u64::try_from(quote.merchant_amount_sat).map_err(|_| {
-                AppError::InvalidAmount("Bitcoin is unavailable for this amount".into())
-            })?,
-            0,
-        ) {
-        crate::provider_limits::ChainAmountEligibility::Eligible => {}
-        crate::provider_limits::ChainAmountEligibility::BelowMinimum
-        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => {
-            return Err(AppError::InvalidAmount(
-                "Bitcoin is unavailable for this amount".into(),
-            ));
-        }
-        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
-            return Err(AppError::ServiceUnavailable(
-                "Bitcoin is temporarily unavailable; retry shortly".into(),
-            ));
-        }
-    }
+    let liquid_address = invoice.liquid_address.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support Bitcoin-to-Liquid payment".into())
+    })?;
+    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
+        .map_err(|error| {
+            AppError::BoltzError(format!(
+                "chain swap invoice has an invalid Liquid destination: {error}"
+            ))
+        })?;
     if quote.expires_at_unix <= unix_now().saturating_add(120) {
         return Err(AppError::ServiceUnavailable(
             "invoice quote is near expiry; refresh after the countdown".into(),
