@@ -1,9 +1,8 @@
 # Opaque Wallet Backups
 
-Bullnym stores one current client-encrypted object for each stream-specific
-wallet key. It cannot decrypt the object and does not accept plaintext wallet
-metadata. This is a best-effort convenience service, not fund-recovery
-authority.
+Bullnym stores one current client-encrypted wallet-backup object. It cannot
+decrypt the object and does not accept plaintext wallet metadata. This is a
+best-effort convenience service, not fund-recovery authority.
 
 ## Routes
 
@@ -13,9 +12,20 @@ authority.
 | `PUT` | `/api/v1/wallet-backups` | Conditionally create or replace an object. |
 | `DELETE` | `/api/v1/wallet-backups` | Conditionally delete an object and retain a short tombstone. |
 
-The closed stream values are `keychain_manifest` and `wallet_metadata`. Each
-stream must use its own seed-derived signing key. Identifiers are JSON fields,
-not URL components, so ordinary access logs do not contain public keys.
+The only stream value is `wallet_backup`, backed by one seed-derived signing
+key. The encrypted payload owns its internal sections; those sections are not
+server-visible streams. Identifiers are JSON fields, not URL components, so
+ordinary access logs do not contain public keys.
+
+Migration 076 may retain pre-release `keychain_manifest` and `wallet_metadata`
+database rows byte-for-byte for operator recovery. They are not accepted by
+this API and are never relabeled as unified backups because their keys were
+derived independently.
+
+Bullnym decodes canonical base64 only to enforce the byte limit and verify the
+declared SHA-256 commitment. It stores those ciphertext bytes unchanged and
+returns their canonical base64 encoding. It never parses, rewraps, injects,
+normalizes, or reorders the encrypted client envelope.
 
 ## Authentication
 
@@ -56,7 +66,7 @@ Request:
 ```json
 {
   "version": 1,
-  "stream": "wallet_metadata",
+  "stream": "wallet_backup",
   "npub": "<64 lowercase hex>",
   "timestamp": 1700000000,
   "signature": "<128 lowercase hex>"
@@ -88,7 +98,7 @@ ETag, and update time.
 ```json
 {
   "version": 1,
-  "stream": "wallet_metadata",
+  "stream": "wallet_backup",
   "npub": "<64 lowercase hex>",
   "generation": 8,
   "expected_etag": "<current ETag or null for generation 1>",
@@ -119,7 +129,7 @@ resulting `etag`.
 ```json
 {
   "version": 1,
-  "stream": "wallet_metadata",
+  "stream": "wallet_backup",
   "npub": "<64 lowercase hex>",
   "generation": 9,
   "expected_etag": "<current ETag>",

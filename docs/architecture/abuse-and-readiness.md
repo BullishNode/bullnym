@@ -15,7 +15,7 @@ external calls, webhooks, and signed write paths.
 | Checkout creation | Protect surface descriptor cursor allocation and eager offer creation. |
 | Invoice create/list/status | Protect signed dashboard and public polling surfaces. |
 | Webhook | Bound webhook-bombing from a single source. |
-| Opaque wallet backups | Bound fetches and mutations per source, mutations per authenticated stream key, distinct keys per source, object size, and global live ciphertext. |
+| Opaque wallet backups | Bound fetches and mutations per source, mutations per authenticated signing key, distinct keys per source, object size, and global live ciphertext. |
 
 ## LUD-22 Descriptor Protection
 

@@ -1,4 +1,4 @@
-//! Opaque current-object storage for seed-derived wallet backup streams.
+//! Opaque current-object storage for the unified seed-derived wallet backup.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -39,15 +39,13 @@ const DELETE_ACTION: &str = "backup-delete";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupStream {
-    KeychainManifest,
-    WalletMetadata,
+    WalletBackup,
 }
 
 impl BackupStream {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::KeychainManifest => "keychain_manifest",
-            Self::WalletMetadata => "wallet_metadata",
+            Self::WalletBackup => "wallet_backup",
         }
     }
 }

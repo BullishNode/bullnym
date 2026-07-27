@@ -313,7 +313,8 @@ for later_migration in \
   migrations/072_mixed_invoice_blinding_key_invariant.sql \
   migrations/073_unfunded_provider_watch.sql \
   migrations/074_bull_bitcoin_execution_rate.sql \
-  migrations/075_fiat_only_quote_accounting.sql; do
+  migrations/075_fiat_only_quote_accounting.sql \
+  migrations/076_unified_wallet_backup_stream.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \
