@@ -79,6 +79,21 @@ it values each output independently from its exact durable first-observation
 time. Provider-backed Lightning and Bitcoin instructions, by contrast, bind
 their independently observable swap rows to one quote version and offer ID.
 
+`GET /api/v1/invoices/:id/status` keeps `quote_rail_availability` as the
+existing three booleans. For a provider-backed Bitcoin chain swap, `bitcoin`
+is amount-aware: it is true only when the current quote's merchant satoshi
+amount is inside a fresh, validated BTC-to-L-BTC chain-pair range. The minimum
+is inclusive. A missing, invalid, future-dated, or stale chain-pair observation
+fails closed until the background refresh succeeds. This check does not reuse
+Lightning reverse-swap limits and does not affect a wallet's direct Bitcoin
+address or an already-valid crypto fallback caused by a downstream conversion
+minimum.
+
+The selected-rail POST repeats the same cached admission check before any key
+allocation or provider mutation. A deterministically out-of-range amount gets
+the generic `InvalidAmount` response `Bitcoin is unavailable for this amount`;
+provider details and merchant settlement policy are not disclosed.
+
 Money first observed before the quote's exclusive expiry boundary keeps that
 quote rate only for the sats actually observed. Money first observed at or
 after expiry never reuses the expired rate. Bullnym records a separate,

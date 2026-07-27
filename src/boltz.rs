@@ -947,6 +947,17 @@ impl BoltzService {
             .map_err(|_| ())
     }
 
+    async fn fetch_btc_to_lbtc_chain_pair(&self) -> Result<Option<ChainPair>, ()> {
+        let Some(transport) = self.transport.as_deref() else {
+            return Err(());
+        };
+        transport
+            .get_chain_pairs()
+            .await
+            .map(|pairs| pairs.get_btc_to_lbtc_pair())
+            .map_err(|_| ())
+    }
+
     /// Perform the startup refresh and timestamp it only after the response
     /// future has completed. Error details are deliberately not retained.
     pub async fn refresh_provider_limits(
@@ -955,6 +966,14 @@ impl BoltzService {
         let result = self.fetch_btc_to_lbtc_reverse_pair().await;
         self.provider_limits
             .record_fetch_result(result, std::time::Instant::now())
+    }
+
+    pub async fn refresh_chain_provider_limits(
+        &self,
+    ) -> crate::provider_limits_runtime::ChainProviderLimitRefreshOutcome {
+        let result = self.fetch_btc_to_lbtc_chain_pair().await;
+        self.provider_limits
+            .record_chain_fetch_result(result, std::time::Instant::now())
     }
 
     /// Spawn the sole periodic reverse-pair refresh loop for this service.
@@ -972,6 +991,30 @@ impl BoltzService {
                 move || {
                     let service = std::sync::Arc::clone(&fetch_service);
                     async move { service.fetch_btc_to_lbtc_reverse_pair().await }
+                },
+                std::time::Instant::now,
+            )
+            .await;
+        })
+    }
+
+    /// Spawn the exact BTC -> L-BTC chain-pair refresh. It is independent of
+    /// reverse limits so a failure on one provider endpoint cannot authorize
+    /// amounts for the other.
+    pub fn spawn_chain_provider_limits_refresh(
+        self: &std::sync::Arc<Self>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = std::sync::Arc::clone(self);
+        let runtime = self.provider_limits.clone();
+        tokio::spawn(async move {
+            let fetch_service = std::sync::Arc::clone(&service);
+            crate::provider_limits_runtime::run_periodic_chain_refresh(
+                runtime,
+                cancel,
+                move || {
+                    let service = std::sync::Arc::clone(&fetch_service);
+                    async move { service.fetch_btc_to_lbtc_chain_pair().await }
                 },
                 std::time::Instant::now,
             )

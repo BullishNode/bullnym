@@ -379,6 +379,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    match boltz_service.refresh_chain_provider_limits().await {
+        pay_service::provider_limits_runtime::ChainProviderLimitRefreshOutcome::Updated => {
+            tracing::info!(event = "chain_provider_limits_startup_updated");
+        }
+        pay_service::provider_limits_runtime::ChainProviderLimitRefreshOutcome::Invalid(error) => {
+            tracing::error!(
+                event = "chain_provider_limits_startup_invalid",
+                reason = %error,
+                "Bitcoin chain payer availability starts closed"
+            );
+        }
+        pay_service::provider_limits_runtime::ChainProviderLimitRefreshOutcome::FetchFailed => {
+            tracing::warn!(
+                event = "chain_provider_limits_startup_failed",
+                "Bitcoin chain payer availability starts closed until a refresh succeeds"
+            );
+        }
+    }
 
     // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
     let whitelist = ip_whitelist::IpWhitelist::parse(&config.rate_limit.ip_whitelist)
@@ -646,6 +664,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .spawn_background(state.admission.clone(), cancel.clone());
     let _provider_limits_refresh_task = boltz.spawn_provider_limits_refresh(cancel.clone());
+    let _chain_provider_limits_refresh_task =
+        boltz.spawn_chain_provider_limits_refresh(cancel.clone());
     tracing::info!(
         event = "provider_limits_refresh_started",
         cadence_secs =

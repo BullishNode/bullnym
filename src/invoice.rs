@@ -1729,6 +1729,13 @@ pub async fn status(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
+    let current_quote_amount_sat = if inv.pricing_mode == "fiat_fixed" {
+        db::current_invoice_quote(&mut *snapshot, inv.id)
+            .await?
+            .map(|quote| quote.merchant_amount_sat)
+    } else {
+        Some(remaining_sat)
+    };
     let sat_fixed_instructions_payable =
         sat_fixed_payment_instructions_are_payable(&inv) && fiat_settlement_policy.is_none();
     let lightning_offer = if sat_fixed_instructions_payable {
@@ -1782,8 +1789,22 @@ pub async fn status(
         .as_ref()
         .filter(|_| sat_fixed_instructions_payable && remaining_sat > 0)
         .map(|_| remaining_sat);
-    let quote_rail_availability =
-        payer_quote_rail_availability(&inv, fiat_settlement_policy.as_ref());
+    let bitcoin_chain_eligibility = Some(
+        current_quote_amount_sat
+            .and_then(|amount| u64::try_from(amount).ok())
+            .map(|amount| {
+                state
+                    .boltz
+                    .provider_limits()
+                    .bitcoin_chain_amount_eligibility(amount)
+            })
+            .unwrap_or(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
+    );
+    let quote_rail_availability = payer_quote_rail_availability(
+        &inv,
+        fiat_settlement_policy.as_ref(),
+        bitcoin_chain_eligibility,
+    );
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -1997,9 +2018,16 @@ pub async fn payer_demand_quote(
             "sat-fixed invoices retain the remaining-aware status and Lightning offer flow".into(),
         ));
     }
-    validate_payer_quote_rail(&invoice, policy.as_ref(), request.rail)?;
+    validate_payer_quote_rail(&invoice, policy.as_ref(), request.rail, None)?;
     let response = if invoice.pricing_mode == "fiat_fixed" {
         let quote = resolve_current_fiat_quote(&state, &invoice).await?;
+        validate_payer_quote_amount(
+            &state,
+            &invoice,
+            policy.as_ref(),
+            request.rail,
+            quote.merchant_amount_sat,
+        )?;
         let instruction =
             versioned_instruction_for_rail(&state, &invoice, &quote, policy.as_ref(), request.rail)
                 .await?;
@@ -2020,6 +2048,7 @@ pub async fn payer_demand_quote(
                 "invoice has no remaining payable amount".into(),
             ));
         }
+        validate_payer_quote_amount(&state, &invoice, policy.as_ref(), request.rail, amount_sat)?;
         let policy = policy.as_ref().ok_or_else(|| {
             AppError::DbError("sat-fixed payer demand is missing its captured policy".into())
         })?;
@@ -2116,6 +2145,7 @@ async fn replay_pending_fiat_only_payer_quote(
 fn payer_quote_rail_availability(
     invoice: &db::Invoice,
     policy: Option<&db::InvoiceFiatSettlementPolicy>,
+    bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
 ) -> Option<PayerQuoteRailAvailability> {
     if invoice.pricing_mode != "fiat_fixed" && policy.is_none() {
         return None;
@@ -2150,15 +2180,32 @@ fn payer_quote_rail_availability(
         availability.lightning &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIGHTNING != 0;
         availability.liquid &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIQUID != 0;
     }
+    if bitcoin_rail_uses_boltz_chain(invoice, policy) && bitcoin_chain_eligibility.is_some() {
+        availability.bitcoin &= matches!(
+            bitcoin_chain_eligibility,
+            Some(crate::provider_limits::ChainAmountEligibility::Eligible)
+        );
+    }
     Some(availability)
+}
+
+fn bitcoin_rail_uses_boltz_chain(
+    invoice: &db::Invoice,
+    policy: Option<&db::InvoiceFiatSettlementPolicy>,
+) -> bool {
+    let mixed_policy = policy.is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage));
+    let wallet_direct_bitcoin = invoice.origin == "wallet" && !mixed_policy;
+    let provider_direct_fiat = policy.is_some_and(|policy| policy.fiat_percentage == 100);
+    !wallet_direct_bitcoin && !provider_direct_fiat
 }
 
 fn validate_payer_quote_rail(
     invoice: &db::Invoice,
     policy: Option<&db::InvoiceFiatSettlementPolicy>,
     rail: PayerQuoteRail,
+    bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
 ) -> Result<(), AppError> {
-    let availability = payer_quote_rail_availability(invoice, policy)
+    let availability = payer_quote_rail_availability(invoice, policy, bitcoin_chain_eligibility)
         .ok_or_else(|| AppError::InvalidAmount("invoice does not support fiat quotes".into()))?;
     match rail {
         PayerQuoteRail::Lightning if !availability.lightning => Err(AppError::InvalidAmount(
@@ -2171,6 +2218,36 @@ fn validate_payer_quote_rail(
             "invoice does not accept Bitcoin".into(),
         )),
         _ => Ok(()),
+    }
+}
+
+fn validate_payer_quote_amount(
+    state: &AppState,
+    invoice: &db::Invoice,
+    policy: Option<&db::InvoiceFiatSettlementPolicy>,
+    rail: PayerQuoteRail,
+    amount_sat: i64,
+) -> Result<(), AppError> {
+    if rail != PayerQuoteRail::Bitcoin || !bitcoin_rail_uses_boltz_chain(invoice, policy) {
+        return Ok(());
+    }
+    let amount_sat = u64::try_from(amount_sat)
+        .map_err(|_| AppError::InvalidAmount("Bitcoin is unavailable for this amount".into()))?;
+    match state
+        .boltz
+        .provider_limits()
+        .bitcoin_chain_amount_eligibility(amount_sat)
+    {
+        crate::provider_limits::ChainAmountEligibility::Eligible => Ok(()),
+        crate::provider_limits::ChainAmountEligibility::BelowMinimum
+        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => Err(
+            AppError::InvalidAmount("Bitcoin is unavailable for this amount".into()),
+        ),
+        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
+            Err(AppError::ServiceUnavailable(
+                "Bitcoin is temporarily unavailable; retry shortly".into(),
+            ))
+        }
     }
 }
 

@@ -16,6 +16,10 @@ dependency health separately.
   separate from funded payout-pending work;
 - `money_admission_creation_circuit_changed` state/reason transitions and its
   monotonic provider-creation transition count;
+- `chain_provider_limits_startup_*` and `chain_provider_limits_refresh_*`
+  outcomes. Alert when the exact BTC-to-L-BTC chain snapshot remains missing,
+  invalid, or stale long enough to hide Bitcoin from otherwise payable
+  checkouts; do not substitute reverse-swap limits;
 - Bitcoin and Liquid direct-watcher recent/historical backlog counts,
   oldest-due timestamps, and lag from each frozen lane-start log;
 - descriptor allocation failures and uniqueness violations;
