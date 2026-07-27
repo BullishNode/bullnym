@@ -5,6 +5,7 @@
 - [Deployment](deployment.md)
 - [Deployment certification preflight](deployment-certification.md)
 - [Monitoring](monitoring.md)
+- [Bull Bitcoin missing-order audit](bull-bitcoin-provider-missing.md)
 - [Swap recovery runbook](runbooks/stuck-swaps.md)
 - [nginx example](nginx.conf.example)
 

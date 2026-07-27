@@ -22,6 +22,10 @@ request_timeout_ms = 10000
 reconcile_interval_secs = 30
 reconcile_batch_size = 50
 retry_backoff_cap_secs = 900
+# A bound order becomes a persistent-missing integrity hold only after both
+# this many consecutive authenticated 404s and this many elapsed seconds.
+provider_not_found_escalation_attempts = 3
+provider_not_found_escalation_secs = 120
 # Expired/cancelled, never-funded fiat-only orders are retained as a derived
 # low-frequency watch instead of active merchant work.
 late_payment_watch_interval_secs = 3600

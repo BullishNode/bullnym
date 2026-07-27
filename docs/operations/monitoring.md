@@ -20,6 +20,10 @@ dependency health separately.
   candidate emits `bull_bitcoin_create_correlation_required`;
 - unfunded-provider-watch depth, oldest due age, and reconciliation delay,
   separate from funded payout-pending work;
+- exact-order provider reads split into transient failures, temporary
+  authenticated `NotFound`, persistent-missing escalations, and successful
+  recovery; alert on persistent holds and page immediately when any such hold
+  has local money evidence;
 - `money_admission_creation_circuit_changed` state/reason transitions and its
   monotonic provider-creation transition count;
 - `chain_provider_limits_startup_*` and `chain_provider_limits_refresh_*`

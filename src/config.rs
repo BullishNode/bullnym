@@ -405,6 +405,8 @@ const DEFAULT_BULL_BITCOIN_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_BULL_BITCOIN_RECONCILE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_BULL_BITCOIN_RECONCILE_BATCH_SIZE: u32 = 50;
 const DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS: u64 = 900;
+const DEFAULT_BULL_BITCOIN_PROVIDER_NOT_FOUND_ESCALATION_ATTEMPTS: u32 = 3;
+const DEFAULT_BULL_BITCOIN_PROVIDER_NOT_FOUND_ESCALATION_SECS: u64 = 120;
 const DEFAULT_BULL_BITCOIN_LATE_PAYMENT_WATCH_INTERVAL_SECS: u64 = 3_600;
 const DEFAULT_BULL_BITCOIN_LATE_PAYMENT_RETENTION_SECS: u64 = 2_592_000;
 
@@ -432,6 +434,14 @@ fn default_bull_bitcoin_retry_backoff_cap_secs() -> u64 {
     DEFAULT_BULL_BITCOIN_RETRY_BACKOFF_CAP_SECS
 }
 
+fn default_bull_bitcoin_provider_not_found_escalation_attempts() -> u32 {
+    DEFAULT_BULL_BITCOIN_PROVIDER_NOT_FOUND_ESCALATION_ATTEMPTS
+}
+
+fn default_bull_bitcoin_provider_not_found_escalation_secs() -> u64 {
+    DEFAULT_BULL_BITCOIN_PROVIDER_NOT_FOUND_ESCALATION_SECS
+}
+
 fn default_bull_bitcoin_late_payment_watch_interval_secs() -> u64 {
     DEFAULT_BULL_BITCOIN_LATE_PAYMENT_WATCH_INTERVAL_SECS
 }
@@ -455,6 +465,14 @@ pub struct BullBitcoinConfig {
     pub reconcile_batch_size: u32,
     #[serde(default = "default_bull_bitcoin_retry_backoff_cap_secs")]
     pub retry_backoff_cap_secs: u64,
+    /// Consecutive authenticated exact-order 404s required before a bound
+    /// order enters the persistent-missing integrity hold.
+    #[serde(default = "default_bull_bitcoin_provider_not_found_escalation_attempts")]
+    pub provider_not_found_escalation_attempts: u32,
+    /// Minimum wall-clock duration of the same consecutive 404 streak. Both
+    /// this duration and the attempt threshold must be met.
+    #[serde(default = "default_bull_bitcoin_provider_not_found_escalation_secs")]
+    pub provider_not_found_escalation_secs: u64,
     /// Poll cadence for an expired/cancelled fiat-only invoice whose provider
     /// instruction remains payable but has never reported received funds.
     #[serde(default = "default_bull_bitcoin_late_payment_watch_interval_secs")]
@@ -475,6 +493,10 @@ impl Default for BullBitcoinConfig {
             reconcile_interval_secs: default_bull_bitcoin_reconcile_interval_secs(),
             reconcile_batch_size: default_bull_bitcoin_reconcile_batch_size(),
             retry_backoff_cap_secs: default_bull_bitcoin_retry_backoff_cap_secs(),
+            provider_not_found_escalation_attempts:
+                default_bull_bitcoin_provider_not_found_escalation_attempts(),
+            provider_not_found_escalation_secs:
+                default_bull_bitcoin_provider_not_found_escalation_secs(),
             late_payment_watch_interval_secs: default_bull_bitcoin_late_payment_watch_interval_secs(
             ),
             late_payment_retention_secs: default_bull_bitcoin_late_payment_retention_secs(),
@@ -1848,6 +1870,14 @@ impl Config {
         require_positive(
             "bull_bitcoin.retry_backoff_cap_secs",
             self.bull_bitcoin.retry_backoff_cap_secs,
+        )?;
+        require_positive_u32(
+            "bull_bitcoin.provider_not_found_escalation_attempts",
+            self.bull_bitcoin.provider_not_found_escalation_attempts,
+        )?;
+        require_positive(
+            "bull_bitcoin.provider_not_found_escalation_secs",
+            self.bull_bitcoin.provider_not_found_escalation_secs,
         )?;
         require_positive(
             "bull_bitcoin.late_payment_watch_interval_secs",

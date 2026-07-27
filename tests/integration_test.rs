@@ -4623,6 +4623,237 @@ async fn bull_bitcoin_integrity_hold_retains_deletion_pending_credential() {
 }
 
 #[tokio::test]
+async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_recovers_on_money() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_created_order(order_id))).await;
+    fake.push_validation(Ok(())).await;
+    fake.push_validation(Err(BullBitcoinError::Upstream)).await;
+    fake.push_validation(Ok(())).await;
+    fake.push_read(Err(BullBitcoinError::NotFound)).await;
+    fake.push_read(Err(BullBitcoinError::NotFound)).await;
+    fake.push_read(Err(BullBitcoinError::NotFound)).await;
+    fake.push_read(Err(BullBitcoinError::Transport)).await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "Completed".into(),
+        payin_status: "Completed".into(),
+        payout_status: "Completed".into(),
+        actual_received_sat: Some(25_000),
+        credited_fiat_minor: Some(FiatAmountMinor::new(11_111).unwrap()),
+        quoted_fiat_minor: Some(FiatAmountMinor::new(11_111).unwrap()),
+        execution_rate_minor_per_btc: Some(FiatAmountMinor::new(44_444_000).unwrap()),
+        provider_final: true,
+        provider_terminal: false,
+    }))
+    .await;
+    let (mut state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "provider-not-found-recovery").await;
+    Arc::make_mut(&mut state.config)
+        .bull_bitcoin
+        .provider_not_found_escalation_attempts = 2;
+    Arc::make_mut(&mut state.config)
+        .bull_bitcoin
+        .provider_not_found_escalation_secs = 1;
+    let request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-provider-not-found-recovery",
+    );
+    let settlement_id =
+        match pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap()
+        {
+            FiatOnlyInstructionOutcome::BullBitcoin { settlement_id, .. } => settlement_id,
+            other => panic!("expected provider instruction, got {other:?}"),
+        };
+
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let temporary = sqlx::query_as::<_, (String, String, i32, bool, bool)>(
+        "SELECT settlement_status, provider_last_read_error_class, \
+                provider_not_found_consecutive, provider_missing_since IS NULL, \
+                payer_instruction IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        temporary,
+        ("pending".into(), "not_found".into(), 1, true, true)
+    );
+
+    // Satisfy the elapsed threshold without sleeping and make the row due.
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET provider_not_found_first_at = now() - interval '2 seconds', \
+                next_attempt_at = now() \
+          WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let unhealthy_threshold = sqlx::query_as::<_, (String, i32, bool, bool)>(
+        "SELECT settlement_status, provider_not_found_consecutive, \
+                provider_missing_since IS NULL, payer_instruction IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unhealthy_threshold, ("pending".into(), 2, true, true));
+
+    // Once an authenticated read-only provider preflight is healthy again,
+    // the already-satisfied count/time threshold may enter the hold.
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let escalated = sqlx::query_as::<_, (String, String, i32, bool, bool, bool, bool)>(
+        "SELECT settlement_status, provider_last_read_error_class, \
+                provider_not_found_consecutive, provider_missing_since IS NOT NULL, \
+                payer_instruction IS NULL, instruction_kind IS NULL, \
+                bull_bitcoin_order_id = $2 \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated,
+        (
+            "integrity_error".into(),
+            "not_found".into(),
+            3,
+            true,
+            true,
+            true,
+            true,
+        )
+    );
+
+    // An idempotent payer retry must not create a replacement or expose the
+    // stale instruction after escalation.
+    assert!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .is_err()
+    );
+    assert_eq!(fake.create_call_count(), 1);
+
+    // A transport failure is recorded separately and breaks the consecutive
+    // 404 streak without clearing the integrity hold.
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let transient = sqlx::query_as::<_, (String, String, i32, bool)>(
+        "SELECT settlement_status, provider_last_read_error_class, \
+                provider_not_found_consecutive, provider_missing_since IS NOT NULL \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        transient,
+        ("integrity_error".into(), "transient".into(), 0, true)
+    );
+
+    // Credential rotation cannot strand the missing-order obligation on an
+    // erased key generation. It remains explicitly draining until the exact
+    // original order resolves.
+    let replacement_credential_id = Uuid::new_v4();
+    let replacement_key = ScopedApiKey::parse(format!("bbak-{}", "cd".repeat(32))).unwrap();
+    let replacement_encryption_key =
+        pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap();
+    let replacement_encrypted = CredentialCipher::new(replacement_encryption_key)
+        .encrypt(replacement_credential_id, &owner_npub, &replacement_key)
+        .unwrap();
+    let rotation = pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::LightningAddress,
+        100,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap() + 10,
+        pay_service::db::FiatSettlementCredential::New(pay_service::db::NewEncryptedCredential {
+            id: replacement_credential_id,
+            encrypted: replacement_encrypted,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        rotation,
+        Err(pay_service::db::FiatSettlementStoreError::CredentialDraining)
+    ));
+
+    // The hold retains a deletion-pending credential because the same order
+    // remains a live financial obligation.
+    let deletion = pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &owner_npub)
+        .await
+        .unwrap();
+    assert_eq!(
+        deletion.credential,
+        pay_service::db::CredentialLifecycle::DeletionPending
+    );
+
+    // Any later authoritative money observation wins: resolve the hold on the
+    // same immutable order, settle it, and never dispatch a second create.
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    let recovered = sqlx::query_as::<_, (String, bool, bool, bool, i64, i64)>(
+        "SELECT settlement_status, provider_final, \
+                provider_missing_since IS NULL, \
+                provider_missing_last_resolved_at IS NOT NULL, \
+                actual_received_sat, credited_fiat_minor \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered,
+        ("settled".into(), true, true, true, 25_000, 11_111)
+    );
+    assert_eq!(fake.create_call_count(), 1);
+    assert_eq!(fake.read_call_count(), 5);
+    assert_eq!(fake.validation_call_count(), 3);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

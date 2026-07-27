@@ -591,6 +591,15 @@ second create.
   terminal;
 - treat canceled, rejected, archived-readable, and not-found results according
   to the exact-order contract instead of silently treating them as unpaid;
+- classify an authenticated exact-order `NotFound` separately from transport
+  and upstream failures. A single 404 remains retryable. Escalate only after
+  both `provider_not_found_escalation_attempts` consecutive 404s and
+  `provider_not_found_escalation_secs` have elapsed, and a read-only
+  authenticated provider preflight succeeds; retain the immutable order
+  binding, clear the payer instruction, enter an integrity hold, and poll at
+  the low-frequency watch cadence. Never abandon or replace the order. A later
+  authoritative observation for that same order resolves this specific hold,
+  and any received-money evidence remains a financial liability throughout;
 - reduce invoice fiat status over all value-bearing legs after each change;
 - after an unpaid invoice expires or is cancelled, remove a never-funded
   fiat-only leg from the customer-facing aggregate and poll the retained order

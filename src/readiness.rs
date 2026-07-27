@@ -1459,6 +1459,19 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND data_type = 'bigint' \
                    AND is_nullable = 'YES' \
             ) \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND (column_name, data_type, is_nullable) IN ( \
+                       ('provider_last_read_error_class', 'text', 'YES'), \
+                       ('provider_last_read_error_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_not_found_first_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_not_found_consecutive', 'integer', 'NO'), \
+                       ('provider_missing_since', 'timestamp with time zone', 'YES'), \
+                       ('provider_missing_last_resolved_at', 'timestamp with time zone', 'YES') \
+                   ) \
+            ) = 6 \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
@@ -1532,6 +1545,10 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_read_error_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_not_found_streak_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_missing_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_missing_resolution_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_shape_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_first_observation_shape_chk'), \
@@ -1702,6 +1719,22 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND to_regprocedure( \
                 'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)' \
             ) IS NOT NULL \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'public' \
+                   AND tablename = 'bull_bitcoin_settlements' \
+                   AND indexname = 'bull_bitcoin_settlements_provider_missing_due_idx' \
+                   AND indexdef LIKE '%provider_missing_since IS NOT NULL%' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
+                           'enforce_bull_bitcoin_settlement_update' \
+                   AND pg_get_functiondef(function_info.oid) LIKE \
+                           '%OLD.provider_missing_since IS NOT NULL%' \
+                   AND pg_get_functiondef(function_info.oid) LIKE \
+                           '%NEW.provider_missing_last_resolved_at IS NOT NULL%' \
+            ) \
             AND NOT has_function_privilege( \
                 current_user, \
                 'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)', \
