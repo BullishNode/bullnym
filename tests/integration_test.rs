@@ -19033,6 +19033,8 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
     config.boltz.api_url = provider.base_url.clone();
     config.features.bull_bitcoin_fiat_settlement = true;
     let mut quote_state = test_state_with_config(pool.clone(), config);
+    quote_state.fee_runtime =
+        Arc::new(pay_service::fee_runtime::FeeRuntime::liquid_ready_test_fixture(0.1));
     quote_state.pricer = Arc::new(
         PricerClient::new(PricerConfig {
             url: pricer_url,
@@ -19043,10 +19045,13 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
     let app = test_app(quote_state);
     let path = format!("/api/v1/invoices/{}/quote", invoice.id);
     let request_app = app.clone();
-    let request = tokio::spawn(async move {
+    let mut request = tokio::spawn(async move {
         post_json(&request_app, &path, json!({ "rail": "lightning" })).await
     });
-    provider.wait_until_request_is_blocked().await;
+    tokio::select! {
+        () = provider.wait_until_request_is_blocked() => {}
+        response = &mut request => panic!("mixed quote failed before provider dispatch: {response:?}"),
+    }
     provider.release_response().await;
     let (status, body) = request.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
