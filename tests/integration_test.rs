@@ -759,6 +759,7 @@ async fn mixed_reverse_fixture(
     owner_label: &str,
     total_amount_sat: i64,
     fiat_percentage: i16,
+    mixed_claim_fee_budget_sat: Option<i64>,
 ) -> MixedReverseFixture {
     let (state, owner_npub, credential_id, keypair) =
         fiat_lifecycle_test_state(pool, fake, owner_label).await;
@@ -863,6 +864,7 @@ async fn mixed_reverse_fixture(
         &mut tx,
         reverse_swap_id,
         invoice.id,
+        mixed_claim_fee_budget_sat,
     )
     .await
     .unwrap());
@@ -877,6 +879,43 @@ async fn mixed_reverse_fixture(
         reverse_swap_id,
         boltz_swap_id,
     }
+}
+
+#[tokio::test]
+async fn mixed_reverse_fee_authority_captures_once_and_is_immutable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = mixed_reverse_fixture(
+        &pool,
+        ScriptedBullBitcoinApi::default(),
+        "mixed-fee-authority",
+        100_000,
+        50,
+        Some(29),
+    )
+    .await;
+
+    let authority: (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT mixed_claim_path, mixed_claim_fee_budget_sat \
+           FROM swap_records WHERE id = $1",
+    )
+    .bind(fixture.reverse_swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(authority, (Some("script".into()), Some(29)));
+
+    let mutation =
+        sqlx::query("UPDATE swap_records SET mixed_claim_fee_budget_sat = 30 WHERE id = $1")
+            .bind(fixture.reverse_swap_id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert!(mutation
+        .to_string()
+        .contains("mixed claim fee authority is immutable once captured"));
+
+    cleanup_db(&pool).await;
 }
 
 fn test_app(state: AppState) -> Router {
@@ -3488,8 +3527,15 @@ async fn get_paid_history_marks_terminal_mixed_fiat_outcome_as_problem() {
         provider_terminal: true,
     }))
     .await;
-    let fixture =
-        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-terminal", 100_000, 40).await;
+    let fixture = mixed_reverse_fixture(
+        &pool,
+        fake.clone(),
+        "fiat-mixed-terminal",
+        100_000,
+        40,
+        None,
+    )
+    .await;
     let settlement_id =
         match pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
             &fixture.state,
@@ -3635,7 +3681,8 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         provider_terminal: false,
     }))
     .await;
-    let fixture = mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-exact", 100_000, 40).await;
+    let fixture =
+        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-exact", 100_000, 40, None).await;
 
     let first = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
         &fixture.state,
@@ -4005,6 +4052,7 @@ async fn bull_bitcoin_mixed_minimum_and_invalid_split_fall_back_once() {
         "fiat-mixed-minimum",
         25_000,
         40,
+        None,
     )
     .await;
     for _ in 0..2 {
@@ -4078,8 +4126,15 @@ async fn bull_bitcoin_mixed_minimum_and_invalid_split_fall_back_once() {
 
     cleanup_db(&pool).await;
     let invalid_fake = ScriptedBullBitcoinApi::default();
-    let invalid =
-        mixed_reverse_fixture(&pool, invalid_fake.clone(), "fiat-mixed-invalid", 1, 99).await;
+    let invalid = mixed_reverse_fixture(
+        &pool,
+        invalid_fake.clone(),
+        "fiat-mixed-invalid",
+        1,
+        99,
+        None,
+    )
+    .await;
     assert!(matches!(
         pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
             &invalid.state,
@@ -4106,7 +4161,8 @@ async fn bull_bitcoin_mixed_uses_net_fee_basis_and_does_not_resize_a_bound_order
     let fake = ScriptedBullBitcoinApi::default();
     fake.push_create(Ok(scripted_liquid_order(Uuid::new_v4(), 39_600)))
         .await;
-    let fixture = mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-net", 100_000, 40).await;
+    let fixture =
+        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-net", 100_000, 40, None).await;
 
     let first = pay_service::bull_bitcoin_settlement::prepare_reverse_mixed_settlement(
         &fixture.state,
@@ -4170,7 +4226,7 @@ async fn bull_bitcoin_mixed_incompatible_liquid_shape_retains_order_without_fall
     fake.push_create(Ok(incompatible_order.clone())).await;
     fake.push_recovery(Ok(incompatible_order)).await;
     let fixture =
-        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-script", 100_000, 40).await;
+        mixed_reverse_fixture(&pool, fake.clone(), "fiat-mixed-script", 100_000, 40, None).await;
     let expected_len = mixed_claim_basis(100_000).additional_output_script_len;
     let returned_len = boltz_client::elements::Address::from_str(CONFIDENTIAL_P2TR)
         .unwrap()
