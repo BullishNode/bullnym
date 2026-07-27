@@ -396,18 +396,29 @@ fresh schema-076 backup first, then record these preflight counts:
 ```sql
 SELECT provider_state,
        bull_bitcoin_order_id IS NOT NULL AS has_order_id,
+       fallback_category,
        COUNT(*)
 FROM bull_bitcoin_settlements
 WHERE provider_state = 'dispatch_started'
    OR bull_bitcoin_order_id IS NOT NULL
-GROUP BY provider_state, bull_bitcoin_order_id IS NOT NULL
-ORDER BY provider_state, has_order_id;
+   OR fallback_category = 'ambiguous_create'
+GROUP BY provider_state, bull_bitcoin_order_id IS NOT NULL, fallback_category
+ORDER BY provider_state, has_order_id, fallback_category;
 ```
 
 Migration 077 adds only local correlation provenance. Existing bound order IDs,
 instructions, money fields, provider states, and timestamps remain unchanged;
 their correlation source is backfilled as `legacy_bound`. The migration does
 not redispatch, abandon, bind, fund, or query a provider order.
+
+An existing `abandoned` row categorized as `ambiguous_create` predates this
+boundary and is not safe to reopen automatically: its Bitcoin fallback may
+already have been exposed or funded while an unknown provider order also
+exists. Reconcile each such row against private provider correlation evidence
+and payer/chain evidence as an incident. Do not call the schema-077 attachment
+function for it, create a replacement order, or rewrite its route. Any evidence
+that both economic paths can be funded is a financial integrity case requiring
+manual accounting resolution.
 
 Start only a matching schema-077 binary. Readiness requires both correlation
 columns, the validated correlation constraint, its immutable-provenance

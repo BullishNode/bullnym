@@ -1044,7 +1044,7 @@ pub async fn claim_ambiguous_bull_bitcoin_dispatches(
     retry_after_secs: i64,
     limit: i64,
 ) -> Result<Vec<StoredBullBitcoinSettlement>, sqlx::Error> {
-    sqlx::query_as::<_, StoredBullBitcoinSettlement>(&format!(
+    let rows = sqlx::query_scalar::<_, Uuid>(
         "WITH due AS ( \
              SELECT id FROM bull_bitcoin_settlements \
               WHERE provider_state = 'dispatch_started' \
@@ -1062,11 +1062,21 @@ pub async fn claim_ambiguous_bull_bitcoin_dispatches(
                 reconcile_attempts = reconcile_attempts + 1, \
                 updated_at = now() \
            FROM due WHERE settlement.id = due.id \
-         RETURNING {SETTLEMENT_PROJECTION}"
-    ))
+         RETURNING settlement.id",
+    )
     .bind(stale_after_secs)
     .bind(retry_after_secs)
     .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, StoredBullBitcoinSettlement>(&format!(
+        "SELECT {SETTLEMENT_PROJECTION} FROM bull_bitcoin_settlements \
+          WHERE id = ANY($1) ORDER BY id"
+    ))
+    .bind(rows)
     .fetch_all(pool)
     .await
 }
