@@ -327,15 +327,12 @@ fn project_merchant_settlement(
     Option<GetPaidSettlementDetails>,
     Option<GetPaidFiatConversionOverride>,
 ) {
-    if !transaction.settlement_present {
-        let kind = if transaction.fiat_policy_present {
-            GetPaidSettlementKind::Unavailable
-        } else {
-            GetPaidSettlementKind::Bitcoin
-        };
-        return (kind, None, None);
-    }
-
+    // A payment event can predate its settlement binding. In particular, a
+    // fiat-only provider attempt may be durably abandoned before the payer
+    // pays, leaving only the invoice-linked Bitcoin fallback row. Resolve
+    // that explicit route before the generic "policy present but no
+    // settlement" guard so history does not misclassify an ordinary Bitcoin
+    // payment as unavailable.
     if transaction.settlement_funding_route.as_deref() == Some("bitcoin_fallback") {
         let reason = crate::bull_bitcoin_settlement::projected_fallback_reason(
             transaction.settlement_fallback_category.as_deref(),
@@ -348,6 +345,15 @@ fn project_merchant_settlement(
                 reason,
             }),
         );
+    }
+
+    if !transaction.settlement_present {
+        let kind = if transaction.fiat_policy_present {
+            GetPaidSettlementKind::Unavailable
+        } else {
+            GetPaidSettlementKind::Bitcoin
+        };
+        return (kind, None, None);
     }
 
     if transaction.settlement_funding_route.as_deref() != Some("bull_bitcoin") {
@@ -660,6 +666,31 @@ mod tests {
             json!({"status": "overridden", "reason": "below_minimum"})
         );
         assert!(fallback.get("settlement_details").is_none());
+
+        // A direct invoice payment can legitimately have no settlement ID on
+        // its payment event: the fiat-only provider attempt may have already
+        // fallen back to Bitcoin before the payer paid. The SQL projection
+        // resolves that orphan fallback row and must still emit the same
+        // public Bitcoin override contract.
+        let mut orphan_fallback = settlement_transaction();
+        orphan_fallback.settlement_present = false;
+        orphan_fallback.settlement_purpose = Some("fiat_only".into());
+        orphan_fallback.settlement_order_id = None;
+        orphan_fallback.settlement_currency = None;
+        orphan_fallback.settlement_status_detail = Some("none".into());
+        orphan_fallback.settlement_credited_fiat_minor = None;
+        orphan_fallback.settlement_quoted_fiat_minor = None;
+        orphan_fallback.settlement_execution_rate_minor_per_btc = None;
+        orphan_fallback.settlement_funding_route = Some("bitcoin_fallback".into());
+        orphan_fallback.settlement_fallback_category = Some("conversion_unavailable".into());
+        let orphan_fallback =
+            serde_json::to_value(project_transaction(orphan_fallback).unwrap()).unwrap();
+        assert_eq!(orphan_fallback["settlement_kind"], "bitcoin");
+        assert_eq!(
+            orphan_fallback["fiat_conversion"],
+            json!({"status": "overridden", "reason": "conversion_unavailable"})
+        );
+        assert!(orphan_fallback.get("settlement_details").is_none());
 
         let mut ambiguous = settlement_transaction();
         ambiguous.settlement_funding_route = Some("bitcoin_fallback".into());

@@ -22,6 +22,11 @@ be changed by the operator, so treat the returned limits as authoritative.
 the implicit default Lightning method. Generic LNURL clients can ignore the
 extension and use Lightning.
 
+The public metadata shape is intentionally the same for every private
+settlement configuration. `commentAllowed` and `payment_methods` describe the
+protocol surface only; they must not be used to infer whether a recipient has
+fiat conversion enabled.
+
 ## `GET /lnurlp/callback/:nym/:comment_intent`
 
 Use the complete opaque callback URL returned by metadata. The final path
@@ -72,9 +77,11 @@ has a larger privacy surface. Mapping `(nym, outpoint)` is idempotent; a UTXO
 can target only a bounded number of distinct nyms. On rate-limit/backend
 throttle errors the implementation may fall back to Lightning, so clients must
 inspect the response type rather than assume the requested rail was selected.
-Comments are currently bound only on the Lightning path. A callback combining
-`comment` with `payment_method=L-BTC` fails closed instead of dropping private
-text during direct-Liquid creation or fallback.
+Comments are currently bound only on the Lightning path. For ordinary or mixed
+settings, a callback combining `comment` with `payment_method=L-BTC` fails
+closed instead of accepting text it cannot durably associate with that rail.
+For a 100%-fiat setting, the callback accepts the payment but deliberately
+forgets the optional comment; it never persists or returns the payer text.
 
 ## `GET /.well-known/nostr.json?name=:nym`
 

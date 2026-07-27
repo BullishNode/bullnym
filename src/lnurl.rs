@@ -116,8 +116,6 @@ const COMMENT_RETRY_MISMATCH: &str =
 const COMMENT_LIGHTNING_ONLY: &str =
     "Comments are currently available only for Lightning payments. Retry without the L-BTC payment method.";
 const COMMENT_INTERNAL_FAILURE: &str = "LNURL comment persistence failed";
-const COMMENT_FIAT_UNAVAILABLE: &str =
-    "Comments are not available when this Lightning Address settles fully to fiat.";
 
 struct RequestedLnurlComment {
     key: LnurlCommentIntentKey,
@@ -404,15 +402,6 @@ pub async fn metadata(
     let _user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
-    // The rollout flag gates new fiat admission. Persisted settings remain in
-    // the database so already-created provider orders can still be replayed
-    // and reconciled, but they must not alter metadata while admission is off.
-    let fiat_setting = if state.config.features.bull_bitcoin_fiat_settlement {
-        db::active_lightning_address_fiat_setting(&state.db, &nym).await?
-    } else {
-        None
-    };
-
     // Cheap, in-process read only. Keep it after abuse/certification and nym
     // existence gates so rejected metadata requests cannot probe provider
     // readiness. Standard Lightning does not require a zero-conf limit.
@@ -449,16 +438,11 @@ pub async fn metadata(
         min_sendable,
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
-        comment_allowed: if setting_is_fiat_only(fiat_setting.as_ref()) {
-            0
-        } else {
-            LNURL_COMMENT_ALLOWED
-        },
-        payment_methods: if setting_is_mixed(fiat_setting.as_ref()) {
-            Vec::new()
-        } else {
-            vec!["L-BTC"]
-        },
+        // Keep public metadata independent of private settlement policy. The
+        // callback still decides the actual rail, but an observer must not be
+        // able to classify a Lightning Address by comment or method fields.
+        comment_allowed: LNURL_COMMENT_ALLOWED,
+        payment_methods: vec!["L-BTC"],
     }))
 }
 
@@ -696,6 +680,7 @@ async fn serve_lightning(
     // An exact retry belongs to the first durable fiat-only decision even if
     // the merchant changed settings after the callback was issued.
     let mut effective_fiat_setting = fiat_setting;
+    let mut requested_comment = requested_comment;
     match fiat_only_lnurl_instruction(
         state,
         user,
@@ -707,9 +692,6 @@ async fn serve_lightning(
     .await?
     {
         FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
-            if requested_comment.is_some() {
-                return Err(AppError::InvalidComment(COMMENT_FIAT_UNAVAILABLE));
-            }
             let PayerInstruction::Lightning { bolt11 } = instruction else {
                 return Err(AppError::DbError(
                     "Bull Bitcoin returned the wrong Lightning Address rail".into(),
@@ -717,7 +699,13 @@ async fn serve_lightning(
             };
             return Ok(Json(lightning_response(nym, &state.config.domain, bolt11)).into_response());
         }
-        FiatOnlyLnurlDecision::BitcoinFallback => effective_fiat_setting = None,
+        FiatOnlyLnurlDecision::BitcoinFallback => {
+            // A replayed fiat-only decision that already fell back to Bitcoin
+            // must retain its no-comment privacy contract even if the merchant
+            // removed the setting before the payer retried the callback.
+            effective_fiat_setting = None;
+            requested_comment = None;
+        }
         FiatOnlyLnurlDecision::NotApplicable => {}
     }
 
@@ -1021,10 +1009,21 @@ async fn callback_inner(
 
     let payer_comment = LnurlPayerComment::from_optional(params.comment.take())
         .map_err(comment_validation_error)?;
-    let requested_comment = payer_comment.map(|comment| RequestedLnurlComment {
+    let mut requested_comment = payer_comment.map(|comment| RequestedLnurlComment {
         key: comment_intent_key.clone(),
         comment,
     });
+
+    // A 100%-fiat Lightning Address must accept wallets that send an optional
+    // LUD-12 comment, but it must not persist that payer text or reveal why it
+    // was discarded. Metadata advertises comment support uniformly, yet
+    // wallets are allowed to send a comment regardless; treating it as a hard
+    // error both rejects an otherwise valid payment and leaks private
+    // settlement policy through the LNURL error response. The comment is
+    // deliberately forgotten before either rail is selected.
+    if setting_is_fiat_only(fiat_setting.as_ref()) {
+        requested_comment = None;
+    }
 
     // --- Caller IP + whitelist ---
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
@@ -1050,9 +1049,6 @@ async fn callback_inner(
     // settlement binding, require the fully wired Lightning path.
     if requested_comment.is_some() && requests_method(params.payment_method.as_deref(), "L-BTC") {
         return Err(AppError::InvalidComment(COMMENT_LIGHTNING_ONLY));
-    }
-    if requested_comment.is_some() && setting_is_fiat_only(fiat_setting.as_ref()) {
-        return Err(AppError::InvalidComment(COMMENT_FIAT_UNAVAILABLE));
     }
     let liquid_throttle = if requests_method(params.payment_method.as_deref(), "L-BTC") {
         match serve_liquid(

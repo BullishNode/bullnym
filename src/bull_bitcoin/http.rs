@@ -188,6 +188,14 @@ fn classify_transport_error(error: reqwest::Error) -> BullBitcoinError {
 }
 
 fn classify_rpc_error(error: &Value, call_kind: RpcCallKind) -> BullBitcoinError {
+    // API-Orders uses this nested code for a dependency failure while creating
+    // an order. It is not a merchant policy rejection: retrying the same
+    // request may produce a different provider result, so preserve the
+    // ambiguity and let settlement choose the safe ambiguous-create fallback.
+    if error.pointer("/data/apiError/code").and_then(Value::as_str) == Some("ERR_ORD_PP_DEPENDENCY")
+    {
+        return BullBitcoinError::Upstream;
+    }
     if call_kind == RpcCallKind::EligibilityPreflight
         && error.pointer("/data/apiError/code").and_then(Value::as_str)
             == Some("SELL_TO_BALANCE_KYC_REQUIRED")
@@ -990,6 +998,15 @@ mod tests {
                 RpcCallKind::CreateOrder
             ),
             BullBitcoinError::Policy
+        );
+        assert_eq!(
+            classify_rpc_error(
+                &serde_json::json!({
+                    "data": {"apiError": {"code": "ERR_ORD_PP_DEPENDENCY"}}
+                }),
+                RpcCallKind::CreateOrder
+            ),
+            BullBitcoinError::Upstream
         );
         let hidden_method = serde_json::json!({
             "code": -32601,

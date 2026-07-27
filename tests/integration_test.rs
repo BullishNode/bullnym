@@ -2856,7 +2856,7 @@ async fn bull_bitcoin_lightning_address_feature_flag_gates_dormant_settings() {
     let (enabled_status, enabled_metadata) =
         get_path(&enabled_app, "/.well-known/lnurlp/fiat-flag-dormant").await;
     assert_eq!(enabled_status, StatusCode::OK, "{enabled_metadata:?}");
-    assert_eq!(enabled_metadata["commentAllowed"], 0);
+    assert_eq!(enabled_metadata["commentAllowed"], 120);
     assert_eq!(enabled_metadata["payment_methods"], json!(["L-BTC"]));
 
     let mut disabled_config = (*enabled_state.config).clone();
@@ -2869,7 +2869,87 @@ async fn bull_bitcoin_lightning_address_feature_flag_gates_dormant_settings() {
     assert_eq!(disabled_status, StatusCode::OK, "{disabled_metadata:?}");
     assert_eq!(disabled_metadata["commentAllowed"], 120);
     assert_eq!(disabled_metadata["payment_methods"], json!(["L-BTC"]));
+    assert_eq!(
+        enabled_metadata["commentAllowed"], disabled_metadata["commentAllowed"],
+        "public LNURL metadata must not disclose settlement configuration"
+    );
+    assert_eq!(
+        enabled_metadata["payment_methods"], disabled_metadata["payment_methods"],
+        "public LNURL metadata must not disclose settlement configuration"
+    );
     assert_eq!(fake.create_call_count(), 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_only_lnurl_comments_are_accepted_and_discarded_on_both_rails() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Ok(scripted_created_order_for(
+        Uuid::new_v4(),
+        BitcoinNetwork::Lightning,
+        100,
+    )))
+    .await;
+    fake.push_create(Ok(scripted_created_order_for(
+        Uuid::new_v4(),
+        BitcoinNetwork::Liquid,
+        100,
+    )))
+    .await;
+    let (mut state, owner_npub, _, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-comment-discard").await;
+    state.ip_whitelist =
+        Arc::new(IpWhitelist::parse(&["127.0.0.1".to_string()]).expect("parse test whitelist"));
+    let app = test_app(state);
+
+    let nym = "fiat-comment-discard";
+    let (metadata_status, metadata) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(metadata_status, StatusCode::OK, "{metadata}");
+    assert_eq!(metadata["commentAllowed"], 120);
+    assert_eq!(metadata["payment_methods"], json!(["L-BTC"]));
+    let callback = metadata["callback"].as_str().unwrap();
+    let metadata_origin = "https://test.example.com";
+    let callback_path = callback
+        .strip_prefix(metadata_origin)
+        .expect("callback uses configured metadata origin");
+
+    let comment = "private settlement probe";
+    let (lightning_status, lightning_body) = get_path_from(
+        &app,
+        &format!("{callback_path}?amount=100000&comment={comment}"),
+        "127.0.0.1:42111".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(lightning_status, StatusCode::OK, "{lightning_body}");
+    assert!(lightning_body["pr"].as_str().is_some(), "{lightning_body}");
+    assert!(!lightning_body.to_string().contains(comment));
+    assert!(!lightning_body.to_string().to_lowercase().contains("fiat"));
+
+    let (liquid_status, liquid_body) = get_path_from(
+        &app,
+        &format!("{callback_path}?amount=100000&comment={comment}&payment_method=L-BTC"),
+        "127.0.0.1:42111".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(liquid_status, StatusCode::OK, "{liquid_body}");
+    assert!(
+        liquid_body["L-BTC"]["address"].as_str().is_some(),
+        "{liquid_body}"
+    );
+    assert!(!liquid_body.to_string().contains(comment));
+    assert!(!liquid_body.to_string().to_lowercase().contains("fiat"));
+
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM lnurl_comment_intents WHERE owner_npub = $1")
+            .bind(&owner_npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted, 0, "fiat-only comments must be forgotten");
+    assert_eq!(fake.create_call_count(), 2);
 
     cleanup_db(&pool).await;
 }
