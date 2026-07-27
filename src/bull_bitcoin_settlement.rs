@@ -96,7 +96,8 @@ fn fallback_decision_log_fields<'a>(
         chain_swap_id: stored.chain_swap_id,
         settlement_id: stored.id,
         selected_fallback_rail: "bitcoin",
-        speculative: stored.purpose == "mixed" && stored.funding_committed_at_unix.is_none(),
+        speculative: matches!(stored.purpose.as_str(), "mixed" | "provider_only")
+            && stored.funding_committed_at_unix.is_none(),
         transition,
     }
 }
@@ -205,8 +206,10 @@ pub enum FiatOnlyInstructionOutcome {
     },
 }
 
-/// Claim-time decision for a captured 1-99% policy. The Bull Bitcoin address
-/// is deliberately available only while the claim is still unjournaled; once
+/// Claim-time decision for a captured swap-backed fiat policy. Percentages
+/// 1-99 produce the mixed merchant/provider outputs; a 100%-fiat Lightning
+/// Address produces the sole provider output. The Bull Bitcoin address is
+/// deliberately available only while the claim is still unjournaled; once
 /// output evidence commits, retries use the immutable transaction and hashes.
 pub enum MixedSettlementPreparation {
     BitcoinFallback {
@@ -218,11 +221,13 @@ pub enum MixedSettlementPreparation {
         confidential_address: String,
         bull_bitcoin_amount_sat: i64,
         fiat_percentage: i16,
+        provider_only: bool,
     },
     Journaled {
         settlement_id: Uuid,
         bull_bitcoin_amount_sat: i64,
         fiat_percentage: i16,
+        provider_only: bool,
     },
 }
 
@@ -233,6 +238,7 @@ pub enum MixedSettlementPreparation {
 pub struct MixedClaimBasis {
     pub net_settlement_sat: i64,
     pub additional_output_script_len: usize,
+    pub provider_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -744,7 +750,7 @@ async fn prepare_mixed_settlement_locked(
         != matches!(source, MixedSwapSource::Reverse(_)).then_some(source.id())
         || policy.chain_swap_id
             != matches!(source, MixedSwapSource::Chain(_)).then_some(source.id())
-        || !(1..=99).contains(&policy.fiat_percentage)
+        || !(1..=100).contains(&policy.fiat_percentage)
     {
         return Err(SettlementServiceError::StoredState);
     }
@@ -789,6 +795,9 @@ async fn prepare_mixed_settlement_locked(
     {
         return Err(SettlementServiceError::StoredState);
     }
+    if basis.provider_only != (policy.fiat_percentage == 100) {
+        return Err(SettlementServiceError::StoredState);
+    }
     let numerator = basis
         .net_settlement_sat
         .checked_mul(i64::from(policy.fiat_percentage))
@@ -802,6 +811,7 @@ async fn prepare_mixed_settlement_locked(
         .net_settlement_sat
         .checked_sub(bull_bitcoin_amount_sat)
         .ok_or(SettlementServiceError::StoredState)?;
+    let provider_only = policy.fiat_percentage == 100;
     let amount = BitcoinAmountSat::new(bull_bitcoin_amount_sat)
         .map_err(|_| SettlementServiceError::StoredState)?;
     let reservation = NewBullBitcoinSettlement {
@@ -812,7 +822,11 @@ async fn prepare_mixed_settlement_locked(
         chain_swap_id: policy.chain_swap_id,
         credential_id: policy.credential_id,
         product: product.as_str(),
-        purpose: "mixed",
+        purpose: if provider_only {
+            "provider_only"
+        } else {
+            "mixed"
+        },
         payer_rail: source.payer_rail(),
         request_key: &request_key,
         fiat_percentage: policy.fiat_percentage,
@@ -845,7 +859,7 @@ async fn prepare_mixed_settlement_locked(
             .map_err(map_store_error)?
     };
 
-    if merchant_amount_sat <= 0 || split_rounds_to_zero {
+    if (!provider_only && merchant_amount_sat <= 0) || split_rounds_to_zero {
         match stored.provider_state.as_str() {
             "reserved" => {
                 abandon_dispatch_with_log(connection, &stored, FallbackCategory::InvalidSplit)
@@ -971,6 +985,7 @@ async fn prepare_mixed_settlement_locked(
                 confidential_address,
                 bull_bitcoin_amount_sat,
                 fiat_percentage: policy.fiat_percentage,
+                provider_only,
             }))
         }
         Ok(order) => {
@@ -1022,12 +1037,14 @@ fn mixed_stored_outcome(
                 confidential_address: address.clone(),
                 bull_bitcoin_amount_sat: stored.requested_bitcoin_sat,
                 fiat_percentage: stored.fiat_percentage,
+                provider_only: stored.purpose == "provider_only",
             })
         }
         ("bound", Some("bull_bitcoin"), Some(_)) => Ok(MixedSettlementPreparation::Journaled {
             settlement_id: stored.id,
             bull_bitcoin_amount_sat: stored.requested_bitcoin_sat,
             fiat_percentage: stored.fiat_percentage,
+            provider_only: stored.purpose == "provider_only",
         }),
         ("abandoned", Some("bitcoin_fallback"), None)
         | ("bound", Some("bitcoin_fallback"), None) => {
@@ -1057,7 +1074,12 @@ fn mixed_reservation_matches_policy(
         && stored.chain_swap_id == policy.chain_swap_id
         && stored.credential_id == policy.credential_id
         && stored.product == policy.product
-        && stored.purpose == "mixed"
+        && stored.purpose
+            == if policy.fiat_percentage == 100 {
+                "provider_only"
+            } else {
+                "mixed"
+            }
         && stored.payer_rail == source.payer_rail()
         && stored.request_key == request_key
         && stored.fiat_percentage == policy.fiat_percentage
@@ -1342,7 +1364,7 @@ async fn reconcile_ambiguous_dispatch(
         .ok_or(SettlementServiceError::StoredState)?;
     let currency = FiatCurrency::from_str(&settlement.fiat_currency)
         .map_err(|_| SettlementServiceError::StoredState)?;
-    let network = if settlement.purpose == "mixed" {
+    let network = if matches!(settlement.purpose.as_str(), "mixed" | "provider_only") {
         BitcoinNetwork::Liquid
     } else {
         match settlement.payer_rail.as_str() {
@@ -1410,7 +1432,7 @@ async fn reconcile_ambiguous_dispatch(
         || order.network != network
         || order.requested_bitcoin != request.bitcoin_amount
         || instruction_network(&order.instruction) != network
-        || (settlement.purpose == "mixed"
+        || (matches!(settlement.purpose.as_str(), "mixed" | "provider_only")
             && settlement
                 .expected_instruction_script_len
                 .and_then(|expected| usize::try_from(expected).ok())

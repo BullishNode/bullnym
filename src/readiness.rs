@@ -1555,6 +1555,49 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                  ) \
             ) \
             AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = \
+                           to_regclass('public.swap_fiat_settlement_policies') \
+                   AND constraint_info.conname = \
+                           'swap_fiat_settlement_policies_percentage_chk' \
+                   AND constraint_info.convalidated \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%fiat_percentage >= 1%' \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%fiat_percentage <= 100%' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = \
+                           to_regclass('public.bull_bitcoin_settlements') \
+                   AND constraint_info.conname = \
+                           'bull_bitcoin_settlements_purpose_chk' \
+                   AND constraint_info.convalidated \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%provider_only%' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('guard_bull_bitcoin_swap_binding', \
+                     'NEW.purpose NOT IN (''mixed'', ''provider_only'')'), \
+                    ('guard_bull_bitcoin_claim_output_insert', \
+                     'settlement_row.purpose NOT IN (''mixed'', ''provider_only'')'), \
+                    ('guard_bull_bitcoin_funding_commitment', \
+                     'NEW.purpose IN (''mixed'', ''provider_only'')') \
+                ) required(function_name, required_fragment) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_proc function_info \
+                     WHERE function_info.pronamespace = \
+                               to_regnamespace('public') \
+                       AND function_info.proname = required.function_name \
+                       AND function_info.pronargs = 0 \
+                       AND POSITION( \
+                           required.required_fragment \
+                           IN pg_get_functiondef(function_info.oid) \
+                       ) > 0 \
+                 ) \
+            ) \
+            AND EXISTS ( \
                 SELECT 1 FROM pg_trigger trigger_info \
                  WHERE trigger_info.tgrelid = \
                            to_regclass('public.invoice_fiat_settlement_policies') \

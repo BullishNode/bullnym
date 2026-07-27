@@ -236,6 +236,10 @@ fn setting_is_mixed(setting: Option<&db::ActiveFiatSettlementSetting>) -> bool {
     setting.is_some_and(|setting| (1..=99).contains(&setting.fiat_percentage))
 }
 
+fn setting_uses_swap_fiat(setting: Option<&db::ActiveFiatSettlementSetting>) -> bool {
+    setting.is_some_and(|setting| (1..=100).contains(&setting.fiat_percentage))
+}
+
 fn setting_is_fiat_only(setting: Option<&db::ActiveFiatSettlementSetting>) -> bool {
     setting.is_some_and(|setting| setting.fiat_percentage == 100)
 }
@@ -743,36 +747,6 @@ async fn serve_lightning(
         }
     }
 
-    if setting_is_fiat_only(effective_fiat_setting) {
-        match fiat_only_lnurl_instruction(
-            state,
-            user,
-            effective_fiat_setting,
-            intent_key,
-            BitcoinNetwork::Lightning,
-            amount_msat / 1_000,
-        )
-        .await?
-        {
-            FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
-                let PayerInstruction::Lightning { bolt11 } = instruction else {
-                    return Err(AppError::DbError(
-                        "Bull Bitcoin returned the wrong Lightning Address rail".into(),
-                    ));
-                };
-                return Ok(
-                    Json(lightning_response(nym, &state.config.domain, bolt11)).into_response()
-                );
-            }
-            FiatOnlyLnurlDecision::BitcoinFallback => effective_fiat_setting = None,
-            FiatOnlyLnurlDecision::NotApplicable => {
-                return Err(AppError::DbError(
-                    "Lightning Address fiat setting lost its durable decision".into(),
-                ));
-            }
-        }
-    }
-
     let binding = requested_comment.map(|requested| LnurlCommentInstructionBinding {
         owner_npub: &user.npub,
         idempotency_key: &requested.key,
@@ -931,9 +905,9 @@ async fn create_lightning_swap(
         // disabled. It must not make the ordinary Bitcoin path unpayable.
         false
     };
-    if captured != setting_is_mixed(fiat_setting) {
+    if captured != setting_uses_swap_fiat(fiat_setting) {
         return Err(AppError::DbError(
-            "Lightning Address mixed policy capture mismatch".into(),
+            "Lightning Address fiat policy capture mismatch".into(),
         ));
     }
     if let Some(binding) = comment_binding {

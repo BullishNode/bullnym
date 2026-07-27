@@ -33,6 +33,101 @@ pub struct VerifiedMixedClaim {
     pub fee_amount_sat: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedProviderOnlyClaim {
+    pub bull_bitcoin: VerifiedClaimOutput,
+    pub fee_amount_sat: u64,
+}
+
+pub fn verify_provider_only_liquid_claim(
+    claim: &BtcLikeTransaction,
+    source_outputs: &[elements::TxOut],
+    source_total_sat: u64,
+    bull_bitcoin_address: &str,
+    bull_bitcoin_amount_sat: i64,
+) -> Result<VerifiedProviderOnlyClaim, String> {
+    let address = elements::Address::from_str(bull_bitcoin_address)
+        .map_err(|_| "Bull Bitcoin Liquid address is invalid".to_owned())?;
+    if address.params != &elements::AddressParams::LIQUID || address.blinding_pubkey.is_none() {
+        return Err(
+            "Bull Bitcoin destination must be a confidential Liquid mainnet address".into(),
+        );
+    }
+    verify_provider_only_liquid_claim_for_script(
+        claim,
+        source_outputs,
+        source_total_sat,
+        &hex::encode(address.script_pubkey().as_bytes()),
+        bull_bitcoin_amount_sat,
+    )
+}
+
+pub fn verify_provider_only_liquid_claim_for_script(
+    claim: &BtcLikeTransaction,
+    source_outputs: &[elements::TxOut],
+    source_total_sat: u64,
+    bull_bitcoin_script_pubkey_hex: &str,
+    bull_bitcoin_amount_sat: i64,
+) -> Result<VerifiedProviderOnlyClaim, String> {
+    let transaction = claim
+        .as_liquid()
+        .ok_or_else(|| "provider-only claim is not a Liquid transaction".to_owned())?;
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    transaction
+        .verify_tx_amt_proofs(&secp, source_outputs)
+        .map_err(|_| {
+            "provider-only claim commitments do not balance against their exact source outputs"
+                .to_owned()
+        })?;
+    if transaction.output.len() != 2 {
+        return Err("provider-only claim must contain [Bull Bitcoin, fee]".into());
+    }
+    let bull_bitcoin_output = &transaction.output[0];
+    let fee_output = &transaction.output[1];
+    if bull_bitcoin_output.is_fee() || !fee_output.is_fee() {
+        return Err("provider-only claim output ordering is invalid".into());
+    }
+    let bull_bitcoin_script = hex::decode(bull_bitcoin_script_pubkey_hex)
+        .map(elements::Script::from)
+        .map_err(|_| "Bull Bitcoin output script is invalid hex".to_owned())?;
+    if bull_bitcoin_script.is_empty()
+        || hex::encode(bull_bitcoin_script.as_bytes()) != bull_bitcoin_script_pubkey_hex
+        || bull_bitcoin_output.script_pubkey != bull_bitcoin_script
+    {
+        return Err("provider-only claim output does not match its authorized destination".into());
+    }
+    let bull_bitcoin_amount = u64::try_from(bull_bitcoin_amount_sat)
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| "Bull Bitcoin provider-only amount is invalid".to_owned())?;
+    let fee_amount = fee_output
+        .value
+        .explicit()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| "provider-only claim fee is not a positive explicit value".to_owned())?;
+    if fee_output.asset.explicit() != Some(elements::AssetId::LIQUID_BTC)
+        || !fee_output.nonce.is_null()
+        || !fee_output.witness.is_empty()
+        || transaction.all_fees().len() != 1
+        || transaction.fee_in(elements::AssetId::LIQUID_BTC) != fee_amount
+        || source_total_sat.checked_sub(fee_amount) != Some(bull_bitcoin_amount)
+    {
+        return Err("provider-only claim has an invalid exact output/fee balance".into());
+    }
+    require_confidential_payment_output(bull_bitcoin_output, "Bull Bitcoin")?;
+    let txid = transaction.txid().to_string();
+    Ok(VerifiedProviderOnlyClaim {
+        bull_bitcoin: output_evidence(
+            "bull_bitcoin",
+            &txid,
+            0,
+            bull_bitcoin_output,
+            bull_bitcoin_amount_sat,
+        )?,
+        fee_amount_sat: fee_amount,
+    })
+}
+
 pub fn verify_mixed_liquid_claim(
     claim: &BtcLikeTransaction,
     source_outputs: &[elements::TxOut],
@@ -327,6 +422,140 @@ mod tests {
             bull_bitcoin_address: bull_bitcoin_address.to_string(),
             bull_bitcoin_script_hex: hex::encode(bull_bitcoin_address.script_pubkey().as_bytes()),
         }
+    }
+
+    fn provider_only_fixture() -> MixedFixture {
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let mut rng = elements::secp256k1_zkp::rand::thread_rng();
+        let asset = elements::AssetId::LIQUID_BTC;
+        let source_amount_sat = 100_000;
+        let fee_amount_sat = 1_000;
+        let provider_amount_sat = source_amount_sat - fee_amount_sat;
+        let address_template = elements::Address::from_str(ADDRESS_TEMPLATE)
+            .unwrap()
+            .to_unconfidential();
+        let provider_blinding_key = elements::secp256k1_zkp::SecretKey::new(&mut rng);
+        let provider_blinding_pubkey =
+            elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &provider_blinding_key);
+        let provider_address = address_template.to_confidential(provider_blinding_pubkey);
+        let source_secrets = elements::TxOutSecrets::new(
+            asset,
+            elements::confidential::AssetBlindingFactor::zero(),
+            source_amount_sat,
+            elements::confidential::ValueBlindingFactor::zero(),
+        );
+        let fee_secrets = elements::TxOutSecrets::new(
+            asset,
+            elements::confidential::AssetBlindingFactor::zero(),
+            fee_amount_sat,
+            elements::confidential::ValueBlindingFactor::zero(),
+        );
+        let (provider_output, _, _, _) = elements::TxOut::new_last_confidential(
+            &mut rng,
+            &secp,
+            provider_amount_sat,
+            asset,
+            provider_address.script_pubkey(),
+            provider_blinding_pubkey,
+            &[source_secrets],
+            &[&fee_secrets],
+        )
+        .unwrap();
+        let source_output = elements::TxOut {
+            asset: elements::confidential::Asset::Explicit(asset),
+            value: elements::confidential::Value::Explicit(source_amount_sat),
+            nonce: elements::confidential::Nonce::Null,
+            script_pubkey: elements::Script::from(vec![0x51]),
+            witness: elements::TxOutWitness::default(),
+        };
+        let transaction = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(
+                    "22".repeat(32).parse().expect("test txid"),
+                    0,
+                ),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::MAX,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![
+                provider_output,
+                elements::TxOut::new_fee(fee_amount_sat, asset),
+            ],
+        };
+        MixedFixture {
+            claim: BtcLikeTransaction::Liquid(transaction),
+            source_outputs: vec![source_output],
+            merchant_address: String::new(),
+            merchant_blinding_key_hex: String::new(),
+            bull_bitcoin_address: provider_address.to_string(),
+            bull_bitcoin_script_hex: hex::encode(provider_address.script_pubkey().as_bytes()),
+        }
+    }
+
+    #[test]
+    fn exact_provider_only_claim_has_one_payment_output_and_replays_by_script() {
+        let fixture = provider_only_fixture();
+        let fresh = verify_provider_only_liquid_claim(
+            &fixture.claim,
+            &fixture.source_outputs,
+            100_000,
+            &fixture.bull_bitcoin_address,
+            99_000,
+        )
+        .unwrap();
+        let replay = verify_provider_only_liquid_claim_for_script(
+            &fixture.claim,
+            &fixture.source_outputs,
+            100_000,
+            &fixture.bull_bitcoin_script_hex,
+            99_000,
+        )
+        .unwrap();
+        assert_eq!(fresh, replay);
+        assert_eq!(fresh.bull_bitcoin.role, "bull_bitcoin");
+        assert_eq!(fresh.bull_bitcoin.vout, 0);
+        assert_eq!(fresh.bull_bitcoin.authorized_amount_sat, 99_000);
+        assert_eq!(fresh.fee_amount_sat, 1_000);
+
+        assert!(verify_provider_only_liquid_claim(
+            &fixture.claim,
+            &fixture.source_outputs,
+            100_000,
+            &fixture.bull_bitcoin_address,
+            98_999,
+        )
+        .is_err());
+        assert!(verify_provider_only_liquid_claim_for_script(
+            &fixture.claim,
+            &fixture.source_outputs,
+            100_000,
+            &("0014".to_owned() + &"42".repeat(20)),
+            99_000,
+        )
+        .is_err());
+        assert!(verify_provider_only_liquid_claim(
+            &fixture.claim,
+            &fixture.source_outputs,
+            99_999,
+            &fixture.bull_bitcoin_address,
+            99_000,
+        )
+        .is_err());
+        let mut reordered = fixture.claim.as_liquid().unwrap().clone();
+        reordered.output.swap(0, 1);
+        assert!(verify_provider_only_liquid_claim(
+            &BtcLikeTransaction::Liquid(reordered),
+            &fixture.source_outputs,
+            100_000,
+            &fixture.bull_bitcoin_address,
+            99_000,
+        )
+        .is_err());
     }
 
     #[test]

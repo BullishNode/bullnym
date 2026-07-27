@@ -667,7 +667,7 @@ fn project_lightning_address_settlement(
         status: status.to_owned(),
     };
     match row.purpose.as_str() {
-        "fiat_only" => Ok(LightningAddressSettlementEntry::Fiat { fiat }),
+        "fiat_only" | "provider_only" => Ok(LightningAddressSettlementEntry::Fiat { fiat }),
         "mixed" => {
             let amount_sat = row
                 .merchant_bitcoin_sat
@@ -848,6 +848,36 @@ mod tests {
                     currency: "CAD".into(),
                     order_id,
                     status: "settled".into(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn provider_only_lightning_address_projects_as_strict_fiat() {
+        let order_id = Uuid::new_v4();
+        let projected = project_lightning_address_settlement(
+            db::LightningAddressBullBitcoinSettlementProjection {
+                purpose: "provider_only".into(),
+                bull_bitcoin_order_id: Some(order_id),
+                fiat_currency: "CAD".into(),
+                settlement_status: "pending".into(),
+                credited_fiat_minor: None,
+                funding_route: Some("bull_bitcoin".into()),
+                fallback_category: None,
+                merchant_bitcoin_sat: None,
+                merchant_bitcoin_settled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            LightningAddressSettlementEntry::Fiat {
+                fiat: FiatSettlementEntry {
+                    amount_minor: None,
+                    currency: "CAD".into(),
+                    order_id,
+                    status: "pending".into(),
                 },
             }
         );

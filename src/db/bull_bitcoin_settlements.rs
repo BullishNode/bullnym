@@ -353,8 +353,8 @@ pub async fn active_lightning_address_fiat_setting(
     .await
 }
 
-/// Revalidate the exact setting observed before Boltz I/O and, for a mixed
-/// setting, capture it onto the newly inserted swap. `None` means the callback
+/// Revalidate the exact setting observed before Boltz I/O and, for any nonzero
+/// fiat allocation, capture it onto the newly inserted swap. `None` means the callback
 /// observed no fiat policy and requires that to remain true at commit.
 pub async fn validate_and_capture_lightning_address_policy(
     tx: &mut Transaction<'_, Postgres>,
@@ -397,41 +397,9 @@ pub async fn validate_and_capture_lightning_address_policy(
     let expected = expected.ok_or_else(|| {
         sqlx::Error::Protocol("Lightning Address fiat policy disappeared during validation".into())
     })?;
-    if expected.fiat_percentage == 100 {
-        let exact: bool = sqlx::query_scalar(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM fiat_settlement_settings setting \
-                 JOIN bull_bitcoin_credentials credential \
-                   ON credential.id = setting.credential_id \
-                  AND credential.owner_npub = setting.owner_npub \
-                 JOIN users account ON account.npub = setting.owner_npub \
-                  AND account.nym = $2 AND account.is_active \
-                  WHERE setting.owner_npub = $1 \
-                    AND setting.product = 'lightning_address' \
-                    AND setting.credential_id = $3 \
-                    AND setting.fiat_percentage = 100 \
-                    AND setting.fiat_currency = $4 \
-                    AND credential.admitted_for_new_orders \
-                    AND credential.ciphertext IS NOT NULL \
-                    AND credential.nonce IS NOT NULL \
-             )",
-        )
-        .bind(&owner_npub)
-        .bind(nym)
-        .bind(expected.credential_id)
-        .bind(&expected.fiat_currency)
-        .fetch_one(&mut **tx)
-        .await?;
-        if !exact {
-            return Err(sqlx::Error::Protocol(
-                "Lightning Address fiat setting changed during offer creation".into(),
-            ));
-        }
-        return Ok(false);
-    }
-    if !(1..=99).contains(&expected.fiat_percentage) {
+    if !(1..=100).contains(&expected.fiat_percentage) {
         return Err(sqlx::Error::Protocol(
-            "only a mixed Lightning Address policy can bind a Boltz swap".into(),
+            "only a nonzero Lightning Address fiat policy can bind a Boltz swap".into(),
         ));
     }
     let result = sqlx::query(
@@ -945,7 +913,7 @@ pub async fn route_unfunded_mixed_settlement_to_fallback(
                 instruction_kind = NULL, payer_instruction = NULL, \
                 instruction_expires_at = NULL, next_attempt_at = NULL, \
                 updated_at = now() \
-          WHERE id = $1 AND purpose = 'mixed' \
+          WHERE id = $1 AND purpose IN ('mixed', 'provider_only') \
             AND provider_state = 'bound' AND funding_route IS NULL \
             AND funding_committed_at IS NULL AND settlement_status = 'none'",
     )
@@ -1004,6 +972,55 @@ pub async fn commit_mixed_bull_bitcoin_funding(
     if updated.rows_affected() != 1 {
         return Err(sqlx::Error::Protocol(
             "mixed Bull Bitcoin funding transition lost its exact row".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Persist the sole provider output for a swap-backed 100%-fiat Lightning
+/// Address and make the exact order eligible for reconciliation atomically.
+pub async fn commit_provider_only_bull_bitcoin_funding(
+    tx: &mut Transaction<'_, Postgres>,
+    settlement_id: Uuid,
+    bull_bitcoin: &NewBullBitcoinClaimOutput<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO bull_bitcoin_claim_outputs ( \
+             settlement_id, role, txid, vout, script_pubkey_hex, \
+             authorized_amount_sat, asset_commitment_sha256, \
+             value_commitment_sha256, nonce_commitment_sha256, \
+             surjection_proof_sha256, rangeproof_sha256 \
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(settlement_id)
+    .bind(bull_bitcoin.role)
+    .bind(bull_bitcoin.txid)
+    .bind(bull_bitcoin.vout)
+    .bind(bull_bitcoin.script_pubkey_hex)
+    .bind(bull_bitcoin.authorized_amount_sat)
+    .bind(bull_bitcoin.asset_commitment_sha256)
+    .bind(bull_bitcoin.value_commitment_sha256)
+    .bind(bull_bitcoin.nonce_commitment_sha256)
+    .bind(bull_bitcoin.surjection_proof_sha256)
+    .bind(bull_bitcoin.rangeproof_sha256)
+    .execute(&mut **tx)
+    .await?;
+    let updated = sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET funding_route = 'bull_bitcoin', funding_committed_at = now(), \
+                settlement_status = 'pending', instruction_kind = NULL, \
+                payer_instruction = NULL, instruction_expires_at = NULL, \
+                next_attempt_at = now(), updated_at = now() \
+          WHERE id = $1 AND purpose = 'provider_only' \
+            AND provider_state = 'bound' AND funding_route IS NULL \
+            AND funding_committed_at IS NULL AND settlement_status = 'none'",
+    )
+    .bind(settlement_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "provider-only Bull Bitcoin funding transition lost its exact row".into(),
         ));
     }
     Ok(())
@@ -1408,7 +1425,7 @@ pub async fn invalidate_bull_bitcoin_credential_on_connection(
                 instruction_kind = NULL, payer_instruction = NULL, \
                 instruction_expires_at = NULL, next_attempt_at = NULL, \
                 updated_at = now() \
-          WHERE credential_id = $1 AND purpose = 'mixed' \
+          WHERE credential_id = $1 AND purpose IN ('mixed', 'provider_only') \
             AND provider_state = 'bound' AND funding_route IS NULL \
             AND funding_committed_at IS NULL AND settlement_status = 'none'",
     )

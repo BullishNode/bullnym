@@ -33,6 +33,10 @@ dependency health separately.
 - funded fiat-only Bull Bitcoin rows retaining a payer instruction (must stay
   zero), and attempts to quote or reserve a second payer intent after provider
   funds are observed;
+- swap-backed `provider_only` rows by reserved/dispatch/bound/funded/final
+  phase, time from Boltz funding to provider binding, and any funded row whose
+  immutable journal is not exactly one Bull Bitcoin vout-0 output (must stay
+  zero);
 - fiat-fixed Bull Bitcoin payment events without immutable quote valuation,
   split by legacy-unattributable and current-schema rows (the latter must stay
   zero);

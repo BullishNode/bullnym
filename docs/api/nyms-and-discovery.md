@@ -82,6 +82,10 @@ settings, a callback combining `comment` with `payment_method=L-BTC` fails
 closed instead of accepting text it cannot durably associate with that rail.
 For a 100%-fiat setting, the callback accepts the payment but deliberately
 forgets the optional comment; it never persists or returns the payer text.
+The default Lightning response is still a Boltz BOLT11. Bullnym creates the
+Bull Bitcoin Liquid conversion leg only after Boltz funding establishes the
+exact claim amount; settlement policy and provider identity remain private.
+An explicit `L-BTC` request continues to return the direct Liquid instruction.
 
 ## `GET /.well-known/nostr.json?name=:nym`
 

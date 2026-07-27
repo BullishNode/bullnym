@@ -43,6 +43,13 @@ with that rail. For a 100%-fiat setting, Bullnym accepts the payment but
 deliberately forgets the optional comment; it never persists or returns the
 payer text.
 
+The default Lightning callback always returns a Boltz BOLT11, including for a
+100%-fiat setting. After the reverse swap is funded, Bullnym claims its exact
+net L-BTC amount into one Bull Bitcoin Liquid order output. The public callback
+therefore does not expose, create, or identify a direct Bull Bitcoin Lightning
+instruction. A payer that explicitly selects `L-BTC` continues to receive the
+direct Liquid instruction for that rail.
+
 A public client requesting `L-BTC` also supplies every Approach B proof field:
 
 | Query field | Format | Meaning |

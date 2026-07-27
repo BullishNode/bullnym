@@ -47,17 +47,22 @@ These are implementation requirements, not open questions.
   `EUR`, `MXN`, or `USD`.
 - Bullnym sends `bitcoinAmount`, never `fiatAmount`, when it creates a Bull
   Bitcoin order.
-- Fiat-only settlement uses the payer's selected source rail directly:
-  Bitcoin/Payjoin, Lightning, or Liquid.
+- Fiat-only settlement normally uses the payer's selected source rail
+  directly. The Lightning Address Lightning rail is the deliberate exception:
+  it always exposes a Boltz BOLT11 and converts the exact net claim through a
+  Bull Bitcoin Liquid order after funding. Direct Liquid remains direct.
 - Mixed settlement always converts the fiat share from an L-BTC output of the
   Bullnym Boltz claim. A Lightning payer uses a reverse swap and a Bitcoin
   payer uses a chain swap. Direct Liquid is not offered for mixed settlement.
-- The merchant's Bitcoin output is the primary/remainder claim output. The Bull
-  Bitcoin L-BTC output is one fixed additional output.
+- For a 1-99% mixed claim, the merchant's Bitcoin output is the
+  primary/remainder output and the Bull Bitcoin L-BTC output is one fixed
+  additional output. A 100%-fiat Lightning Address claim has one Bull Bitcoin
+  output and never creates a zero-value merchant output.
 - Split percentages apply to the net amount available to settle after the
-  exact current two-confidential-output claim fee. Payer quotes and the
-  Bitcoin-only one-output path remain unchanged: Bullnym does not pre-create a
-  Bull Bitcoin order merely to predict a future claim fee.
+  exact current claim fee for the selected one- or two-confidential-output
+  shape. Payer quotes and the Bitcoin-only one-output path remain unchanged:
+  Bullnym does not pre-create a Bull Bitcoin order merely to predict a future
+  claim fee.
 - Integer rounding favors the Bitcoin output:
   `fiat_sat = floor(net_settlement_sat * fiat_percent / 100)` and the primary
   Bitcoin output receives the remainder.
@@ -279,8 +284,8 @@ weakening the final constraints.
 - one row per payer instruction or mixed claim leg, so an invoice may have
   several partial settlements without overwriting history;
 - owner npub, optional invoice ID, product, captured percentage/currency/terms,
-  purpose (`fiat_only` or `mixed`), payer rail, and optional reverse/chain swap
-  binding;
+  purpose (`fiat_only`, `mixed`, or the swap-backed Lightning Address
+  `provider_only`), payer rail, and optional reverse/chain swap binding;
 - one durable local request key, unique within its owner/invoice or Lightning
   Address intent, and the exact credential-generation ID while reconciliation
   still needs it;
