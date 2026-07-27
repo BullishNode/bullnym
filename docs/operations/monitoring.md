@@ -21,9 +21,16 @@ dependency health separately.
 - unfunded-provider-watch depth, oldest due age, and reconciliation delay,
   separate from funded payout-pending work;
 - exact-order provider reads split into transient failures, temporary
-  authenticated `NotFound`, persistent-missing escalations, and successful
+  authenticated `NotFound`, unverified `NotFound`, authentication failures,
+  persistent-missing escalations, low-cadence persistent watches, and successful
   recovery; alert on persistent holds and page immediately when any such hold
-  has local money evidence;
+  has local money evidence. Use the stable event names
+  `bull_bitcoin_provider_order_temporarily_not_found`,
+  `bull_bitcoin_provider_order_not_found_unverified`,
+  `bull_bitcoin_provider_order_read_authentication_failure`,
+  `bull_bitcoin_provider_order_persistently_missing`,
+  `bull_bitcoin_provider_order_persistent_missing_watch`, and
+  `bull_bitcoin_provider_order_missing_resolved`;
 - `money_admission_creation_circuit_changed` state/reason transitions and its
   monotonic provider-creation transition count;
 - `chain_provider_limits_startup_*` and `chain_provider_limits_refresh_*`

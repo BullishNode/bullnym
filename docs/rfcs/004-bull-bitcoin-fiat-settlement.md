@@ -596,8 +596,9 @@ second create.
   both `provider_not_found_escalation_attempts` consecutive 404s and
   `provider_not_found_escalation_secs` have elapsed, and a read-only
   authenticated provider preflight succeeds; retain the immutable order
-  binding, clear the payer instruction, enter an integrity hold, and poll at
-  the low-frequency watch cadence. Never abandon or replace the order. A later
+  binding, suppress the retained payer instruction from payer-facing reads,
+  enter an integrity hold, and poll at the low-frequency watch cadence. Never
+  abandon or replace the order. A later
   authoritative observation for that same order resolves this specific hold,
   and any received-money evidence remains a financial liability throughout;
 - reduce invoice fiat status over all value-bearing legs after each change;

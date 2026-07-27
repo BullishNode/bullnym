@@ -371,7 +371,7 @@ assert_provider_not_found_migration_owner_boundary() {
     docker exec "$CONTAINER" \
       psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --username "$PG_USER" --dbname "$runtime_scratch" \
-        --command "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'bull_bitcoin_settlements' AND column_name IN ('provider_last_read_error_class', 'provider_last_read_error_at', 'provider_not_found_first_at', 'provider_not_found_consecutive', 'provider_missing_since', 'provider_missing_last_resolved_at');"
+        --command "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'bull_bitcoin_settlements' AND column_name IN ('provider_last_read_error_class', 'provider_last_read_error_at', 'provider_last_success_at', 'provider_not_found_first_at', 'provider_not_found_consecutive', 'provider_missing_since', 'provider_missing_last_resolved_at');"
   )"
   [[ "$rollback_state" == "0" ]] \
     || die "migration 080 runtime-role refusal leaked provider-read columns ($rollback_state)"

@@ -535,6 +535,50 @@ After migration 079 commits, never start a schema-078-or-older writer: it does
 not understand the provider-only policy or one-output journal. Fix forward, or
 restore the matching validated pre-079 database backup and artifact together.
 
+## Migration 080 persistent provider-order NotFound
+
+Apply `080_persistent_provider_order_not_found.sql` as the privileged owner of
+`bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Retain a validated
+schema-079 database backup and its matching artifact before applying 080.
+
+Before migration, record the count of bound, non-final provider rows and verify
+that none of the seven migration-080 columns already exists:
+
+```sql
+SELECT COUNT(*) AS bound_nonfinal_orders
+FROM bull_bitcoin_settlements
+WHERE provider_state = 'bound' AND NOT provider_final;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'bull_bitcoin_settlements'
+  AND column_name IN (
+      'provider_last_read_error_class',
+      'provider_last_read_error_at',
+      'provider_last_success_at',
+      'provider_not_found_first_at',
+      'provider_not_found_consecutive',
+      'provider_missing_since',
+      'provider_missing_last_resolved_at'
+  )
+ORDER BY column_name;
+```
+
+The expected column result is empty. Migration 080 adds nullable observation
+state plus a zero-valued streak counter; it does not infer NotFound or success
+evidence for historical rows. After applying it, require `/ready` and
+`/version` from the matching schema-080 binary, then run the historical audit
+in [Bull Bitcoin provider-order missing audit](bull-bitcoin-provider-missing.md)
+before enabling new fiat admission.
+
+Do not start a schema-079-or-older writer after migration 080 commits: it cannot
+maintain the missing-order state or recover its integrity hold. Operational
+recovery is to keep writers stopped and repair forward with the schema-080
+binary. Restoring schema 079 requires restoring the matching pre-080 database
+backup and artifact together; never downgrade only the binary.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

@@ -55,6 +55,7 @@ $$;
 ALTER TABLE bull_bitcoin_settlements
     ADD COLUMN provider_last_read_error_class TEXT,
     ADD COLUMN provider_last_read_error_at TIMESTAMPTZ,
+    ADD COLUMN provider_last_success_at TIMESTAMPTZ,
     ADD COLUMN provider_not_found_first_at TIMESTAMPTZ,
     ADD COLUMN provider_not_found_consecutive INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN provider_missing_since TIMESTAMPTZ,
@@ -64,7 +65,9 @@ ALTER TABLE bull_bitcoin_settlements
             provider_last_read_error_class IS NULL
             AND provider_last_read_error_at IS NULL
         ) OR (
-            provider_last_read_error_class IN ('not_found', 'transient')
+            provider_last_read_error_class IN (
+                'not_found', 'not_found_unverified', 'transient', 'authentication'
+            )
             AND provider_last_read_error_at IS NOT NULL
         )
     ),
@@ -95,9 +98,11 @@ ALTER TABLE bull_bitcoin_settlements
     );
 
 COMMENT ON COLUMN bull_bitcoin_settlements.provider_last_read_error_class IS
-    'Last exact-order read failure class: authenticated not_found or transient transport/upstream failure.';
+    'Last exact-order read failure class: qualified/unverified not_found, transient transport/upstream, or authentication.';
 COMMENT ON COLUMN bull_bitcoin_settlements.provider_not_found_first_at IS
     'Start of the current consecutive authenticated exact-order NotFound streak.';
+COMMENT ON COLUMN bull_bitcoin_settlements.provider_last_success_at IS
+    'Most recent valid exact-order provider observation; NULL when no successful read has been observed locally.';
 COMMENT ON COLUMN bull_bitcoin_settlements.provider_not_found_consecutive IS
     'Current consecutive authenticated exact-order NotFound count; reset by any non-NotFound result.';
 COMMENT ON COLUMN bull_bitcoin_settlements.provider_missing_since IS

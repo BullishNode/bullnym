@@ -1140,6 +1140,12 @@ fn stored_outcome(
         stored.funding_route.as_deref(),
     ) {
         ("bound", Some("bull_bitcoin")) => {
+            if stored.provider_missing_since_unix_micros.is_some() {
+                // Retain the exact original instruction in durable storage for
+                // audit and provider-authoritative recovery, but never project
+                // it to a payer while the provider denies the order exists.
+                return Err(SettlementServiceError::StoredState);
+            }
             if stored.actual_received_sat.is_some() {
                 // A provider funding observation permanently closes payer
                 // admission even while payout reconciliation is still pending.
@@ -1612,10 +1618,14 @@ async fn reconcile_settlement(
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
                 if settlement.provider_missing_since_unix_micros.is_some() {
+                    let financial_evidence_present =
+                        db::bull_bitcoin_financial_evidence_present(&state.db, settlement.id)
+                            .await
+                            .map_err(|_| SettlementServiceError::Database)?;
                     tracing::info!(
                         event = "bull_bitcoin_provider_order_missing_resolved",
                         settlement_id = %settlement.id,
-                        financial_evidence_present = observation.actual_received_sat.is_some(),
+                        financial_evidence_present,
                         "A persistent exact-order NotFound hold was resolved by an authoritative provider observation"
                     );
                 }
@@ -1635,9 +1645,20 @@ async fn reconcile_settlement(
             }
         }
         Err(BullBitcoinError::Authentication) => {
-            db::invalidate_bull_bitcoin_credential(&state.db, settlement.credential_id)
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+            db::record_bull_bitcoin_provider_authentication_retry(
+                &state.db,
+                settlement.id,
+                retry_delay_secs(state, settlement.reconcile_attempts),
+                late_payment_watch_delay_secs(state),
+            )
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+            tracing::error!(
+                event = "bull_bitcoin_provider_order_read_authentication_failure",
+                settlement_id = %settlement.id,
+                persistent_missing = settlement.provider_missing_since_unix_micros.is_some(),
+                "A previously bound Bull Bitcoin order could not be read with its retained credential generation"
+            );
         }
         Err(BullBitcoinError::Integrity | BullBitcoinError::MalformedResponse) => {
             db::record_bull_bitcoin_terminal_problem(&state.db, settlement.id, "integrity_error")
@@ -1646,9 +1667,20 @@ async fn reconcile_settlement(
         }
         Err(BullBitcoinError::NotFound) => {
             if provider_health_after_not_found == Some(Err(BullBitcoinError::Authentication)) {
-                db::invalidate_bull_bitcoin_credential(&state.db, settlement.credential_id)
-                    .await
-                    .map_err(|_| SettlementServiceError::Database)?;
+                db::record_bull_bitcoin_provider_authentication_retry(
+                    &state.db,
+                    settlement.id,
+                    retry_delay_secs(state, settlement.reconcile_attempts),
+                    late_payment_watch_delay_secs(state),
+                )
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+                tracing::error!(
+                    event = "bull_bitcoin_provider_order_read_authentication_failure",
+                    settlement_id = %settlement.id,
+                    persistent_missing = settlement.provider_missing_since_unix_micros.is_some(),
+                    "An exact-order NotFound could not be qualified because the authenticated preflight failed"
+                );
                 return Ok(());
             }
             let provider_api_healthy = matches!(
@@ -1678,21 +1710,38 @@ async fn reconcile_settlement(
             .map_err(|_| SettlementServiceError::Database)?;
             if outcome.escalated_now {
                 tracing::error!(
-                    event = "bull_bitcoin_provider_order_persistently_missing",
+                    event = provider_not_found_event(&outcome, provider_api_healthy),
                     settlement_id = %settlement.id,
                     consecutive_not_found = outcome.consecutive,
                     financial_evidence_present = outcome.financial_evidence_present,
                     provider_api_healthy,
                     "A previously bound Bull Bitcoin order remained missing past both escalation thresholds"
                 );
-            } else {
+            } else if outcome.persistent_missing {
                 tracing::warn!(
-                    event = "bull_bitcoin_provider_order_temporarily_not_found",
+                    event = provider_not_found_event(&outcome, provider_api_healthy),
+                    settlement_id = %settlement.id,
+                    consecutive_not_found = outcome.consecutive,
+                    financial_evidence_present = outcome.financial_evidence_present,
+                    provider_api_healthy,
+                    "A persistent missing-order hold remains under low-cadence exact-order watch"
+                );
+            } else if provider_api_healthy {
+                tracing::warn!(
+                    event = provider_not_found_event(&outcome, provider_api_healthy),
                     settlement_id = %settlement.id,
                     consecutive_not_found = outcome.consecutive,
                     persistent_missing = outcome.persistent_missing,
                     provider_api_healthy,
                     "An authenticated exact-order read returned NotFound"
+                );
+            } else {
+                tracing::warn!(
+                    event = provider_not_found_event(&outcome, provider_api_healthy),
+                    settlement_id = %settlement.id,
+                    consecutive_not_found = outcome.consecutive,
+                    provider_api_healthy,
+                    "An exact-order NotFound did not qualify because provider health could not be authenticated"
                 );
             }
         }
@@ -1797,6 +1846,21 @@ fn late_payment_watch_delay_secs(state: &AppState) -> i64 {
     i64::try_from(state.config.bull_bitcoin.late_payment_watch_interval_secs).unwrap_or(i64::MAX)
 }
 
+fn provider_not_found_event(
+    outcome: &db::ProviderNotFoundOutcome,
+    provider_api_healthy: bool,
+) -> &'static str {
+    if outcome.escalated_now {
+        "bull_bitcoin_provider_order_persistently_missing"
+    } else if outcome.persistent_missing {
+        "bull_bitcoin_provider_order_persistent_missing_watch"
+    } else if provider_api_healthy {
+        "bull_bitcoin_provider_order_temporarily_not_found"
+    } else {
+        "bull_bitcoin_provider_order_not_found_unverified"
+    }
+}
+
 fn map_store_error(error: BullBitcoinSettlementStoreError) -> SettlementServiceError {
     match error {
         BullBitcoinSettlementStoreError::SourceIdentityNotActive => {
@@ -1855,11 +1919,52 @@ mod tests {
             provider_final: false,
             provider_last_read_error_class: None,
             provider_last_read_error_at_unix_micros: None,
+            provider_last_success_at_unix_micros: None,
             provider_not_found_first_at_unix_micros: None,
             provider_not_found_consecutive: 0,
             provider_missing_since_unix_micros: None,
             provider_missing_last_resolved_at_unix_micros: None,
         }
+    }
+
+    #[test]
+    fn provider_not_found_event_taxonomy_is_stable_and_persistent_is_not_temporary() {
+        let temporary = db::ProviderNotFoundOutcome {
+            consecutive: 1,
+            escalated_now: false,
+            persistent_missing: false,
+            financial_evidence_present: false,
+        };
+        assert_eq!(
+            provider_not_found_event(&temporary, true),
+            "bull_bitcoin_provider_order_temporarily_not_found"
+        );
+        assert_eq!(
+            provider_not_found_event(&temporary, false),
+            "bull_bitcoin_provider_order_not_found_unverified"
+        );
+
+        let persistent = db::ProviderNotFoundOutcome {
+            consecutive: 0,
+            escalated_now: false,
+            persistent_missing: true,
+            financial_evidence_present: true,
+        };
+        assert_eq!(
+            provider_not_found_event(&persistent, false),
+            "bull_bitcoin_provider_order_persistent_missing_watch"
+        );
+
+        let escalated = db::ProviderNotFoundOutcome {
+            consecutive: 3,
+            escalated_now: true,
+            persistent_missing: true,
+            financial_evidence_present: true,
+        };
+        assert_eq!(
+            provider_not_found_event(&escalated, true),
+            "bull_bitcoin_provider_order_persistently_missing"
+        );
     }
 
     #[test]

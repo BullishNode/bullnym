@@ -1466,12 +1466,13 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND (column_name, data_type, is_nullable) IN ( \
                        ('provider_last_read_error_class', 'text', 'YES'), \
                        ('provider_last_read_error_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_last_success_at', 'timestamp with time zone', 'YES'), \
                        ('provider_not_found_first_at', 'timestamp with time zone', 'YES'), \
                        ('provider_not_found_consecutive', 'integer', 'NO'), \
                        ('provider_missing_since', 'timestamp with time zone', 'YES'), \
                        ('provider_missing_last_resolved_at', 'timestamp with time zone', 'YES') \
                    ) \
-            ) = 6 \
+            ) = 7 \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \

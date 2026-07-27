@@ -76,6 +76,7 @@ pub struct StoredBullBitcoinSettlement {
     pub provider_final: bool,
     pub provider_last_read_error_class: Option<String>,
     pub provider_last_read_error_at_unix_micros: Option<i64>,
+    pub provider_last_success_at_unix_micros: Option<i64>,
     pub provider_not_found_first_at_unix_micros: Option<i64>,
     pub provider_not_found_consecutive: i32,
     pub provider_missing_since_unix_micros: Option<i64>,
@@ -230,6 +231,8 @@ const SETTLEMENT_PROJECTION: &str =
      provider_last_read_error_class, \
      (EXTRACT(EPOCH FROM provider_last_read_error_at) * 1000000)::BIGINT \
          AS provider_last_read_error_at_unix_micros, \
+     (EXTRACT(EPOCH FROM provider_last_success_at) * 1000000)::BIGINT \
+         AS provider_last_success_at_unix_micros, \
      (EXTRACT(EPOCH FROM provider_not_found_first_at) * 1000000)::BIGINT \
          AS provider_not_found_first_at_unix_micros, \
      provider_not_found_consecutive, \
@@ -1273,6 +1276,7 @@ pub async fn record_bull_bitcoin_observation(
                 provider_final = $7, \
                 provider_last_read_error_class = NULL, \
                 provider_last_read_error_at = NULL, \
+                provider_last_success_at = now(), \
                 provider_not_found_first_at = NULL, \
                 provider_not_found_consecutive = 0, \
                 provider_missing_last_resolved_at = CASE \
@@ -1444,8 +1448,12 @@ pub async fn record_bull_bitcoin_provider_not_found(
               FOR UPDATE \
          ), decision AS ( \
              SELECT target.*, \
-                    target.provider_not_found_consecutive + 1 AS next_consecutive, \
-                    COALESCE(target.provider_not_found_first_at, now()) AS next_first_at, \
+                    CASE WHEN $6 \
+                         THEN target.provider_not_found_consecutive + 1 \
+                         ELSE 0 END AS next_consecutive, \
+                    CASE WHEN $6 \
+                         THEN COALESCE(target.provider_not_found_first_at, now()) \
+                         ELSE NULL END AS next_first_at, \
                     ($6 \
                      AND target.provider_not_found_consecutive + 1 >= $4 \
                      AND now() >= COALESCE(target.provider_not_found_first_at, now()) \
@@ -1454,7 +1462,8 @@ pub async fn record_bull_bitcoin_provider_not_found(
                FROM target \
          ), updated AS ( \
              UPDATE bull_bitcoin_settlements settlement \
-                SET provider_last_read_error_class = 'not_found', \
+                SET provider_last_read_error_class = CASE WHEN $6 \
+                        THEN 'not_found' ELSE 'not_found_unverified' END, \
                     provider_last_read_error_at = now(), \
                     provider_not_found_first_at = decision.next_first_at, \
                     provider_not_found_consecutive = decision.next_consecutive, \
@@ -1465,12 +1474,6 @@ pub async fn record_bull_bitcoin_provider_not_found(
                     settlement_status = CASE \
                         WHEN decision.should_escalate THEN 'integrity_error' \
                         ELSE settlement.settlement_status END, \
-                    payer_instruction = CASE \
-                        WHEN decision.should_escalate THEN NULL \
-                        ELSE settlement.payer_instruction END, \
-                    instruction_kind = CASE \
-                        WHEN decision.should_escalate THEN NULL \
-                        ELSE settlement.instruction_kind END, \
                     last_checked_at = now(), \
                     reconcile_attempts = settlement.reconcile_attempts + 1, \
                     next_attempt_at = now() + make_interval(secs => (CASE \
@@ -1506,6 +1509,33 @@ pub async fn record_bull_bitcoin_provider_not_found(
     })
 }
 
+/// Return the conservative local/provider evidence predicate used to classify
+/// a missing-order hold. This never makes an abandonment decision.
+pub async fn bull_bitcoin_financial_evidence_present(
+    pool: &PgPool,
+    settlement_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT settlement.actual_received_sat IS NOT NULL \
+                OR (settlement.purpose = 'mixed' \
+                    AND settlement.funding_committed_at IS NOT NULL) \
+                OR EXISTS ( \
+                    SELECT 1 FROM bull_bitcoin_claim_outputs output \
+                     WHERE output.settlement_id = settlement.id \
+                ) \
+                OR EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events event \
+                     WHERE event.bull_bitcoin_settlement_id = settlement.id \
+                        OR (settlement.invoice_id IS NOT NULL \
+                            AND event.invoice_id = settlement.invoice_id) \
+                ) \
+           FROM bull_bitcoin_settlements settlement WHERE settlement.id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Record a retryable transport/upstream exact-order read failure separately
 /// from authenticated NotFound. A transient failure breaks a 404 streak but
 /// cannot clear an already-escalated missing-order integrity hold.
@@ -1518,6 +1548,42 @@ pub async fn record_bull_bitcoin_provider_transient_retry(
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
             SET provider_last_read_error_class = 'transient', \
+                provider_last_read_error_at = now(), \
+                provider_not_found_first_at = NULL, \
+                provider_not_found_consecutive = 0, \
+                reconcile_attempts = reconcile_attempts + 1, \
+                last_checked_at = now(), \
+                next_attempt_at = now() + make_interval(secs => (CASE \
+                    WHEN provider_missing_since IS NOT NULL THEN $3 \
+                    ELSE $2 END)::DOUBLE PRECISION), \
+                updated_at = now() \
+          WHERE id = $1 AND provider_state = 'bound' \
+            AND funding_route = 'bull_bitcoin' \
+            AND (settlement_status = 'pending' \
+                 OR (settlement_status = 'integrity_error' \
+                     AND provider_missing_since IS NOT NULL))",
+    )
+    .bind(settlement_id)
+    .bind(delay_secs)
+    .bind(persistent_watch_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// An authentication failure while reading a previously bound order is an
+/// access incident, not proof that the financial obligation disappeared.
+/// Preserve the credential generation, order, instruction, and ordinary retry
+/// path so an operator/provider correction can recover the same order.
+pub async fn record_bull_bitcoin_provider_authentication_retry(
+    pool: &PgPool,
+    settlement_id: Uuid,
+    delay_secs: i64,
+    persistent_watch_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET provider_last_read_error_class = 'authentication', \
                 provider_last_read_error_at = now(), \
                 provider_not_found_first_at = NULL, \
                 provider_not_found_consecutive = 0, \

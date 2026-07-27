@@ -15,7 +15,7 @@ BEGIN
            'provider_missing_since',
            'provider_missing_last_resolved_at'
        );
-    IF provider_columns <> 6 THEN
+    IF provider_columns <> 7 THEN
         RAISE EXCEPTION 'migration 080 did not create all provider-read state columns';
     END IF;
 

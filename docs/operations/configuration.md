@@ -56,7 +56,8 @@ Bull Bitcoin exact-order reads use
 `provider_not_found_escalation_attempts` (default `3`) together with
 `provider_not_found_escalation_secs` (default `120`). Both thresholds and a
 successful authenticated provider preflight are required before a bound order
-enters the persistent-missing integrity hold. Keep the low-cadence
+enters the persistent-missing integrity hold. A failed preflight breaks the
+qualifying streak rather than contributing evidence toward the hold. Keep the low-cadence
 `late_payment_watch_interval_secs` comfortably above the ordinary reconcile
 interval; it also bounds polling for an escalated missing-order hold. These
 settings suppress stale payer admission and reduce retry noise. They never

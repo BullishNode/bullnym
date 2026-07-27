@@ -6351,7 +6351,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "079_lightning_address_provider_only"
+        "080_persistent_provider_order_not_found"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -6592,7 +6592,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "079_lightning_address_provider_only"
+        "080_persistent_provider_order_not_found"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")

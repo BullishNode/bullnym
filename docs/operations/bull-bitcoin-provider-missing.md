@@ -14,6 +14,7 @@ SELECT id,
        reconcile_attempts,
        instruction_expires_at,
        last_checked_at,
+       provider_last_success_at,
        actual_received_sat,
        funding_committed_at,
        provider_missing_since
@@ -32,7 +33,9 @@ erase its credential, create a replacement, or manually label it missing based
 on retry count. Once the 0.4 worker runs, it records authenticated exact-order
 404s from zero, requires the configured count and time thresholds plus a
 healthy authenticated provider preflight, then suppresses the instruction and
-enters the explicit integrity hold.
+enters the explicit integrity hold. Suppression is a read policy: the original
+instruction remains private durable evidence and is never returned while
+`provider_missing_since` is set.
 
 For every escalated row, reconcile the immutable order ID against provider and
 local money evidence. Any payment, claim output, invoice payment event, or
@@ -40,4 +43,3 @@ provider received-funds evidence remains a liability and requires attention.
 A later authoritative observation for the same order lets the worker resolve
 the hold. Replacement requires a separate explicit, audited decision and is
 never performed by this runbook.
-
