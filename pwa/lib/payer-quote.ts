@@ -492,3 +492,17 @@ export class PayerQuoteCoordinator {
 export function payerQuoteRails(): readonly PayerQuoteRail[] {
   return RAILS
 }
+
+/** Public payer copy for an instruction that is not ready yet. Errors stay
+ * rail-neutral: a quote/readiness failure is not evidence that the selected
+ * payment network itself is down. */
+export function paymentInstructionPlaceholder(
+  railLabel: string,
+  accessibility: { busy: boolean; error: boolean },
+): string {
+  if (accessibility.busy) return `Refreshing ${railLabel} instruction…`
+  if (accessibility.error) {
+    return 'This payment option is temporarily unavailable. Choose another option or retry.'
+  }
+  return `Preparing ${railLabel} instruction…`
+}

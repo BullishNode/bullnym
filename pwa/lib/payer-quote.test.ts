@@ -13,6 +13,7 @@ import {
   formatQuoteCountdown,
   quoteAccessibilityState,
   quoteRailPresentation,
+  paymentInstructionPlaceholder,
 } from './payer-quote'
 
 const INVOICE_ID = '11111111-1111-4111-8111-111111111111'
@@ -371,5 +372,19 @@ describe('PayerQuoteCoordinator', () => {
 
     coordinator.expire(now)
     expect(captureLightningQuoteAuthority(coordinator.state, now)).toBeNull()
+  })
+
+  it('keeps quote-failure copy neutral across payer rails', () => {
+    const unavailable = { busy: false, error: true }
+    const messages = ['Lightning', 'Liquid', 'Bitcoin'].map((rail) =>
+      paymentInstructionPlaceholder(rail, unavailable),
+    )
+
+    expect(new Set(messages)).toEqual(new Set([
+      'This payment option is temporarily unavailable. Choose another option or retry.',
+    ]))
+    expect(paymentInstructionPlaceholder('Liquid', { busy: true, error: false })).toBe(
+      'Refreshing Liquid instruction…',
+    )
   })
 })
