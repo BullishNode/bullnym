@@ -58,6 +58,8 @@ pub struct StoredBullBitcoinSettlement {
     pub settlement_status: String,
     pub requested_bitcoin_sat: i64,
     pub bull_bitcoin_order_id: Option<Uuid>,
+    pub order_correlation_source: Option<String>,
+    pub order_correlated_at_unix_micros: Option<i64>,
     pub instruction_kind: Option<String>,
     pub payer_instruction: Option<String>,
     pub instruction_expires_at_unix: Option<i64>,
@@ -196,7 +198,10 @@ const SETTLEMENT_PROJECTION: &str =
      credential_id, product, purpose, payer_rail, \
      request_key, fiat_percentage, fiat_currency, provider_state, \
      funding_route, fallback_category, settlement_status, requested_bitcoin_sat, \
-     bull_bitcoin_order_id, instruction_kind, payer_instruction, \
+     bull_bitcoin_order_id, order_correlation_source, \
+     (EXTRACT(EPOCH FROM order_correlated_at) * 1000000)::BIGINT \
+         AS order_correlated_at_unix_micros, \
+     instruction_kind, payer_instruction, \
      extract(epoch FROM instruction_expires_at)::BIGINT AS instruction_expires_at_unix, \
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
      extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
@@ -779,6 +784,9 @@ pub async fn bind_bull_bitcoin_order(
                 funding_committed_at = CASE WHEN purpose = 'fiat_only' \
                     THEN now() ELSE NULL END, \
                 bull_bitcoin_order_id = $2, \
+                order_correlation_source = COALESCE( \
+                    order_correlation_source, 'provider_response'), \
+                order_correlated_at = COALESCE(order_correlated_at, clock_timestamp()), \
                 instruction_kind = $3, payer_instruction = $4, \
                 instruction_expires_at = CASE WHEN $5::BIGINT IS NULL \
                     THEN NULL ELSE to_timestamp($5) END, \
@@ -786,7 +794,8 @@ pub async fn bind_bull_bitcoin_order(
                 quoted_fiat_minor = $7, \
                 next_attempt_at = now(), updated_at = now() \
           WHERE id = $1 AND provider_state = 'dispatch_started' \
-            AND funding_route IS NULL",
+            AND funding_route IS NULL \
+            AND (bull_bitcoin_order_id IS NULL OR bull_bitcoin_order_id = $2)",
     )
     .bind(settlement_id)
     .bind(order_id)
@@ -810,10 +819,44 @@ pub async fn abandon_bull_bitcoin_dispatch(
             SET provider_state = 'abandoned', \
                 funding_route = 'bitcoin_fallback', \
                 fallback_category = $2, updated_at = now() \
-          WHERE id = $1 AND provider_state IN ('reserved', 'dispatch_started')",
+          WHERE id = $1 AND provider_state IN ('reserved', 'dispatch_started') \
+            AND bull_bitcoin_order_id IS NULL",
     )
     .bind(settlement_id)
     .bind(fallback_category)
+    .execute(connection)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Retain correlation evidence from an invalid/ambiguous create response
+/// without treating that response as a usable provider binding. `None` still
+/// marks the durable dispatch as needing reconciliation and never selects a
+/// fallback route.
+pub async fn record_ambiguous_bull_bitcoin_dispatch(
+    connection: &mut PgConnection,
+    settlement_id: Uuid,
+    candidate_order_id: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET bull_bitcoin_order_id = COALESCE(bull_bitcoin_order_id, $2), \
+                order_correlation_source = CASE \
+                    WHEN bull_bitcoin_order_id IS NULL AND $2::UUID IS NOT NULL \
+                    THEN 'provider_response' \
+                    ELSE order_correlation_source END, \
+                order_correlated_at = CASE \
+                    WHEN bull_bitcoin_order_id IS NULL AND $2::UUID IS NOT NULL \
+                    THEN clock_timestamp() \
+                    ELSE order_correlated_at END, \
+                next_attempt_at = now(), updated_at = clock_timestamp() \
+          WHERE id = $1 AND provider_state = 'dispatch_started' \
+            AND funding_route IS NULL \
+            AND (bull_bitcoin_order_id IS NULL \
+                 OR bull_bitcoin_order_id IS NOT DISTINCT FROM $2)",
+    )
+    .bind(settlement_id)
+    .bind(candidate_order_id)
     .execute(connection)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -995,20 +1038,35 @@ pub async fn reverse_mixed_settlement_accounting(
     }))
 }
 
-pub async fn recover_stale_bull_bitcoin_dispatches(
+pub async fn claim_ambiguous_bull_bitcoin_dispatches(
     pool: &PgPool,
     stale_after_secs: i64,
+    retry_after_secs: i64,
+    limit: i64,
 ) -> Result<Vec<StoredBullBitcoinSettlement>, sqlx::Error> {
     sqlx::query_as::<_, StoredBullBitcoinSettlement>(&format!(
-        "UPDATE bull_bitcoin_settlements \
-            SET provider_state = 'abandoned', \
-                funding_route = 'bitcoin_fallback', \
-                fallback_category = 'ambiguous_create', updated_at = now() \
-          WHERE provider_state = 'dispatch_started' \
-            AND updated_at < now() - make_interval(secs => $1::DOUBLE PRECISION) \
+        "WITH due AS ( \
+             SELECT id FROM bull_bitcoin_settlements \
+              WHERE provider_state = 'dispatch_started' \
+                AND funding_route IS NULL \
+                AND (bull_bitcoin_order_id IS NOT NULL \
+                     OR updated_at < now() - make_interval(secs => $1::DOUBLE PRECISION)) \
+                AND (next_attempt_at IS NULL OR next_attempt_at <= now()) \
+              ORDER BY COALESCE(next_attempt_at, updated_at), id \
+              FOR UPDATE SKIP LOCKED LIMIT $3 \
+         ) \
+         UPDATE bull_bitcoin_settlements settlement \
+            SET next_attempt_at = now() + \
+                    make_interval(secs => $2::DOUBLE PRECISION), \
+                last_checked_at = now(), \
+                reconcile_attempts = reconcile_attempts + 1, \
+                updated_at = now() \
+           FROM due WHERE settlement.id = due.id \
          RETURNING {SETTLEMENT_PROJECTION}"
     ))
     .bind(stale_after_secs)
+    .bind(retry_after_secs)
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

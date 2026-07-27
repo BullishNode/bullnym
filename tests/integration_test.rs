@@ -37,9 +37,9 @@ use pay_service::boltz_transport::{
     ScriptedBoltzWebhookEvent, ScriptedBoltzWebhookInstruction, ScriptedBoltzWebhookPlan,
 };
 use pay_service::bull_bitcoin::{
-    BitcoinAmountSat, BitcoinNetwork, BullBitcoinApi, BullBitcoinError, CreateSellRequest,
-    CreatedSellOrder, CredentialCipher, FiatAmountMinor, FiatCurrency, OrderObservation,
-    PayerInstruction, Product, ScopedApiKey,
+    BitcoinAmountSat, BitcoinNetwork, BullBitcoinApi, BullBitcoinError, CreateSellFailure,
+    CreateSellRequest, CreatedSellOrder, CredentialCipher, FiatAmountMinor, FiatCurrency,
+    OrderObservation, PayerInstruction, Product, ScopedApiKey,
 };
 use pay_service::bull_bitcoin_settlement::{
     FallbackCategory, FiatOnlyInstructionOutcome, FiatOnlyInstructionRequest, MixedClaimBasis,
@@ -411,8 +411,10 @@ struct ScriptedBullBitcoinApi {
     validation_calls: Arc<AtomicUsize>,
     create_calls: Arc<AtomicUsize>,
     read_calls: Arc<AtomicUsize>,
+    recovery_calls: Arc<AtomicUsize>,
     validation_results: Arc<Mutex<VecDeque<Result<(), BullBitcoinError>>>>,
-    create_results: Arc<Mutex<VecDeque<Result<CreatedSellOrder, BullBitcoinError>>>>,
+    create_results: Arc<Mutex<VecDeque<Result<CreatedSellOrder, CreateSellFailure>>>>,
+    recovery_results: Arc<Mutex<VecDeque<Result<CreatedSellOrder, BullBitcoinError>>>>,
     read_results: Arc<Mutex<VecDeque<Result<OrderObservation, BullBitcoinError>>>>,
 }
 
@@ -426,7 +428,18 @@ impl ScriptedBullBitcoinApi {
     }
 
     async fn push_create(&self, result: Result<CreatedSellOrder, BullBitcoinError>) {
-        self.create_results.lock().await.push_back(result);
+        self.create_results
+            .lock()
+            .await
+            .push_back(result.map_err(CreateSellFailure::from));
+    }
+
+    async fn push_create_failure(&self, failure: CreateSellFailure) {
+        self.create_results.lock().await.push_back(Err(failure));
+    }
+
+    async fn push_recovery(&self, result: Result<CreatedSellOrder, BullBitcoinError>) {
+        self.recovery_results.lock().await.push_back(result);
     }
 
     async fn push_read(&self, result: Result<OrderObservation, BullBitcoinError>) {
@@ -439,6 +452,10 @@ impl ScriptedBullBitcoinApi {
 
     fn read_call_count(&self) -> usize {
         self.read_calls.load(Ordering::SeqCst)
+    }
+
+    fn recovery_call_count(&self) -> usize {
+        self.recovery_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -457,9 +474,23 @@ impl BullBitcoinApi for ScriptedBullBitcoinApi {
         &self,
         _key: &ScopedApiKey,
         _request: &CreateSellRequest,
-    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+    ) -> Result<CreatedSellOrder, CreateSellFailure> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         self.create_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Err(BullBitcoinError::Upstream.into()))
+    }
+
+    async fn recover_created_sell_to_balance(
+        &self,
+        _key: &ScopedApiKey,
+        _order_id: Uuid,
+        _request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        self.recovery_results
             .lock()
             .await
             .pop_front()
@@ -2761,20 +2792,54 @@ async fn bull_bitcoin_create_failures_never_redispatch_ambiguous_attempts() {
     let timeout_request =
         fiat_only_test_request(&timeout_owner, timeout_credential, "payer-intent-timeout");
     for _ in 0..2 {
-        assert!(matches!(
+        assert_eq!(
             pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
                 &timeout_state,
                 &timeout_request,
             )
             .await
-            .unwrap(),
-            FiatOnlyInstructionOutcome::BitcoinFallback {
-                category: FallbackCategory::AmbiguousCreate,
-                ..
-            }
-        ));
+            .unwrap_err(),
+            pay_service::bull_bitcoin_settlement::SettlementServiceError::ProviderCreateAmbiguous
+        );
     }
     assert_eq!(timeout_fake.create_call_count(), 1);
+    let timeout_row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<Uuid>)>(
+        "SELECT provider_state, funding_route, fallback_category, bull_bitcoin_order_id \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&timeout_owner)
+    .bind("payer-intent-timeout")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(timeout_row, ("dispatch_started".into(), None, None, None));
+
+    let policy_fake = ScriptedBullBitcoinApi::default();
+    policy_fake.push_create(Err(BullBitcoinError::Policy)).await;
+    let (policy_state, policy_owner, policy_credential, _) =
+        fiat_lifecycle_test_state(&pool, policy_fake.clone(), "fiat-lifecycle-policy").await;
+    let policy_request =
+        fiat_only_test_request(&policy_owner, policy_credential, "payer-intent-policy");
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
+            &policy_state,
+            &policy_request,
+        )
+        .await
+        .unwrap_err(),
+        pay_service::bull_bitcoin_settlement::SettlementServiceError::ProviderCreateAmbiguous
+    );
+    assert_eq!(policy_fake.create_call_count(), 1);
+    let policy_route: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT provider_state, funding_route, fallback_category \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&policy_owner)
+    .bind("payer-intent-policy")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(policy_route, ("dispatch_started".into(), None, None));
 
     let minimum_fake = ScriptedBullBitcoinApi::default();
     minimum_fake
@@ -2828,19 +2893,152 @@ async fn bull_bitcoin_create_failures_never_redispatch_ambiguous_attempts() {
             .unwrap()
     );
     drop(connection);
-    assert!(matches!(
+    assert_eq!(
         pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(
             &crash_state,
             &crash_request,
         )
         .await
-        .unwrap(),
-        FiatOnlyInstructionOutcome::BitcoinFallback {
-            category: FallbackCategory::AmbiguousCreate,
-            ..
-        }
-    ));
+        .unwrap_err(),
+        pay_service::bull_bitcoin_settlement::SettlementServiceError::ProviderCreateAmbiguous
+    );
     assert_eq!(crash_fake.create_call_count(), 0);
+    let crash_row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT provider_state, funding_route, fallback_category \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(crash_row, ("dispatch_started".into(), None, None));
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET updated_at = now() - interval '1 day', next_attempt_at = now() \
+          WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&crash_state)
+        .await
+        .unwrap();
+    let after_restart = sqlx::query_as::<_, (String, Option<String>, Option<String>, i32)>(
+        "SELECT provider_state, funding_route, fallback_category, reconcile_attempts \
+           FROM bull_bitcoin_settlements WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_restart, ("dispatch_started".into(), None, None, 1));
+    assert_eq!(crash_fake.create_call_count(), 0);
+    assert_eq!(crash_fake.recovery_call_count(), 0);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_invalid_create_with_order_id_recovers_without_redispatch() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create_failure(CreateSellFailure {
+        error: BullBitcoinError::MalformedResponse,
+        order_id: Some(order_id),
+    })
+    .await;
+    let (state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-correlation-recovery").await;
+    let request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-correlation-recovery",
+    );
+
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap_err(),
+        pay_service::bull_bitcoin_settlement::SettlementServiceError::ProviderCreateAmbiguous
+    );
+    assert_eq!(fake.create_call_count(), 1);
+    let ambiguous = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>)>(
+        "SELECT bull_bitcoin_order_id, provider_state, funding_route, \
+                order_correlation_source \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&owner_npub)
+    .bind("payer-intent-correlation-recovery")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ambiguous,
+        (
+            order_id,
+            "dispatch_started".into(),
+            None,
+            Some("provider_response".into()),
+        )
+    );
+
+    // Removing the current setting must not erase the credential retained by
+    // an ambiguous create. The exact provider order remains recoverable.
+    pay_service::db::delete_fiat_settlement_setting(&pool, &owner_npub, Product::LightningAddress)
+        .await
+        .unwrap();
+    let material_retained: bool = sqlx::query_scalar(
+        "SELECT ciphertext IS NOT NULL FROM bull_bitcoin_credentials WHERE id = $1",
+    )
+    .bind(credential_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(material_retained);
+
+    fake.push_recovery(Ok(scripted_created_order(order_id)))
+        .await;
+    fake.push_read(Ok(OrderObservation {
+        order_id,
+        currency: FiatCurrency::CAD,
+        order_status: "In progress".into(),
+        payin_status: "Awaiting payment".into(),
+        payout_status: "Not started".into(),
+        actual_received_sat: None,
+        credited_fiat_minor: None,
+        quoted_fiat_minor: None,
+        execution_rate_minor_per_btc: None,
+        provider_final: false,
+        provider_terminal: false,
+    }))
+    .await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+    assert_eq!(fake.create_call_count(), 1);
+    assert_eq!(fake.recovery_call_count(), 1);
+    let recovered = sqlx::query_as::<_, (String, String, String, Uuid, String)>(
+        "SELECT provider_state, funding_route, settlement_status, \
+                bull_bitcoin_order_id, order_correlation_source \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&owner_npub)
+    .bind("payer-intent-correlation-recovery")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered,
+        (
+            "bound".into(),
+            "bull_bitcoin".into(),
+            "pending".into(),
+            order_id,
+            "provider_response".into(),
+        )
+    );
     cleanup_db(&pool).await;
 }
 
@@ -2965,6 +3163,40 @@ async fn fiat_only_lnurl_comments_are_accepted_and_discarded_on_both_rails() {
     assert_eq!(persisted, 0, "fiat-only comments must be forgotten");
     assert_eq!(fake.create_call_count(), 2);
 
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn ambiguous_provider_create_is_private_on_public_lnurl() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Err(BullBitcoinError::Timeout)).await;
+    let (mut state, _, _, _) =
+        fiat_lifecycle_test_state(&pool, fake, "fiat-ambiguous-private").await;
+    state.ip_whitelist =
+        Arc::new(IpWhitelist::parse(&["127.0.0.1".to_string()]).expect("parse test whitelist"));
+    let app = test_app(state);
+    let (metadata_status, metadata) =
+        get_path(&app, "/.well-known/lnurlp/fiat-ambiguous-private").await;
+    assert_eq!(metadata_status, StatusCode::OK, "{metadata}");
+    let callback_path = metadata["callback"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("https://test.example.com")
+        .unwrap();
+    let (status, body) = get_path_from(
+        &app,
+        &format!("{callback_path}?amount=100000&payment_method=L-BTC"),
+        "127.0.0.1:42112".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ERROR");
+    let public_body = body.to_string().to_ascii_lowercase();
+    for private_term in ["fiat", "settlement", "provider", "reconciliation"] {
+        assert!(!public_body.contains(private_term), "{body}");
+    }
     cleanup_db(&pool).await;
 }
 
@@ -5479,7 +5711,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "076_unified_wallet_backup_stream"
+        "077_bull_bitcoin_create_correlation"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -5720,7 +5952,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "076_unified_wallet_backup_stream"
+        "077_bull_bitcoin_create_correlation"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -5829,6 +6061,67 @@ async fn wallet_backup_readiness_requires_runtime_crud_without_table_authority()
     let app = test_app(test_state(runtime));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
+}
+
+#[tokio::test]
+async fn bull_bitcoin_create_correlation_readiness_rejects_boundary_drift() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query(
+        "ALTER TABLE bull_bitcoin_settlements RENAME CONSTRAINT \
+         bull_bitcoin_settlements_order_correlation_chk TO \
+         bull_bitcoin_settlements_order_correlation_chk_before_readiness_test",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(!readiness::schema_and_journal_ready(&runtime).await.unwrap());
+    sqlx::query(
+        "ALTER TABLE bull_bitcoin_settlements RENAME CONSTRAINT \
+         bull_bitcoin_settlements_order_correlation_chk_before_readiness_test TO \
+         bull_bitcoin_settlements_order_correlation_chk",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION \
+         attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID) TO bullnym_app",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(!readiness::schema_and_journal_ready(&runtime).await.unwrap());
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION \
+         attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID) FROM bullnym_app",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION \
+         attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID) TO PUBLIC",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(!readiness::schema_and_journal_ready(&runtime).await.unwrap());
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION \
+         attach_ambiguous_bull_bitcoin_order(UUID, UUID, TEXT, UUID) FROM PUBLIC",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
 }
 
 #[tokio::test]

@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::{
-    BitcoinAmountSat, BitcoinNetwork, BullBitcoinApi, BullBitcoinError, CreateSellRequest,
-    CreatedSellOrder, FiatAmountMinor, FiatCurrency, OrderObservation, PayerInstruction,
-    ScopedApiKey,
+    BitcoinAmountSat, BitcoinNetwork, BullBitcoinApi, BullBitcoinError, CreateSellFailure,
+    CreateSellRequest, CreatedSellOrder, FiatAmountMinor, FiatCurrency, OrderObservation,
+    PayerInstruction, ScopedApiKey,
 };
 use crate::config::BullBitcoinConfig;
 
@@ -53,6 +53,7 @@ impl HttpBullBitcoinApi {
         &self,
         key: &ScopedApiKey,
         body: String,
+        expected_response_id: &str,
         call_kind: RpcCallKind,
     ) -> Result<Value, BullBitcoinError> {
         let api_key =
@@ -87,6 +88,11 @@ impl HttpBullBitcoinApi {
         let bytes = bounded_response_body(response).await?;
         let envelope: Value =
             serde_json::from_slice(&bytes).map_err(|_| BullBitcoinError::MalformedResponse)?;
+        if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || envelope.get("id").and_then(Value::as_str) != Some(expected_response_id)
+        {
+            return Err(BullBitcoinError::MalformedResponse);
+        }
         if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
             return Err(classify_rpc_error(error, call_kind));
         }
@@ -102,7 +108,7 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
     async fn validate_sell_to_balance(&self, key: &ScopedApiKey) -> Result<(), BullBitcoinError> {
         let body = "{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{\"version\":1}}".to_owned();
         let result = self
-            .post_rpc(key, body, RpcCallKind::EligibilityPreflight)
+            .post_rpc(key, body, "bullnym", RpcCallKind::EligibilityPreflight)
             .await?;
         match result.as_object() {
             Some(object)
@@ -119,13 +125,46 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
         &self,
         key: &ScopedApiKey,
         request: &CreateSellRequest,
-    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+    ) -> Result<CreatedSellOrder, CreateSellFailure> {
         if request.use_payjoin && request.network != BitcoinNetwork::Bitcoin {
-            return Err(BullBitcoinError::Integrity);
+            return Err(BullBitcoinError::Integrity.into());
         }
         let body = build_create_body(request);
-        let result = self.post_rpc(key, body, RpcCallKind::CreateOrder).await?;
-        parse_created_order(&result, request)
+        let response_id = request.request_id.to_string();
+        let result = self
+            .post_rpc(key, body, &response_id, RpcCallKind::CreateOrder)
+            .await
+            .map_err(CreateSellFailure::from)?;
+        let order_id = result
+            .get("orderId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        parse_created_order(&result, request, true)
+            .map_err(|error| CreateSellFailure { error, order_id })
+    }
+
+    async fn recover_created_sell_to_balance(
+        &self,
+        key: &ScopedApiKey,
+        order_id: Uuid,
+        request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        let body = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrder\",\"params\":{{\"orderId\":\"{order_id}\"}}}}"
+        );
+        let result = self
+            .post_rpc(key, body, "bullnym", RpcCallKind::ReadOrder)
+            .await?;
+        let order = result.get("element").unwrap_or(&result);
+        // A provider order may still be payable after its original quote or
+        // confirmation deadline. Recovery validates the immutable identity,
+        // amount, currency and instruction, but must not reject that durable
+        // order merely because the read happens later.
+        let recovered = parse_created_order(order, request, false)?;
+        if recovered.order_id != order_id {
+            return Err(BullBitcoinError::Integrity);
+        }
+        Ok(recovered)
     }
 
     async fn get_created_order(
@@ -136,7 +175,9 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
         let body = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrder\",\"params\":{{\"orderId\":\"{order_id}\"}}}}"
         );
-        let result = self.post_rpc(key, body, RpcCallKind::ReadOrder).await?;
+        let result = self
+            .post_rpc(key, body, "bullnym", RpcCallKind::ReadOrder)
+            .await?;
         let order = result.get("element").unwrap_or(&result);
         let observation = parse_order_observation(order)?;
         if observation.order_id != order_id {
@@ -153,7 +194,8 @@ fn build_create_body(request: &CreateSellRequest) -> String {
         ""
     };
     format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"sellToBalance\",\"params\":{{\"bitcoinAmount\":{},\"bitcoinNetwork\":\"{}\",\"fiatCurrency\":\"{}\"{payjoin}}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{}\",\"method\":\"sellToBalance\",\"params\":{{\"bitcoinAmount\":{},\"bitcoinNetwork\":\"{}\",\"fiatCurrency\":\"{}\"{payjoin}}}}}",
+        request.request_id,
         request.bitcoin_amount.btc_json_number(),
         request.network.as_str(),
         request.currency.as_str(),
@@ -244,6 +286,7 @@ fn classify_rpc_error(error: &Value, call_kind: RpcCallKind) -> BullBitcoinError
 fn parse_created_order(
     order: &Value,
     request: &CreateSellRequest,
+    require_future_deadline: bool,
 ) -> Result<CreatedSellOrder, BullBitcoinError> {
     let order_id = parse_uuid_field(order, "orderId")?;
     let currency = parse_currency_field(order, "payoutCurrency")?;
@@ -259,7 +302,7 @@ fn parse_created_order(
     let expires_at_unix = DateTime::parse_from_rfc3339(deadline)
         .map_err(|_| BullBitcoinError::MalformedResponse)?
         .timestamp();
-    if expires_at_unix <= chrono::Utc::now().timestamp() {
+    if require_future_deadline && expires_at_unix <= chrono::Utc::now().timestamp() {
         return Err(BullBitcoinError::Integrity);
     }
     let quoted_fiat = parse_optional_fiat_field(order, "payoutAmount")?;
@@ -550,6 +593,7 @@ mod tests {
     ) -> Json<Value> {
         let is_validation =
             body.get("method").and_then(Value::as_str) == Some("validateSellToBalance");
+        let response_id = body.get("id").cloned().unwrap_or(Value::Null);
         *capture.0.lock().await = Some((headers, body));
         let result = if is_validation {
             serde_json::json!({"eligible": true})
@@ -568,7 +612,7 @@ mod tests {
         };
         Json(serde_json::json!({
             "jsonrpc": "2.0",
-            "id": "bullnym",
+            "id": response_id,
             "result": result
         }))
     }
@@ -610,7 +654,9 @@ mod tests {
     #[tokio::test]
     async fn create_call_is_exactly_scoped_and_uses_x_api_key() {
         let (client, capture, task) = test_client().await;
+        let request_id = Uuid::new_v4();
         let request = CreateSellRequest {
+            request_id,
             currency: FiatCurrency::CAD,
             network: BitcoinNetwork::Bitcoin,
             bitcoin_amount: BitcoinAmountSat::new(100_000).unwrap(),
@@ -632,11 +678,76 @@ mod tests {
         let (headers, body) = capture.0.lock().await.take().unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
         assert_eq!(body["method"], "sellToBalance");
+        assert_eq!(body["id"], request_id.to_string());
         assert_eq!(body["params"]["bitcoinAmount"], 0.001);
         assert_eq!(body["params"]["bitcoinNetwork"], "bitcoin");
         assert_eq!(body["params"]["fiatCurrency"], "CAD");
         assert_eq!(body["params"]["usePayjoin"], true);
         assert!(body["params"].get("fiatAmount").is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_mismatched_json_rpc_response_id() {
+        async fn wrong_id() -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "some-other-request",
+                "result": {
+                    "orderId": "11111111-1111-4111-8111-111111111111"
+                }
+            }))
+        }
+        let (client, task) =
+            client_for_app(Router::new().route("/ak/api-orders", post(wrong_id)), 1_000).await;
+        let request = CreateSellRequest {
+            request_id: Uuid::new_v4(),
+            currency: FiatCurrency::CAD,
+            network: BitcoinNetwork::Bitcoin,
+            bitcoin_amount: BitcoinAmountSat::new(100_000).unwrap(),
+            use_payjoin: false,
+        };
+        assert_eq!(
+            client.create_sell_to_balance(&key(), &request).await,
+            Err(CreateSellFailure::without_order_id(
+                BullBitcoinError::MalformedResponse
+            ))
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn create_retains_a_safe_order_id_from_an_invalid_correlated_result() {
+        async fn invalid_result(Json(body): Json<Value>) -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "orderId": "11111111-1111-4111-8111-111111111111",
+                    "payinAmount": 0.001,
+                    "payoutCurrency": "USD"
+                }
+            }))
+        }
+        let (client, task) = client_for_app(
+            Router::new().route("/ak/api-orders", post(invalid_result)),
+            1_000,
+        )
+        .await;
+        let request = CreateSellRequest {
+            request_id: Uuid::new_v4(),
+            currency: FiatCurrency::CAD,
+            network: BitcoinNetwork::Bitcoin,
+            bitcoin_amount: BitcoinAmountSat::new(100_000).unwrap(),
+            use_payjoin: false,
+        };
+        assert_eq!(
+            client.create_sell_to_balance(&key(), &request).await,
+            Err(CreateSellFailure {
+                error: BullBitcoinError::Integrity,
+                order_id: Some(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()),
+            })
+        );
         task.abort();
     }
 

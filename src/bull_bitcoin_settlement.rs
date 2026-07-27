@@ -153,6 +153,27 @@ async fn route_unfunded_mixed_with_log(
     Ok(committed)
 }
 
+async fn preserve_ambiguous_dispatch(
+    connection: &mut sqlx::PgConnection,
+    stored: &StoredBullBitcoinSettlement,
+    candidate_order_id: Option<Uuid>,
+) -> Result<(), SettlementServiceError> {
+    let committed =
+        db::record_ambiguous_bull_bitcoin_dispatch(connection, stored.id, candidate_order_id)
+            .await
+            .map_err(|_| SettlementServiceError::Database)?;
+    if !committed {
+        return Err(SettlementServiceError::StoredState);
+    }
+    tracing::warn!(
+        event = "bull_bitcoin_create_ambiguous",
+        settlement_id = %stored.id,
+        provider_order_id_retained = candidate_order_id.is_some(),
+        "Bull Bitcoin create may have reached the provider; fallback and retry remain closed"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct FiatOnlyInstructionRequest<'a> {
     pub owner_npub: &'a str,
@@ -247,6 +268,7 @@ pub enum SettlementServiceError {
     SourceIdentityUnavailable,
     CredentialUnavailable,
     RequestKeyConflict,
+    ProviderCreateAmbiguous,
     StoredState,
     Database,
 }
@@ -257,6 +279,9 @@ impl fmt::Display for SettlementServiceError {
             Self::SourceIdentityUnavailable => "fiat-settlement identity is unavailable",
             Self::CredentialUnavailable => "fiat-settlement credential is unavailable",
             Self::RequestKeyConflict => "fiat-settlement request identity conflicts",
+            Self::ProviderCreateAmbiguous => {
+                "fiat-settlement provider create requires reconciliation"
+            }
             Self::StoredState => "fiat-settlement state is invalid",
             Self::Database => "fiat-settlement persistence failed",
         })
@@ -446,12 +471,7 @@ async fn create_fiat_only_instruction_locked(
         // a concurrent exact caller. It survived a crash/cancellation and is
         // therefore ambiguous; never issue a second create.
         "dispatch_started" => {
-            abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
-                .await?;
-            stored = db::load_bull_bitcoin_settlement(connection, stored.id)
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
-            return stored_outcome(&stored);
+            return Err(SettlementServiceError::ProviderCreateAmbiguous);
         }
         "reserved" => {}
         _ => return Err(SettlementServiceError::StoredState),
@@ -494,6 +514,7 @@ async fn create_fiat_only_instruction_locked(
     };
 
     let provider_request = CreateSellRequest {
+        request_id: stored.id,
         currency: request.fiat_currency,
         network: request.network,
         bitcoin_amount: request.bitcoin_amount,
@@ -512,12 +533,8 @@ async fn create_fiat_only_instruction_locked(
                 || order.requested_bitcoin != request.bitcoin_amount
                 || instruction_network(&order.instruction) != request.network
             {
-                abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
-                    .await?;
-                return Ok(FiatOnlyInstructionOutcome::BitcoinFallback {
-                    settlement_id: stored.id,
-                    category: FallbackCategory::AmbiguousCreate,
-                });
+                preserve_ambiguous_dispatch(connection, &stored, Some(order.order_id)).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
             }
             let (kind, instruction) = instruction_parts(&order.instruction);
             let retention_secs =
@@ -543,10 +560,17 @@ async fn create_fiat_only_instruction_locked(
                 .map_err(|_| SettlementServiceError::Database)?;
             stored_outcome(&stored)
         }
-        Err(error) => {
-            let category = fallback_for_create_error(error);
+        Err(failure) => {
+            if failure.order_id.is_some() {
+                preserve_ambiguous_dispatch(connection, &stored, failure.order_id).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
+            }
+            let Some(category) = fallback_for_definite_create_rejection(failure.error) else {
+                preserve_ambiguous_dispatch(connection, &stored, None).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
+            };
             abandon_dispatch_with_log(connection, &stored, category).await?;
-            if error == BullBitcoinError::Authentication {
+            if failure.error == BullBitcoinError::Authentication {
                 // This call has no exposed destination. Disable the proven
                 // invalid generation and all future settings after the local
                 // state is durably routed to Bitcoin.
@@ -751,12 +775,7 @@ async fn prepare_mixed_settlement_locked(
                 return mixed_stored_outcome(stored).map(Some);
             }
             ("dispatch_started", None, None) => {
-                abandon_dispatch_with_log(connection, stored, FallbackCategory::AmbiguousCreate)
-                    .await?;
-                let stored = db::load_bull_bitcoin_settlement(connection, stored.id)
-                    .await
-                    .map_err(|_| SettlementServiceError::Database)?;
-                return mixed_stored_outcome(&stored).map(Some);
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
             }
             _ => {}
         }
@@ -823,10 +842,11 @@ async fn prepare_mixed_settlement_locked(
 
     if merchant_amount_sat <= 0 || split_rounds_to_zero {
         match stored.provider_state.as_str() {
-            "reserved" | "dispatch_started" => {
+            "reserved" => {
                 abandon_dispatch_with_log(connection, &stored, FallbackCategory::InvalidSplit)
                     .await?;
             }
+            "dispatch_started" => return Err(SettlementServiceError::ProviderCreateAmbiguous),
             "bound" if stored.funding_route.is_none() => {
                 route_unfunded_mixed_with_log(connection, &stored, FallbackCategory::InvalidSplit)
                     .await?;
@@ -894,6 +914,7 @@ async fn prepare_mixed_settlement_locked(
         .create_sell_to_balance(
             &scoped_key,
             &CreateSellRequest {
+                request_id: stored.id,
                 currency,
                 network: BitcoinNetwork::Liquid,
                 bitcoin_amount: amount,
@@ -951,18 +972,21 @@ async fn prepare_mixed_settlement_locked(
                 fiat_percentage: policy.fiat_percentage,
             }))
         }
-        Ok(_) => {
-            abandon_dispatch_with_log(connection, &stored, FallbackCategory::AmbiguousCreate)
-                .await?;
-            Ok(Some(MixedSettlementPreparation::BitcoinFallback {
-                settlement_id: stored.id,
-                category: FallbackCategory::AmbiguousCreate,
-            }))
+        Ok(order) => {
+            preserve_ambiguous_dispatch(connection, &stored, Some(order.order_id)).await?;
+            Err(SettlementServiceError::ProviderCreateAmbiguous)
         }
-        Err(error) => {
-            let category = fallback_for_create_error(error);
+        Err(failure) => {
+            if failure.order_id.is_some() {
+                preserve_ambiguous_dispatch(connection, &stored, failure.order_id).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
+            }
+            let Some(category) = fallback_for_definite_create_rejection(failure.error) else {
+                preserve_ambiguous_dispatch(connection, &stored, None).await?;
+                return Err(SettlementServiceError::ProviderCreateAmbiguous);
+            };
             abandon_dispatch_with_log(connection, &stored, category).await?;
-            if error == BullBitcoinError::Authentication {
+            if failure.error == BullBitcoinError::Authentication {
                 db::invalidate_bull_bitcoin_credential_on_connection(
                     connection,
                     stored.credential_id,
@@ -1168,26 +1192,26 @@ fn instruction_from_parts(
     }
 }
 
-fn fallback_for_create_error(error: BullBitcoinError) -> FallbackCategory {
+fn fallback_for_definite_create_rejection(error: BullBitcoinError) -> Option<FallbackCategory> {
     match error {
-        BullBitcoinError::Minimum => FallbackCategory::BelowMinimum,
+        BullBitcoinError::Minimum => Some(FallbackCategory::BelowMinimum),
         BullBitcoinError::Maximum
-        | BullBitcoinError::Policy
         | BullBitcoinError::BenchmarkEligibilityDenied
         | BullBitcoinError::Authentication
-        | BullBitcoinError::NotFound
         | BullBitcoinError::InvalidApiKey
         | BullBitcoinError::InvalidOwner
         | BullBitcoinError::InvalidProduct
         | BullBitcoinError::InvalidCurrency
         | BullBitcoinError::InvalidBitcoinAmount
         | BullBitcoinError::InvalidFiatAmount
-        | BullBitcoinError::CredentialEncryption => FallbackCategory::ConversionUnavailable,
-        BullBitcoinError::Timeout
+        | BullBitcoinError::CredentialEncryption => Some(FallbackCategory::ConversionUnavailable),
+        BullBitcoinError::Policy
+        | BullBitcoinError::NotFound
+        | BullBitcoinError::Timeout
         | BullBitcoinError::Transport
         | BullBitcoinError::Upstream
         | BullBitcoinError::MalformedResponse
-        | BullBitcoinError::Integrity => FallbackCategory::AmbiguousCreate,
+        | BullBitcoinError::Integrity => None,
     }
 }
 
@@ -1220,21 +1244,6 @@ async fn reconcile_once(
 ) -> Result<(), SettlementServiceError> {
     let stale_after_secs =
         i64::try_from(stale_after_secs).map_err(|_| SettlementServiceError::StoredState)?;
-    let recovered_rows = db::recover_stale_bull_bitcoin_dispatches(&state.db, stale_after_secs)
-        .await
-        .map_err(|_| SettlementServiceError::Database)?;
-    for settlement in &recovered_rows {
-        emit_committed_fallback_decision(
-            settlement,
-            FallbackCategory::AmbiguousCreate,
-            "stale_dispatch_recovered",
-        );
-    }
-    let recovered = recovered_rows.len();
-    let expired = db::expire_bull_bitcoin_retention(&state.db)
-        .await
-        .map_err(|_| SettlementServiceError::Database)?;
-
     let batch_size = i64::from(state.config.bull_bitcoin.reconcile_batch_size);
     let lease_secs = i64::try_from(
         state
@@ -1245,12 +1254,47 @@ async fn reconcile_once(
             .saturating_add(state.config.bull_bitcoin.reconcile_interval_secs),
     )
     .map_err(|_| SettlementServiceError::StoredState)?;
+    let ambiguous_dispatches = db::claim_ambiguous_bull_bitcoin_dispatches(
+        &state.db,
+        stale_after_secs,
+        lease_secs,
+        batch_size,
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)?;
+    let ambiguous_selected = ambiguous_dispatches.len();
+    let mut first_row_error = None;
+    for settlement in ambiguous_dispatches {
+        let settlement_id = settlement.id;
+        if settlement.bull_bitcoin_order_id.is_some() {
+            if let Err(error) = reconcile_ambiguous_dispatch(state, settlement).await {
+                if error == SettlementServiceError::Database {
+                    return Err(error);
+                }
+                tracing::error!(
+                    %settlement_id,
+                    error = %error,
+                    "Ambiguous Bull Bitcoin create reconciliation row failed closed"
+                );
+                first_row_error.get_or_insert(error);
+            }
+        } else {
+            tracing::warn!(
+                event = "bull_bitcoin_create_correlation_required",
+                settlement_id = %settlement.id,
+                "Ambiguous Bull Bitcoin create has no provider order ID; operator correlation is required"
+            );
+        }
+    }
+
+    let expired = db::expire_bull_bitcoin_retention(&state.db)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
     let settlements =
         db::claim_bull_bitcoin_reconciliation_batch(&state.db, batch_size, lease_secs)
             .await
             .map_err(|_| SettlementServiceError::Database)?;
     let selected = settlements.len();
-    let mut first_row_error = None;
     for settlement in settlements {
         let settlement_id = settlement.id;
         if let Err(error) = reconcile_settlement(state, settlement).await {
@@ -1268,9 +1312,9 @@ async fn reconcile_once(
     let erased = db::finalize_drained_bull_bitcoin_credentials(&state.db)
         .await
         .map_err(|_| SettlementServiceError::Database)?;
-    if recovered > 0 || expired > 0 || selected > 0 || erased > 0 {
+    if ambiguous_selected > 0 || expired > 0 || selected > 0 || erased > 0 {
         tracing::info!(
-            recovered_ambiguous_dispatches = recovered,
+            ambiguous_create_dispatches = ambiguous_selected,
             expired_retention_rows = expired,
             reconciled_rows = selected,
             erased_drained_credentials = erased,
@@ -1278,6 +1322,126 @@ async fn reconcile_once(
         );
     }
     first_row_error.map_or(Ok(()), Err)
+}
+
+async fn reconcile_ambiguous_dispatch(
+    state: &AppState,
+    settlement: StoredBullBitcoinSettlement,
+) -> Result<(), SettlementServiceError> {
+    if settlement.provider_state != "dispatch_started"
+        || settlement.funding_route.is_some()
+        || settlement.settlement_status != "none"
+        || settlement.funding_committed_at_unix.is_some()
+        || settlement.provider_final
+    {
+        return Err(SettlementServiceError::StoredState);
+    }
+    let order_id = settlement
+        .bull_bitcoin_order_id
+        .ok_or(SettlementServiceError::StoredState)?;
+    let currency = FiatCurrency::from_str(&settlement.fiat_currency)
+        .map_err(|_| SettlementServiceError::StoredState)?;
+    let network = if settlement.purpose == "mixed" {
+        BitcoinNetwork::Liquid
+    } else {
+        match settlement.payer_rail.as_str() {
+            "bitcoin" => BitcoinNetwork::Bitcoin,
+            "lightning" => BitcoinNetwork::Lightning,
+            "liquid" => BitcoinNetwork::Liquid,
+            _ => return Err(SettlementServiceError::StoredState),
+        }
+    };
+    let request = CreateSellRequest {
+        request_id: settlement.id,
+        currency,
+        network,
+        bitcoin_amount: BitcoinAmountSat::new(settlement.requested_bitcoin_sat)
+            .map_err(|_| SettlementServiceError::StoredState)?,
+        use_payjoin: false,
+    };
+
+    let mut connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let credential = db::load_bull_bitcoin_credential(&mut connection, settlement.credential_id)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?
+        .ok_or(SettlementServiceError::CredentialUnavailable)?;
+    if credential.owner_npub != settlement.owner_npub {
+        return Err(SettlementServiceError::StoredState);
+    }
+    let encryption_key = state
+        .config
+        .bull_bitcoin_credential_encryption_key
+        .clone()
+        .ok_or(SettlementServiceError::CredentialUnavailable)?;
+    let scoped_key = decrypt_credential(encryption_key, &credential)
+        .map_err(|_| SettlementServiceError::CredentialUnavailable)?;
+    drop(connection);
+
+    let recovered = state
+        .bull_bitcoin
+        .recover_created_sell_to_balance(&scoped_key, order_id, &request)
+        .await;
+    drop(scoped_key);
+    let order = match recovered {
+        Ok(order) => order,
+        Err(BullBitcoinError::Authentication) => {
+            db::invalidate_bull_bitcoin_credential(&state.db, settlement.credential_id)
+                .await
+                .map_err(|_| SettlementServiceError::Database)?;
+            return Ok(());
+        }
+        Err(
+            BullBitcoinError::NotFound
+            | BullBitcoinError::Timeout
+            | BullBitcoinError::Transport
+            | BullBitcoinError::Upstream
+            | BullBitcoinError::MalformedResponse
+            | BullBitcoinError::Integrity,
+        ) => return Ok(()),
+        Err(_) => return Err(SettlementServiceError::StoredState),
+    };
+    if order.order_id != order_id
+        || order.currency != currency
+        || order.network != network
+        || order.requested_bitcoin != request.bitcoin_amount
+        || instruction_network(&order.instruction) != network
+    {
+        return Err(SettlementServiceError::StoredState);
+    }
+
+    let (kind, instruction) = instruction_parts(&order.instruction);
+    let retention_secs = i64::try_from(state.config.bull_bitcoin.late_payment_retention_secs)
+        .map_err(|_| SettlementServiceError::StoredState)?;
+    let mut connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let bound = db::bind_bull_bitcoin_order(
+        &mut connection,
+        settlement.id,
+        order_id,
+        kind,
+        instruction,
+        order.expires_at_unix,
+        retention_secs,
+        order.quoted_fiat.map(|quote| quote.as_minor()),
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)?;
+    if !bound {
+        return Err(SettlementServiceError::StoredState);
+    }
+    tracing::info!(
+        event = "bull_bitcoin_ambiguous_create_reconciled",
+        settlement_id = %settlement.id,
+        "Ambiguous Bull Bitcoin create was bound to its exact recovered order"
+    );
+    Ok(())
 }
 
 /// Run one bounded maintenance pass. The server normally uses
@@ -1563,6 +1727,8 @@ mod tests {
             settlement_status: "none".into(),
             requested_bitcoin_sat: 7_794,
             bull_bitcoin_order_id: None,
+            order_correlation_source: None,
+            order_correlated_at_unix_micros: None,
             instruction_kind: Some("liquid".into()),
             payer_instruction: Some("payer-instruction-secret-canary".into()),
             instruction_expires_at_unix: None,
@@ -1581,8 +1747,8 @@ mod tests {
     #[test]
     fn create_error_fallbacks_are_conservative() {
         assert_eq!(
-            fallback_for_create_error(BullBitcoinError::Minimum),
-            FallbackCategory::BelowMinimum
+            fallback_for_definite_create_rejection(BullBitcoinError::Minimum),
+            Some(FallbackCategory::BelowMinimum)
         );
         for error in [
             BullBitcoinError::Timeout,
@@ -1591,14 +1757,15 @@ mod tests {
             BullBitcoinError::MalformedResponse,
             BullBitcoinError::Integrity,
         ] {
-            assert_eq!(
-                fallback_for_create_error(error),
-                FallbackCategory::AmbiguousCreate
-            );
+            assert_eq!(fallback_for_definite_create_rejection(error), None);
         }
         assert_eq!(
-            fallback_for_create_error(BullBitcoinError::BenchmarkEligibilityDenied),
-            FallbackCategory::ConversionUnavailable
+            fallback_for_definite_create_rejection(BullBitcoinError::BenchmarkEligibilityDenied),
+            Some(FallbackCategory::ConversionUnavailable)
+        );
+        assert_eq!(
+            fallback_for_definite_create_rejection(BullBitcoinError::Policy),
+            None
         );
     }
 

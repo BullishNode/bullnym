@@ -165,14 +165,16 @@ Add one `bull_bitcoin` module with a small trait used by handlers and the
 worker:
 
 ```text
-create_sell_to_balance(key, currency, network, bitcoin_sat, use_payjoin)
+create_sell_to_balance(key, request_id, currency, network, bitcoin_sat, use_payjoin)
+recover_created_sell_to_balance(key, order_id, committed_request)
 get_created_order(key, order_id)
 ```
 
 The production implementation uses JSON-RPC 2.0 at the configured
 `/ak/api-orders` endpoint with `X-API-Key`. It has bounded connect/request
-timeouts and no automatic retry of `sellToBalance`. Reads may retry with
-bounded backoff.
+timeouts and no automatic retry of `sellToBalance`. The create request uses the
+durable settlement UUID as its JSON-RPC ID and accepts only an exact echoed ID.
+Reads may retry with bounded backoff.
 
 The adapter deserializes only the fields Bullnym needs:
 
@@ -282,7 +284,9 @@ weakening the final constraints.
   Address intent, and the exact credential-generation ID while reconciliation
   still needs it;
 - a monotonic provider state: `reserved`, `dispatch_started`, `bound`, or
-  `abandoned`; only `bound` has an order ID;
+  `abandoned`; `bound` always has an order ID, while `dispatch_started` may
+  retain a candidate order ID from a correlated but otherwise unusable create
+  response without treating that order as usable;
 - a separate immutable funding route once decided: `bull_bitcoin` or
   `bitcoin_fallback`. A fallback has a category, and a known mixed order may be
   left unfunded if the split becomes invalid before claim commitment;
@@ -449,21 +453,28 @@ transaction held across HTTP:
    Bitcoin instruction for a row routed to fallback;
 3. otherwise insert/reuse `reserved` and commit it;
 4. atomically advance it to `dispatch_started` and commit **before** the one
-   `sellToBalance` call;
+   `sellToBalance` call; use the settlement UUID as the JSON-RPC request ID and
+   require the response to echo it exactly;
 5. validate a successful response's order ID, network-specific instruction,
    amount, and currency;
 6. in a short transaction, revalidate the invoice/intent and bind the exact
    response before returning it;
-7. on deterministic failure, timeout, cancellation, or a surviving
-   `dispatch_started` row without an order binding, irreversibly mark the
-   provider attempt abandoned, choose the fallback route, and execute the
-   existing Bitcoin path.
+7. only a definite rejection proving that no order was created may mark the
+   attempt abandoned and select the existing Bitcoin fallback; timeout,
+   transport failure, cancellation, dependency failure, malformed response,
+   or a surviving `dispatch_started` row remains ambiguous and is never
+   created again or routed to fallback.
 
-A timeout after Bull Bitcoin accepted the create call may leave an unfunded
-orphan order. Bullnym does not retry the ambiguous create and does not list
-orders to find it. Because no instruction was exposed, the orphan cannot
-receive this payment. This is safer and much smaller than adding cross-system
-idempotency to the MVP.
+If a correlated response contains a syntactically valid order UUID but fails
+some other validation, Bullnym durably retains that UUID as correlation
+evidence and reads that exact order with the same credential. It binds only
+after the order's currency, network, amount, and payer instruction all match
+the committed request. If no order UUID was safely received, an operator must
+correlate the provider request using the settlement UUID and use the
+schema-owner-only recovery boundary to attach the candidate UUID. That boundary
+does not bind or fund the order; ordinary reconciliation performs the same
+strict validation. An operator must never guess absence, attach a guessed UUID,
+or re-POST the create.
 
 Every `bound` row is treated as potentially exposed, including a server crash
 after commit but before socket delivery. It is never replaced or redirected.
@@ -484,13 +495,15 @@ instruction. Order creation then has two phases.
 3. if the merchant output is zero/dust or the split is otherwise locally
    invalid, commit the full-Bitcoin route without calling Bull Bitcoin;
 4. otherwise commit `dispatch_started`, release any database transaction, and
-   call `sellToBalance` once for a `liquid` order with the fixed fiat share;
-5. on a minimum/policy failure or unusable response, mark the attempt abandoned
-   and commit the full-Bitcoin route; on success, revalidate the same funded
-   swap and commit `bound`;
-6. release the session lock. A restart that finds `dispatch_started` without a
-   binding marks it abandoned with `ambiguous_create`, chooses Bitcoin, and
-   never dispatches again.
+   call `sellToBalance` once for a `liquid` order with the fixed fiat share,
+   using the settlement UUID as the exact JSON-RPC request ID;
+5. on a definite minimum or other proven pre-create rejection, mark the attempt
+   abandoned and commit the full-Bitcoin route; on success, revalidate the same
+   funded swap and commit `bound`; any uncertain outcome remains
+   `dispatch_started` and retains a safely parsed candidate order UUID;
+6. release the session lock. A restart that finds `dispatch_started` never
+   dispatches or falls back again. Exact-order reconciliation or the guarded
+   operator correlation boundary must resolve it first.
 
 **Phase B — construct and journal the claim:**
 
@@ -508,9 +521,10 @@ instruction. Order creation then has two phases.
 No Bull Bitcoin network call occurs inside the claim transaction. A crash after
 binding reuses the bound order. If fee revalidation makes a mixed output invalid
 after binding but before claim journaling, Bullnym may choose Bitcoin and leave
-that known order unfunded; after journaling it cannot. A crash after an
-ambiguous create falls back to Bitcoin, leaving only an unfunded unknown
-provider order. Once the two-output transaction is journaled, no fallback or
+that known order unfunded; after journaling it cannot. An ambiguous create
+pauses claim construction until exact recovery proves whether the provider
+order exists; it never silently creates a second sell or redirects value to
+Bitcoin. Once the two-output transaction is journaled, no fallback or
 settings/deletion action can redirect either output.
 
 The existing transaction journal remains the raw-byte authority. The two
@@ -551,8 +565,10 @@ invoice value.
 
 ## 7. Settlement reconciliation worker
 
-One small supervised worker polls only `bound` local settlement rows with a
-known Bull Bitcoin order ID. It never calls an order-list endpoint.
+One small supervised worker polls `bound` settlement rows and recovery-eligible
+`dispatch_started` rows that have a safely correlated Bull Bitcoin order ID. It
+never calls an order-list endpoint and never turns an ambiguous create into a
+second create.
 
 - bounded batch size and cadence;
 - per-order exponential backoff with a cap for transport/5xx failures;
@@ -688,8 +704,8 @@ merchant-only detail may add only `fiat_conversion: {"status":"overridden",
 | Bitcoin remainder is dust/zero | Override to full Bitcoin without creating a Bull Bitcoin order. |
 | Fee changes after a mixed order binds but before claim journal | If the pair is no longer valid, leave the known order unfunded and atomically choose full Bitcoin; after journal commit, never redirect. |
 | Bull Bitcoin maximum or policy rejection before exposure | Full-Bitcoin fallback, categorized without persisting raw error text. |
-| API timeout/cancellation during create | Never retry a `dispatch_started` create; mark it abandoned and choose Bitcoin. The unknown order stays unfunded. |
-| Crash after API response but before binding commit | Restart sees `dispatch_started`, never dispatches again, and chooses Bitcoin; the provider order is an unfunded orphan. |
+| API timeout/cancellation during create | Keep `dispatch_started`, never retry or fall back, and require exact correlation/recovery. |
+| Crash after API response but before binding commit | Restart sees `dispatch_started`, never dispatches or falls back again, and recovers only a validated exact order. |
 | Crash after binding commit but before response/claim | Retry reuses the persisted order; it is treated as potentially exposed. |
 | Duplicate payer/claim requests | Existing session advisory lock plus a unique local request key returns one binding/routing decision. |
 | Bound fiat instruction expires before/after socket delivery | Treat it as potentially exposed; do not replace or redirect it. A later partial instruction requires a new request key. |
@@ -702,7 +718,7 @@ merchant-only detail may add only `fiat_conversion: {"status":"overridden",
 | Key replacement with an exposed/funded old-key dependency | Reject until its drain completes; never strand the only read capability. |
 | Credential deletion | Disable immediately; fallback only unexposed/unfunded legs; drain exposed/funded dependencies, then erase without revocation. |
 | Key revoked or rejected while polling | Stop new conversion, mark affected fiat projection unavailable, erase unusable key, retain minimal order evidence. |
-| Malformed response, wrong order ID/currency, impossible amount | Integrity state; never mark settled or expose a guessed value. |
+| Malformed response, wrong response ID/currency, impossible amount | Retain only a safely correlated order UUID, keep the create ambiguous, and never mark settled, fall back, or expose a guessed value. |
 | Exact API response lacks actual credited fiat semantics | Compatibility gate fails; extend the exact-order DTO before enabling money movement. |
 | API/worker outage after funds were sent | Remain pending and retry; never fall back to a different destination. |
 | Bullnym database restored without encryption key | Fiat admission stays closed; existing rows remain visibly unreconciled. |
@@ -790,7 +806,8 @@ without pretending to own Bull Bitcoin's blinding key.
   defaults, exact key grammar/NUL rejection, and key-never-returned tests;
 - split rounding, minimum fallback, primary dust fallback, 100% boundary, and
   no destination mutation after commitment;
-- write-ahead state transitions including ambiguous crash fallback;
+- write-ahead state transitions including crash-surviving ambiguous create,
+  exact candidate-order recovery, and the absence of redispatch/fallback;
 - worker retry/backoff, idempotent/superseding completion, derived late-payment
   watch, invoice-less retention boundary, credential drain, and key replacement
   conflict.
