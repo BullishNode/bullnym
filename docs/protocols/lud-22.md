@@ -22,6 +22,8 @@ The normal LUD-06 metadata response adds `payment_methods`:
 
 `payment_methods` advertises alternate methods only. Lightning remains the
 implicit default and is used when the payer omits `payment_method`.
+The advertised fields are independent of any private fiat-settlement setting;
+metadata consumers must not infer settlement policy from them.
 
 ## Callback Request
 
@@ -35,8 +37,11 @@ The callback remains an HTTP GET. All requests include:
 
 The callback path contains the opaque per-metadata intent token. Clients must
 retain the complete URL across an exact callback retry; there is no tokenless
-callback route. Bullnym rejects a comment sent together with `L-BTC` rather
-than accepting text it cannot durably associate with that rail.
+callback route. For ordinary or mixed settings, Bullnym rejects a comment sent
+together with `L-BTC` rather than accepting text it cannot durably associate
+with that rail. For a 100%-fiat setting, Bullnym accepts the payment but
+deliberately forgets the optional comment; it never persists or returns the
+payer text.
 
 A public client requesting `L-BTC` also supplies every Approach B proof field:
 

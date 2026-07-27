@@ -253,13 +253,37 @@ pub async fn list_get_paid_transactions(
              SELECT event.transaction_id, event.source, event.source_rank, \
                     event.invoice_id, event.amount_sat, event.received_at_unix_micros, \
                     event.rail, event.settlement_state, event.late, event.comment, \
-                    FALSE, event.fiat_policy_present, \
+                    fallback.id IS NOT NULL, \
+                    event.fiat_policy_present OR fallback.id IS NOT NULL, \
                     event.creation_rate_minor_per_btc, event.creation_rate_currency, \
-                    NULL::TEXT, NULL::UUID, \
-                    NULL::TEXT, NULL::TEXT, \
-                    NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::SMALLINT, NULL::TEXT, \
-                    NULL::TEXT, NULL::BIGINT, NULL::TEXT \
+                    fallback.purpose, fallback.bull_bitcoin_order_id, \
+                    fallback.fiat_currency, fallback.settlement_status, \
+                    fallback.credited_fiat_minor, fallback.quoted_fiat_minor, \
+                    fallback.execution_rate_minor_per_btc, fallback.fiat_percentage, \
+                    fallback.funding_route, fallback.fallback_category, \
+                    NULL::BIGINT, NULL::TEXT \
                FROM invoice_events event \
+          LEFT JOIN LATERAL ( \
+                    SELECT settlement.id, settlement.purpose, \
+                           settlement.bull_bitcoin_order_id, \
+                           settlement.fiat_currency, settlement.settlement_status, \
+                           settlement.credited_fiat_minor, settlement.quoted_fiat_minor, \
+                           settlement.execution_rate_minor_per_btc, \
+                           settlement.fiat_percentage, settlement.funding_route, \
+                           settlement.fallback_category \
+                      FROM bull_bitcoin_settlements settlement \
+                     WHERE settlement.owner_npub = $1 \
+                       AND settlement.invoice_id = event.invoice_id \
+                       AND settlement.purpose = 'fiat_only' \
+                       AND settlement.payer_rail = event.rail \
+                       AND settlement.requested_bitcoin_sat = event.amount_sat \
+                       AND settlement.funding_route = 'bitcoin_fallback' \
+                       AND settlement.created_at <= to_timestamp( \
+                           event.received_at_unix_micros::DOUBLE PRECISION / 1000000.0 \
+                       ) \
+                     ORDER BY settlement.created_at DESC, settlement.id DESC \
+                     LIMIT 1 \
+               ) fallback ON TRUE \
               WHERE event.bull_bitcoin_settlement_id IS NULL \
                 AND NOT EXISTS ( \
                     SELECT 1 FROM bull_bitcoin_settlements settlement \
