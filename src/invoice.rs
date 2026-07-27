@@ -1729,12 +1729,36 @@ pub async fn status(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
-    let current_quote_amount_sat = if inv.pricing_mode == "fiat_fixed" {
-        db::current_invoice_quote(&mut *snapshot, inv.id)
-            .await?
-            .map(|quote| quote.merchant_amount_sat)
+    let current_quote = if inv.pricing_mode == "fiat_fixed" {
+        db::current_invoice_quote(&mut *snapshot, inv.id).await?
     } else {
-        Some(remaining_sat)
+        None
+    };
+    let current_quote_amount_sat = current_quote
+        .as_ref()
+        .map(|quote| quote.merchant_amount_sat)
+        .or_else(|| (inv.pricing_mode != "fiat_fixed").then_some(remaining_sat));
+    let existing_quote_chain_offer = if let Some(quote) = current_quote.as_ref() {
+        let offer =
+            db::invoice_quote_offer_for_rail(&mut *snapshot, inv.id, quote.id, "bitcoin").await?;
+        if let Some(offer) = offer {
+            match offer.provider_offer_id.as_deref() {
+                Some(provider_offer_id) => db::payer_exposable_chain_swap_for_quote_offer(
+                    &mut *snapshot,
+                    inv.id,
+                    quote.id,
+                    offer.id,
+                    provider_offer_id,
+                )
+                .await?
+                .is_some(),
+                None => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        false
     };
     let sat_fixed_instructions_payable =
         sat_fixed_payment_instructions_are_payable(&inv) && fiat_settlement_policy.is_none();
@@ -1796,7 +1820,7 @@ pub async fn status(
                 state
                     .boltz
                     .provider_limits()
-                    .bitcoin_chain_amount_eligibility(amount)
+                    .bitcoin_chain_amount_eligibility(amount, 0)
             })
             .unwrap_or(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
     );
@@ -1804,6 +1828,7 @@ pub async fn status(
         &inv,
         fiat_settlement_policy.as_ref(),
         bitcoin_chain_eligibility,
+        existing_quote_chain_offer,
     );
 
     Ok(Json(InvoiceStatusResponse {
@@ -2021,13 +2046,6 @@ pub async fn payer_demand_quote(
     validate_payer_quote_rail(&invoice, policy.as_ref(), request.rail, None)?;
     let response = if invoice.pricing_mode == "fiat_fixed" {
         let quote = resolve_current_fiat_quote(&state, &invoice).await?;
-        validate_payer_quote_amount(
-            &state,
-            &invoice,
-            policy.as_ref(),
-            request.rail,
-            quote.merchant_amount_sat,
-        )?;
         let instruction =
             versioned_instruction_for_rail(&state, &invoice, &quote, policy.as_ref(), request.rail)
                 .await?;
@@ -2048,7 +2066,6 @@ pub async fn payer_demand_quote(
                 "invoice has no remaining payable amount".into(),
             ));
         }
-        validate_payer_quote_amount(&state, &invoice, policy.as_ref(), request.rail, amount_sat)?;
         let policy = policy.as_ref().ok_or_else(|| {
             AppError::DbError("sat-fixed payer demand is missing its captured policy".into())
         })?;
@@ -2146,6 +2163,7 @@ fn payer_quote_rail_availability(
     invoice: &db::Invoice,
     policy: Option<&db::InvoiceFiatSettlementPolicy>,
     bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
+    existing_quote_chain_offer: bool,
 ) -> Option<PayerQuoteRailAvailability> {
     if invoice.pricing_mode != "fiat_fixed" && policy.is_none() {
         return None;
@@ -2180,7 +2198,10 @@ fn payer_quote_rail_availability(
         availability.lightning &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIGHTNING != 0;
         availability.liquid &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIQUID != 0;
     }
-    if bitcoin_rail_uses_boltz_chain(invoice, policy) && bitcoin_chain_eligibility.is_some() {
+    if bitcoin_rail_uses_boltz_chain(invoice, policy)
+        && bitcoin_chain_eligibility.is_some()
+        && !existing_quote_chain_offer
+    {
         availability.bitcoin &= matches!(
             bitcoin_chain_eligibility,
             Some(crate::provider_limits::ChainAmountEligibility::Eligible)
@@ -2205,8 +2226,11 @@ fn validate_payer_quote_rail(
     rail: PayerQuoteRail,
     bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
 ) -> Result<(), AppError> {
-    let availability = payer_quote_rail_availability(invoice, policy, bitcoin_chain_eligibility)
-        .ok_or_else(|| AppError::InvalidAmount("invoice does not support fiat quotes".into()))?;
+    let availability =
+        payer_quote_rail_availability(invoice, policy, bitcoin_chain_eligibility, false)
+            .ok_or_else(|| {
+                AppError::InvalidAmount("invoice does not support fiat quotes".into())
+            })?;
     match rail {
         PayerQuoteRail::Lightning if !availability.lightning => Err(AppError::InvalidAmount(
             "invoice does not accept Lightning".into(),
@@ -2218,36 +2242,6 @@ fn validate_payer_quote_rail(
             "invoice does not accept Bitcoin".into(),
         )),
         _ => Ok(()),
-    }
-}
-
-fn validate_payer_quote_amount(
-    state: &AppState,
-    invoice: &db::Invoice,
-    policy: Option<&db::InvoiceFiatSettlementPolicy>,
-    rail: PayerQuoteRail,
-    amount_sat: i64,
-) -> Result<(), AppError> {
-    if rail != PayerQuoteRail::Bitcoin || !bitcoin_rail_uses_boltz_chain(invoice, policy) {
-        return Ok(());
-    }
-    let amount_sat = u64::try_from(amount_sat)
-        .map_err(|_| AppError::InvalidAmount("Bitcoin is unavailable for this amount".into()))?;
-    match state
-        .boltz
-        .provider_limits()
-        .bitcoin_chain_amount_eligibility(amount_sat)
-    {
-        crate::provider_limits::ChainAmountEligibility::Eligible => Ok(()),
-        crate::provider_limits::ChainAmountEligibility::BelowMinimum
-        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => Err(
-            AppError::InvalidAmount("Bitcoin is unavailable for this amount".into()),
-        ),
-        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
-            Err(AppError::ServiceUnavailable(
-                "Bitcoin is temporarily unavailable; retry shortly".into(),
-            ))
-        }
     }
 }
 
@@ -3454,6 +3448,31 @@ async fn ensure_versioned_bitcoin_chain_offer(
             ));
         }
         ReusableVersionedBitcoinOffer::Missing => {}
+    }
+    // Only a new provider offer is subject to the current chain-limit
+    // snapshot. Durable payer-exposable offers above remain replayable even
+    // if the provider later changes its limits or the snapshot is stale.
+    match state
+        .boltz
+        .provider_limits()
+        .bitcoin_chain_amount_eligibility(
+            u64::try_from(quote.merchant_amount_sat).map_err(|_| {
+                AppError::InvalidAmount("Bitcoin is unavailable for this amount".into())
+            })?,
+            0,
+        ) {
+        crate::provider_limits::ChainAmountEligibility::Eligible => {}
+        crate::provider_limits::ChainAmountEligibility::BelowMinimum
+        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => {
+            return Err(AppError::InvalidAmount(
+                "Bitcoin is unavailable for this amount".into(),
+            ));
+        }
+        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
+            return Err(AppError::ServiceUnavailable(
+                "Bitcoin is temporarily unavailable; retry shortly".into(),
+            ));
+        }
     }
     if quote.expires_at_unix <= unix_now().saturating_add(120) {
         return Err(AppError::ServiceUnavailable(

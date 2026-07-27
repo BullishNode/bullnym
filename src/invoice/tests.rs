@@ -345,6 +345,7 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
             &wallet,
             None,
             Some(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(true)
@@ -365,6 +366,7 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
             &checkout,
             None,
             Some(crate::provider_limits::ChainAmountEligibility::Eligible),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(true)
@@ -374,6 +376,7 @@ fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed(
             &checkout,
             None,
             Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(false)
@@ -408,6 +411,7 @@ fn chain_minimum_only_gates_routes_that_actually_use_boltz_chain() {
             &checkout,
             Some(&provider_direct),
             Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(true),
@@ -420,6 +424,7 @@ fn chain_minimum_only_gates_routes_that_actually_use_boltz_chain() {
             &checkout,
             Some(&mixed),
             Some(crate::provider_limits::ChainAmountEligibility::BelowMinimum),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(false)
@@ -429,6 +434,7 @@ fn chain_minimum_only_gates_routes_that_actually_use_boltz_chain() {
             &checkout,
             Some(&mixed),
             Some(crate::provider_limits::ChainAmountEligibility::Eligible),
+            false,
         )
         .map(|rails| rails.bitcoin),
         Some(true)

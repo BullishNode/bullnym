@@ -289,6 +289,8 @@ pub enum ReversePairSnapshotState {
 pub struct ChainPairSnapshot {
     minimum_sat: u64,
     maximum_sat: u64,
+    server_miner_fee_sat: u64,
+    percentage_fee: f64,
     observed_at: Instant,
 }
 
@@ -356,6 +358,8 @@ impl ChainPairSnapshotState {
             None => Self::Available(ChainPairSnapshot {
                 minimum_sat: pair.limits.minimal,
                 maximum_sat: pair.limits.maximal,
+                server_miner_fee_sat: pair.fees.miner_fees.server,
+                percentage_fee: pair.fees.percentage,
                 observed_at,
             }),
         }
@@ -363,7 +367,8 @@ impl ChainPairSnapshotState {
 
     pub fn amount_eligibility(
         &self,
-        amount_sat: u64,
+        merchant_amount_sat: u64,
+        additional_server_lock_sat: u64,
         now: Instant,
         maximum_age: Duration,
     ) -> ChainAmountEligibility {
@@ -376,9 +381,22 @@ impl ChainPairSnapshotState {
         if age > maximum_age {
             return ChainAmountEligibility::SnapshotUnavailable;
         }
-        if amount_sat < snapshot.minimum_sat {
+        let Some(server_lock_sat) = merchant_amount_sat.checked_add(additional_server_lock_sat)
+        else {
+            return ChainAmountEligibility::AboveMaximum;
+        };
+        let Some(numerator) = server_lock_sat.checked_add(snapshot.server_miner_fee_sat) else {
+            return ChainAmountEligibility::AboveMaximum;
+        };
+        let denominator = 1.0 - snapshot.percentage_fee / 100.0;
+        let payer_amount_sat = ((numerator as f64) / denominator).ceil();
+        if !payer_amount_sat.is_finite() || payer_amount_sat > u64::MAX as f64 {
+            return ChainAmountEligibility::AboveMaximum;
+        }
+        let payer_amount_sat = payer_amount_sat as u64;
+        if payer_amount_sat < snapshot.minimum_sat {
             ChainAmountEligibility::BelowMinimum
-        } else if amount_sat > snapshot.maximum_sat {
+        } else if payer_amount_sat > snapshot.maximum_sat {
             ChainAmountEligibility::AboveMaximum
         } else {
             ChainAmountEligibility::Eligible
@@ -692,19 +710,19 @@ mod tests {
         let state = ChainPairSnapshotState::from_pair(chain_pair(25_000, 1_000_000), observed_at);
 
         assert_eq!(
-            state.amount_eligibility(24_999, observed_at, FRESH_FOR),
+            state.amount_eligibility(24_854, 0, observed_at, FRESH_FOR),
             ChainAmountEligibility::BelowMinimum
         );
         assert_eq!(
-            state.amount_eligibility(25_000, observed_at, FRESH_FOR),
+            state.amount_eligibility(24_855, 0, observed_at, FRESH_FOR),
             ChainAmountEligibility::Eligible
         );
         assert_eq!(
-            state.amount_eligibility(25_001, observed_at, FRESH_FOR),
+            state.amount_eligibility(24_999, 0, observed_at, FRESH_FOR),
             ChainAmountEligibility::Eligible
         );
         assert_eq!(
-            state.amount_eligibility(1_000_001, observed_at, FRESH_FOR),
+            state.amount_eligibility(994_981, 0, observed_at, FRESH_FOR),
             ChainAmountEligibility::AboveMaximum
         );
     }
@@ -713,7 +731,7 @@ mod tests {
     fn chain_pair_missing_invalid_future_and_stale_snapshots_fail_closed() {
         let observed_at = Instant::now();
         assert_eq!(
-            ChainPairSnapshotState::Missing.amount_eligibility(25_000, observed_at, FRESH_FOR),
+            ChainPairSnapshotState::Missing.amount_eligibility(25_000, 0, observed_at, FRESH_FOR),
             ChainAmountEligibility::SnapshotUnavailable
         );
 
@@ -728,6 +746,7 @@ mod tests {
         assert_eq!(
             state.amount_eligibility(
                 25_000,
+                0,
                 observed_at + FRESH_FOR + Duration::from_nanos(1),
                 FRESH_FOR
             ),
@@ -736,6 +755,7 @@ mod tests {
         assert_eq!(
             state.amount_eligibility(
                 25_000,
+                0,
                 observed_at.checked_sub(Duration::from_secs(1)).unwrap(),
                 FRESH_FOR
             ),
