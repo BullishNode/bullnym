@@ -1599,12 +1599,13 @@ impl BoltzService {
             .map_err(|error| AppError::BoltzError(format!("chain pair fetch failed: {error}")))?
             .get_btc_to_lbtc_pair()
             .ok_or_else(|| AppError::BoltzError("BTC/L-BTC chain pair is unavailable".into()))?;
+        let server_lock_amount_sat = mixed_server_lock_amount_sat.unwrap_or(merchant_amount_sat);
 
         // Reject known deterministic limit failures before reserving a
         // provider attempt or crossing its irreversible dispatch boundary.
         // The provider still validates the request, so submit-time mapping
         // below remains necessary if its limits change between these reads.
-        validate_chain_create_amount(&pair, amount_sat)?;
+        validate_chain_create_amount(&pair, server_lock_amount_sat)?;
 
         // Heights are captured before the mutating request and bound the
         // timeout-order validation. A block arriving during the request only
@@ -1619,7 +1620,6 @@ impl BoltzService {
         let heights = heights_result
             .map_err(|error| AppError::BoltzError(format!("chain height fetch failed: {error}")))?;
 
-        let server_lock_amount_sat = mixed_server_lock_amount_sat.unwrap_or(merchant_amount_sat);
         let request = CreateChainRequest {
             from: "BTC".to_string(),
             to: "L-BTC".to_string(),
@@ -3737,7 +3737,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.server_lock_amount_sat, 25_029);
-        assert!(result.user_lock_amount_sat > result.server_lock_amount_sat);
+        assert_eq!(result.server_lock_amount_sat - 25_000, 29);
+        assert_eq!(
+            result.user_lock_amount_sat,
+            expected_chain_user_lock_amount(&pair, 25_029).unwrap()
+        );
         assert_eq!(fixture.request()["serverLockAmount"], 25_029);
         fixture.shutdown().await;
     }

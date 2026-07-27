@@ -1839,14 +1839,26 @@ pub async fn status(
         .as_ref()
         .filter(|_| sat_fixed_instructions_payable && remaining_sat > 0)
         .map(|_| remaining_sat);
+    let mixed_chain_fee_budget_sat = if existing_quote_chain_offer {
+        // Current limits never invalidate an already-created durable offer.
+        Some(0)
+    } else if fiat_settlement_policy
+        .as_ref()
+        .is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage))
+    {
+        current_mixed_claim_fee_budget_sat(&state).ok()
+    } else {
+        Some(0)
+    };
     let bitcoin_chain_eligibility = Some(
         current_quote_amount_sat
             .and_then(|amount| u64::try_from(amount).ok())
-            .map(|amount| {
+            .zip(mixed_chain_fee_budget_sat)
+            .map(|(amount, fee_budget_sat)| {
                 state
                     .boltz
                     .provider_limits()
-                    .bitcoin_chain_amount_eligibility(amount, 0)
+                    .bitcoin_chain_amount_eligibility(amount, fee_budget_sat)
             })
             .unwrap_or(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
     );
@@ -3396,6 +3408,9 @@ async fn ensure_versioned_bitcoin_chain_offer(
         return Ok((offer_id, offer));
     }
     drop(lookup_connection);
+    let mixed_claim_fee_budget_sat = capture_mixed_policy
+        .then(|| current_mixed_claim_fee_budget_sat(state))
+        .transpose()?;
     // Reject a new offer before touching recovery ownership or provider
     // mutation. Existing payer-exposable offers returned above remain
     // replayable regardless of current limit freshness.
@@ -3406,7 +3421,7 @@ async fn ensure_versioned_bitcoin_chain_offer(
             u64::try_from(requested_quote.merchant_amount_sat).map_err(|_| {
                 AppError::InvalidAmount("Bitcoin is unavailable for this amount".into())
             })?,
-            0,
+            mixed_claim_fee_budget_sat.unwrap_or(0),
         ) {
         crate::provider_limits::ChainAmountEligibility::Eligible => {}
         crate::provider_limits::ChainAmountEligibility::BelowMinimum
@@ -3617,21 +3632,24 @@ async fn ensure_versioned_bitcoin_chain_offer(
         .map_err(|error| {
             AppError::DbError(format!("chain refund key reservation failed: {error}"))
         })?;
-        let provider_create = if capture_mixed_policy {
-            state
-                .boltz
-                .prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(
-                    claim_key,
-                    refund_key,
-                    merchant_amount_sat,
-                    current_mixed_claim_fee_budget_sat(state)?,
-                )
-                .await?
-        } else {
-            state
-                .boltz
-                .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
-                .await?
+        let provider_create = match mixed_claim_fee_budget_sat {
+            Some(claim_fee_budget_sat) => {
+                state
+                    .boltz
+                    .prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(
+                        claim_key,
+                        refund_key,
+                        merchant_amount_sat,
+                        claim_fee_budget_sat,
+                    )
+                    .await?
+            }
+            None => {
+                state
+                    .boltz
+                    .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
+                    .await?
+            }
         };
         let (request_authority_json, request_authority_sha256) =
             provider_create.canonical_authority()?;

@@ -754,6 +754,41 @@ mod tests {
     }
 
     #[test]
+    fn mixed_claim_budget_is_conserved_before_chain_limit_evaluation() {
+        let observed_at = Instant::now();
+        let state = ChainPairSnapshotState::from_pair(chain_pair(25_000, 1_000_000), observed_at);
+
+        // Pair pricing is ceil((server lock + 20) / 0.995). A 29-sat mixed
+        // claim budget raises this merchant amount from a 24,971-sat payer
+        // lock to exactly the inclusive 25,000-sat provider minimum.
+        assert_eq!(
+            state.amount_eligibility(24_826, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::BelowMinimum
+        );
+        assert_eq!(
+            state.amount_eligibility(24_826, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+
+        // The same budget must also count at the upper boundary. Without it
+        // the gross payer amount is 999,972 sats; with it the amount exceeds
+        // the provider maximum and admission must close before mutation.
+        assert_eq!(
+            state.amount_eligibility(994_952, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+        assert_eq!(
+            state.amount_eligibility(994_952, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::AboveMaximum
+        );
+
+        assert_eq!(
+            state.amount_eligibility(u64::MAX, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::AboveMaximum
+        );
+    }
+
+    #[test]
     fn chain_pair_missing_invalid_future_and_stale_snapshots_fail_closed() {
         let observed_at = Instant::now();
         assert_eq!(
