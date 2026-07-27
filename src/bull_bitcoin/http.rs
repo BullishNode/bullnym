@@ -914,6 +914,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_recovery_accepts_an_expired_but_still_identical_order() {
+        let request = CreateSellRequest {
+            request_id: Uuid::new_v4(),
+            currency: FiatCurrency::CAD,
+            network: BitcoinNetwork::Bitcoin,
+            bitcoin_amount: BitcoinAmountSat::new(100_000).unwrap(),
+            use_payjoin: false,
+        };
+        let order = serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payinAmount": 0.001,
+            "payoutCurrency": "CAD",
+            "bitcoinAddress": BTC_ADDRESS,
+            "confirmationDeadline": "2020-01-01T00:00:00Z"
+        });
+        assert_eq!(
+            parse_created_order(&order, &request, true),
+            Err(BullBitcoinError::Integrity)
+        );
+        let recovered = parse_created_order(&order, &request, false).unwrap();
+        assert_eq!(
+            recovered.order_id.to_string(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(recovered.requested_bitcoin, request.bitcoin_amount);
+    }
+
+    #[test]
     fn observation_uses_actual_received_and_exact_credited_minor_units() {
         let observation = parse_order_observation(&serde_json::json!({
             "orderId": "11111111-1111-4111-8111-111111111111",
