@@ -267,6 +267,35 @@ enum CycleOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetedLiquidScanOutcome {
+    PaymentObserved,
+    NoChange,
+    NotEligible,
+    Deferred,
+    HardBound,
+    RateLimited,
+    BackendUnavailable,
+    InvalidTarget,
+    Failed,
+}
+
+impl TargetedLiquidScanOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PaymentObserved => "payment_observed",
+            Self::NoChange => "no_change",
+            Self::NotEligible => "not_eligible",
+            Self::Deferred => "deferred",
+            Self::HardBound => "hard_bound",
+            Self::RateLimited => "rate_limited",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::InvalidTarget => "invalid_target",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl CycleOutcome {
     fn after_token_exhaustion(useful_progress: usize) -> Self {
         if useful_progress == 0 {
@@ -625,7 +654,7 @@ pub async fn run(
     cfg: ChainWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
     mut reporter: WorkerReporter,
-    wakeup: Arc<crate::watcher_wakeup::WatcherWakeup>,
+    wakeup: Arc<crate::watcher_wakeup::TargetedWatcherWakeup>,
 ) {
     let mut tier_health = TierHealth::default();
     let mut active_epoch = LiquidTierScanEpoch::default();
@@ -752,39 +781,6 @@ pub async fn run(
                 report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
                 resume_schedule.observe(tier.lane(), turn.resume);
             }
-            generation = wakeup.wait_for_request() => {
-                let started = std::time::Instant::now();
-                let turn = poll_cycle(
-                    ChainWatcherPollCtx {
-                        pool: &pool,
-                        backend: backend.as_ref(),
-                        rate_limiter: rate_limiter.as_ref(),
-                        pricer: Some(pricer.as_ref()),
-                        cancel: &cancel,
-                    },
-                    &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch, false,
-                ).await;
-                if cancel.is_cancelled() {
-                    reporter.intentional_shutdown();
-                    return;
-                }
-                report_outcome(
-                    &reporter,
-                    &mut tier_health,
-                    WatchTier::Recent,
-                    turn.outcome,
-                );
-                resume_schedule.observe(db::WatcherLane::Recent, turn.resume);
-                wakeup.complete_through(generation);
-                tracing::info!(
-                    event = "liquid_watcher_payer_wakeup_completed",
-                    generation,
-                    latency_ms = started.elapsed().as_millis() as u64,
-                    outcome = ?turn.outcome,
-                    resume = ?turn.resume,
-                    "payer-triggered authoritative Liquid watcher turn completed"
-                );
-            }
             _ = idle_tick.tick() => {
                 let turn = poll_cycle(
                     ChainWatcherPollCtx {
@@ -807,6 +803,46 @@ pub async fn run(
                     turn.outcome,
                 );
                 resume_schedule.observe(db::WatcherLane::Historical, turn.resume);
+            }
+            request = wakeup.wait_for_request() => {
+                let started = std::time::Instant::now();
+                let invoice_id = request.invoice_id;
+                let generation = request.generation;
+                let queue_depth_after_dequeue = request.queue_depth_after_dequeue;
+                let outcome = poll_targeted_liquid_invoice(
+                    ChainWatcherPollCtx {
+                        pool: &pool,
+                        backend: backend.as_ref(),
+                        rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
+                        cancel: &cancel,
+                    },
+                    LiquidInvoicePollConfig {
+                        tolerances,
+                        finality_confirmations: cfg.liquid_finality_confirmations,
+                        active_window_secs: cfg.active_window_secs,
+                    },
+                    invoice_id,
+                    &reporter,
+                ).await;
+                if cancel.is_cancelled() {
+                    reporter.intentional_shutdown();
+                    return;
+                }
+                let completion = wakeup.complete(request);
+                tracing::info!(
+                    event = "liquid_watcher_targeted_wakeup_completed",
+                    invoice_id = %invoice_id,
+                    generation,
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    outcome = outcome.label(),
+                    request_count = completion.request_count,
+                    coalesced_requests = completion.request_count.saturating_sub(1),
+                    queue_depth_after_dequeue,
+                    queue_depth = completion.queue_depth,
+                    outstanding = completion.outstanding,
+                    "payer-triggered targeted Liquid watcher scan completed"
+                );
             }
         }
     }
@@ -1210,6 +1246,95 @@ async fn poll_invoice_addresses(
         match epoch.invoices.finish_page_range() {
             Some(outcome) => WatcherTurn::complete(outcome),
             None => WatcherTurn::continue_soon(CycleOutcome::Incomplete),
+        }
+    }
+}
+
+/// One payer-triggered scan of one existing, watcher-eligible invoice. This
+/// path intentionally does not touch background lane epochs or durable lane
+/// cursors: scheduled recent/historical scans remain the recovery and
+/// completeness mechanism.
+async fn poll_targeted_liquid_invoice(
+    ctx: ChainWatcherPollCtx<'_>,
+    config: LiquidInvoicePollConfig,
+    invoice_id: uuid::Uuid,
+    reporter: &WorkerReporter,
+) -> TargetedLiquidScanOutcome {
+    reporter.progress();
+    let invoice = match db::liquid_watcher_invoice_target(
+        ctx.pool,
+        config.tolerances.payment_grace_secs,
+        invoice_id,
+    )
+    .await
+    {
+        Ok(Some(invoice)) => invoice,
+        Ok(None) => return TargetedLiquidScanOutcome::NotEligible,
+        Err(error) => {
+            tracing::warn!(
+                event = "liquid_watcher_targeted_lookup_failed",
+                invoice_id = %invoice_id,
+                error = %error,
+                "targeted Liquid watcher lookup failed"
+            );
+            return TargetedLiquidScanOutcome::Failed;
+        }
+    };
+    if ctx.cancel.is_cancelled() {
+        return TargetedLiquidScanOutcome::Failed;
+    }
+    if let Err(error) = ctx.backend.health_check().await {
+        tracing::warn!(
+            event = "liquid_watcher_targeted_backend_unavailable",
+            invoice_id = %invoice_id,
+            error = %error,
+            "targeted Liquid watcher backend health check failed"
+        );
+        return TargetedLiquidScanOutcome::BackendUnavailable;
+    }
+    if ctx.rate_limiter.check_electrum_watcher().await.is_err() {
+        return TargetedLiquidScanOutcome::RateLimited;
+    }
+    let parsed = match elements::Address::from_str(&invoice.liquid_address) {
+        Ok(address) => address,
+        Err(error) => {
+            tracing::warn!(
+                event = "liquid_watcher_targeted_invalid_address",
+                invoice_id = %invoice_id,
+                error = %error,
+                "targeted Liquid watcher found an invalid persisted address"
+            );
+            return TargetedLiquidScanOutcome::InvalidTarget;
+        }
+    };
+    let script = parsed.script_pubkey();
+    match record_liquid_events_for_script(
+        ctx,
+        LiquidInvoiceObservationTarget {
+            invoice_id,
+            address: &invoice.liquid_address,
+            script: &script,
+            blinding_key_hex: &invoice.liquid_blinding_key_hex,
+            fiat_currency: invoice.fiat_currency.as_deref(),
+            finality_confirmations: config.finality_confirmations,
+        },
+        config.tolerances,
+        reporter,
+    )
+    .await
+    {
+        Ok(LiquidRecordOutcome::Applied { recorded: 0 }) => TargetedLiquidScanOutcome::NoChange,
+        Ok(LiquidRecordOutcome::Applied { .. }) => TargetedLiquidScanOutcome::PaymentObserved,
+        Ok(LiquidRecordOutcome::Deferred) => TargetedLiquidScanOutcome::Deferred,
+        Ok(LiquidRecordOutcome::HardBound) => TargetedLiquidScanOutcome::HardBound,
+        Err(error) => {
+            tracing::warn!(
+                event = "liquid_watcher_targeted_scan_failed",
+                invoice_id = %invoice_id,
+                error = %error,
+                "targeted Liquid watcher scan failed"
+            );
+            TargetedLiquidScanOutcome::Failed
         }
     }
 }

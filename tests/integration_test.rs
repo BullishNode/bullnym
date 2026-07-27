@@ -27025,6 +27025,45 @@ async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
 }
 
 #[tokio::test]
+async fn liquid_watcher_target_lookup_selects_only_the_requested_existing_obligation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "liquidtarget").await;
+    let requested =
+        insert_test_invoice(&pool, "liquidtarget", &npub, "lq1targetrequested", 3_600).await;
+    let unrelated =
+        insert_test_invoice(&pool, "liquidtarget", &npub, "lq1targetunrelated", 3_600).await;
+
+    let target = pay_service::db::liquid_watcher_invoice_target(&pool, 0, requested.id)
+        .await
+        .unwrap()
+        .expect("requested invoice remains a watcher obligation");
+    assert_eq!(target.invoice_id, requested.id);
+    assert_eq!(target.liquid_address, "lq1targetrequested");
+    assert_ne!(target.invoice_id, unrelated.id);
+
+    let unknown_id = Uuid::new_v4();
+    assert!(
+        pay_service::db::liquid_watcher_invoice_target(&pool, 0, unknown_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a targeted poll cannot manufacture an unknown watch obligation"
+    );
+    assert_eq!(
+        pay_service::db::liquid_watcher_invoice_target(&pool, 0, unrelated.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .invoice_id,
+        unrelated.id,
+        "changing one target cannot redirect the exact lookup"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

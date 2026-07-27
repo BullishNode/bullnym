@@ -1647,6 +1647,20 @@ async fn wait_for_direct_watcher(
     }
 }
 
+async fn wait_for_targeted_liquid_watcher(
+    enabled: bool,
+    invoice_id: Uuid,
+    wakeup: &crate::watcher_wakeup::TargetedWatcherWakeup,
+) -> crate::watcher_wakeup::TargetedWakeWait {
+    if enabled {
+        wakeup
+            .request_and_wait(invoice_id, DIRECT_WATCHER_STATUS_WAIT)
+            .await
+    } else {
+        crate::watcher_wakeup::TargetedWakeWait::unavailable()
+    }
+}
+
 pub async fn status(
     State(state): State<AppState>,
     Path(id_str): Path<String>,
@@ -1704,13 +1718,25 @@ pub async fn status(
         let started = std::time::Instant::now();
         let (bitcoin, liquid) = tokio::join!(
             wait_for_direct_watcher(wake_bitcoin, state.direct_watcher_wakeups.bitcoin.as_ref(),),
-            wait_for_direct_watcher(wake_liquid, state.direct_watcher_wakeups.liquid.as_ref(),),
+            wait_for_targeted_liquid_watcher(
+                wake_liquid,
+                id,
+                state.direct_watcher_wakeups.liquid.as_ref(),
+            ),
         );
         tracing::info!(
             event = "invoice_status_direct_watcher_wakeup",
             invoice_id = %id,
             bitcoin = ?bitcoin,
-            liquid = ?liquid,
+            liquid = ?liquid.outcome,
+            liquid_generation = ?liquid.generation,
+            liquid_coalesced = liquid.coalesced,
+            liquid_queue_depth = liquid.queue_depth,
+            liquid_outstanding = liquid.outstanding,
+            liquid_wait_timed_out = liquid.outcome
+                == crate::watcher_wakeup::WakeWaitOutcome::TimedOut,
+            liquid_backpressured = liquid.outcome
+                == crate::watcher_wakeup::WakeWaitOutcome::Backpressured,
             latency_ms = started.elapsed().as_millis() as u64,
             "invoice status refreshed after bounded direct-watcher handoff"
         );
