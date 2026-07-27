@@ -139,9 +139,14 @@ impl ProviderLimitsRuntime {
 
     /// In-memory eligibility for the exact BTC -> L-BTC chain endpoint.
     /// Missing, invalid, future, and stale observations fail closed.
-    pub fn bitcoin_chain_amount_eligibility(&self, amount_sat: u64) -> ChainAmountEligibility {
+    pub fn bitcoin_chain_amount_eligibility(
+        &self,
+        amount_sat: u64,
+        additional_server_lock_sat: u64,
+    ) -> ChainAmountEligibility {
         self.chain_snapshot().amount_eligibility(
             amount_sat,
+            additional_server_lock_sat,
             Instant::now(),
             PROVIDER_LIMIT_MAXIMUM_AGE,
         )
@@ -428,7 +433,8 @@ mod tests {
         );
         assert_eq!(
             runtime.chain_snapshot().amount_eligibility(
-                24_999,
+                24_916,
+                0,
                 completed_at,
                 PROVIDER_LIMIT_MAXIMUM_AGE,
             ),
@@ -436,7 +442,8 @@ mod tests {
         );
         assert_eq!(
             runtime.chain_snapshot().amount_eligibility(
-                25_000,
+                24_917,
+                0,
                 completed_at,
                 PROVIDER_LIMIT_MAXIMUM_AGE,
             ),
@@ -460,6 +467,7 @@ mod tests {
         assert_eq!(
             runtime.chain_snapshot().amount_eligibility(
                 25_000,
+                0,
                 observed_at + PROVIDER_LIMIT_MAXIMUM_AGE,
                 PROVIDER_LIMIT_MAXIMUM_AGE,
             ),
@@ -468,6 +476,7 @@ mod tests {
         assert_eq!(
             runtime.chain_snapshot().amount_eligibility(
                 25_000,
+                0,
                 observed_at + PROVIDER_LIMIT_MAXIMUM_AGE + Duration::from_nanos(1),
                 PROVIDER_LIMIT_MAXIMUM_AGE,
             ),
