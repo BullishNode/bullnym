@@ -233,7 +233,7 @@ fn classify_rpc_error(error: &Value, call_kind: RpcCallKind) -> BullBitcoinError
     // API-Orders uses this nested code for a dependency failure while creating
     // an order. It is not a merchant policy rejection: retrying the same
     // request may produce a different provider result, so preserve the
-    // ambiguity and let settlement choose the safe ambiguous-create fallback.
+    // ambiguity and keep fallback plus redispatch closed until correlation.
     if error.pointer("/data/apiError/code").and_then(Value::as_str) == Some("ERR_ORD_PP_DEPENDENCY")
     {
         return BullBitcoinError::Upstream;
