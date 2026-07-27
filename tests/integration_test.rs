@@ -2917,30 +2917,44 @@ async fn fiat_only_lnurl_comments_are_accepted_and_discarded_on_both_rails() {
         .expect("callback uses configured metadata origin");
 
     let comment = "private settlement probe";
+    let encoded_comment = "private%20settlement%20probe";
     let (lightning_status, lightning_body) = get_path_from(
         &app,
-        &format!("{callback_path}?amount=100000&comment={comment}"),
+        &format!("{callback_path}?amount=100000&comment={encoded_comment}"),
         "127.0.0.1:42111".parse().unwrap(),
     )
     .await;
     assert_eq!(lightning_status, StatusCode::OK, "{lightning_body}");
-    assert!(lightning_body["pr"].as_str().is_some(), "{lightning_body}");
+    assert_eq!(
+        lightning_body,
+        json!({
+            "pr": "lnbc1testbullbitcoinfiatonlyinvoice",
+            "routes": [],
+            "disposable": false,
+            "successAction": {
+                "tag": "message",
+                "message": "Payment received to fiat-comment-discard@test.example.com"
+            }
+        })
+    );
     assert!(!lightning_body.to_string().contains(comment));
-    assert!(!lightning_body.to_string().to_lowercase().contains("fiat"));
 
     let (liquid_status, liquid_body) = get_path_from(
         &app,
-        &format!("{callback_path}?amount=100000&comment={comment}&payment_method=L-BTC"),
+        &format!("{callback_path}?amount=100000&comment={encoded_comment}&payment_method=L-BTC"),
         "127.0.0.1:42111".parse().unwrap(),
     )
     .await;
     assert_eq!(liquid_status, StatusCode::OK, "{liquid_body}");
-    assert!(
-        liquid_body["L-BTC"]["address"].as_str().is_some(),
-        "{liquid_body}"
+    assert_eq!(
+        liquid_body,
+        json!({
+            "L-BTC": {
+                "address": "lq1qqtestbullbitcoinfiatonlydestination"
+            }
+        })
     );
     assert!(!liquid_body.to_string().contains(comment));
-    assert!(!liquid_body.to_string().to_lowercase().contains("fiat"));
 
     let persisted: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lnurl_comment_intents WHERE owner_npub = $1")
