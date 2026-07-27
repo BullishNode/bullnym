@@ -297,6 +297,53 @@ pub async fn create_fiat_only_instruction(
     result
 }
 
+/// Replay an already-reserved fiat-only instruction without admitting a new
+/// provider order. This is used when binding the first order has changed the
+/// invoice aggregate to `pending`, but the payer lost the original response
+/// and retries the still-current quote.
+pub async fn replay_existing_fiat_only_instruction(
+    state: &AppState,
+    request: &FiatOnlyInstructionRequest<'_>,
+) -> Result<Option<FiatOnlyInstructionOutcome>, SettlementServiceError> {
+    if request.use_payjoin && request.network != BitcoinNetwork::Bitcoin {
+        return Err(SettlementServiceError::StoredState);
+    }
+
+    let lock = PgAdvisoryLock::new(format!(
+        "bullnym-bull-bitcoin:{}:{}",
+        request.owner_npub, request.request_key
+    ));
+    let connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    let mut guard = lock
+        .acquire(connection)
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+
+    let existing = db::load_bull_bitcoin_settlement_by_request_key(
+        &mut guard,
+        request.owner_npub,
+        request.request_key,
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)?;
+    let result = if existing.is_some() {
+        create_fiat_only_instruction_locked(state, request, &mut guard)
+            .await
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    guard
+        .release_now()
+        .await
+        .map_err(|_| SettlementServiceError::Database)?;
+    result
+}
+
 /// Replay a previously reserved Lightning Address fiat-only intent without
 /// consulting the merchant's current setting. Settings govern new callbacks;
 /// once a payer-facing destination (or a durable all-Bitcoin fallback) exists,
