@@ -18586,6 +18586,110 @@ async fn payer_demand_quote_rejects_sat_fixed_and_creates_no_fiat_version() {
 }
 
 #[tokio::test]
+async fn fiat_only_quote_replay_returns_the_bound_unfunded_instruction() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let fake = ScriptedBullBitcoinApi::default();
+    let order_id = Uuid::new_v4();
+    fake.push_create(Ok(scripted_liquid_order(order_id, 10_000)))
+        .await;
+    let (mut state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-quote-replay").await;
+    pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        100,
+        FiatCurrency::CAD,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let liquid_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let liquid_blinding_key_hex =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
+    let invoice = insert_test_wallet_invoice_with_fiat_policy(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &owner_npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
+            expires_in_secs: 3_600,
+        },
+        Product::Invoice,
+        4,
+    )
+    .await
+    .unwrap();
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    state.pricer = Arc::new(
+        PricerClient::new(PricerConfig {
+            url: pricer_url,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+
+    let (first_status, first) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(first["instruction"]["kind"], "liquid_direct");
+    assert_eq!(first["instruction"]["payer_amount_sat"], 10_000);
+
+    let bound_state: (String, Option<String>, String, Option<i64>) = sqlx::query_as(
+        "SELECT invoice.status, invoice.presentation_status, invoice.settlement_status, \
+                settlement.actual_received_sat \
+           FROM invoices invoice \
+           JOIN bull_bitcoin_settlements settlement \
+             ON settlement.invoice_id = invoice.id \
+          WHERE invoice.id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bound_state,
+        (
+            "unpaid".into(),
+            Some("unpaid".into()),
+            "pending".into(),
+            None
+        )
+    );
+
+    let (replay_status, replay) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, first);
+    assert_eq!(fake.create_call_count(), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn direct_liquid_stable_address_values_each_partial_and_reorgs_without_repricing() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

@@ -1979,13 +1979,19 @@ pub async fn payer_demand_quote(
     let invoice = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+    let policy = db::invoice_fiat_settlement_policy(&state.db, invoice.id).await?;
     if !invoice_payment_rails_are_payable(&invoice) {
+        if let Some(response) =
+            replay_pending_fiat_only_payer_quote(&state, &invoice, policy.as_ref(), request.rail)
+                .await?
+        {
+            return Ok(Json(response));
+        }
         return Err(AppError::InvalidAmount(format!(
             "invoice is {} (not payable); no payer quote available",
             invoice.status
         )));
     }
-    let policy = db::invoice_fiat_settlement_policy(&state.db, invoice.id).await?;
     if invoice.pricing_mode == "sat_fixed" && policy.is_none() {
         return Err(AppError::InvalidAmount(
             "sat-fixed invoices retain the remaining-aware status and Lightning offer flow".into(),
@@ -2023,10 +2029,13 @@ pub async fn payer_demand_quote(
             &state,
             &invoice,
             policy,
-            None,
-            request.rail,
-            amount_sat,
-            &request_key,
+            FiatOnlyInstructionParams {
+                invoice_quote_version_id: None,
+                rail: request.rail,
+                amount_sat,
+                request_key: &request_key,
+                mode: FiatOnlyInstructionMode::CreateOrReplay,
+            },
         )
         .await?
         {
@@ -2052,6 +2061,56 @@ pub async fn payer_demand_quote(
         }
     };
     Ok(Json(response))
+}
+
+async fn replay_pending_fiat_only_payer_quote(
+    state: &AppState,
+    invoice: &db::Invoice,
+    policy: Option<&db::InvoiceFiatSettlementPolicy>,
+    rail: PayerQuoteRail,
+) -> Result<Option<PayerDemandQuoteResponse>, AppError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if invoice.pricing_mode != "fiat_fixed"
+        || !matches!(
+            invoice.status.as_str(),
+            "unpaid" | "in_progress" | "partially_paid"
+        )
+        || invoice.presentation_status.as_deref() != Some("unpaid")
+        || invoice.settlement_status != "pending"
+        || policy.fiat_percentage != 100
+    {
+        return Ok(None);
+    }
+    let Some(quote) = db::current_invoice_quote(&state.db, invoice.id).await? else {
+        return Ok(None);
+    };
+    let request_key = quote_offer_request_key(quote.id, rail, "bull_bitcoin_fiat_only");
+    let Some(instruction) = fiat_only_instruction(
+        state,
+        invoice,
+        policy,
+        FiatOnlyInstructionParams {
+            invoice_quote_version_id: Some(quote.id),
+            rail,
+            amount_sat: quote.merchant_amount_sat,
+            request_key: &request_key,
+            mode: FiatOnlyInstructionMode::ReplayOnly,
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(PayerDemandQuoteResponse::FiatFixed {
+        invoice_id: invoice.id,
+        selected_rail: rail,
+        quote: FiatQuoteView::from(&quote),
+        instruction: instruction.instruction,
+        instruction_expires_at_unix: instruction.expires_at_unix,
+    }))
 }
 
 fn payer_quote_rail_availability(
@@ -2500,10 +2559,13 @@ async fn versioned_instruction_for_rail(
             state,
             invoice,
             policy,
-            Some(quote.id),
-            rail,
-            quote.merchant_amount_sat,
-            &request_key,
+            FiatOnlyInstructionParams {
+                invoice_quote_version_id: Some(quote.id),
+                rail,
+                amount_sat: quote.merchant_amount_sat,
+                request_key: &request_key,
+                mode: FiatOnlyInstructionMode::CreateOrReplay,
+            },
         )
         .await?
         {
@@ -2606,14 +2668,25 @@ struct PreparedPayerInstruction {
     expires_at_unix: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum FiatOnlyInstructionMode {
+    CreateOrReplay,
+    ReplayOnly,
+}
+
+struct FiatOnlyInstructionParams<'a> {
+    invoice_quote_version_id: Option<Uuid>,
+    rail: PayerQuoteRail,
+    amount_sat: i64,
+    request_key: &'a str,
+    mode: FiatOnlyInstructionMode,
+}
+
 async fn fiat_only_instruction(
     state: &AppState,
     invoice: &db::Invoice,
     policy: &db::InvoiceFiatSettlementPolicy,
-    invoice_quote_version_id: Option<Uuid>,
-    rail: PayerQuoteRail,
-    amount_sat: i64,
-    request_key: &str,
+    params: FiatOnlyInstructionParams<'_>,
 ) -> Result<Option<PreparedPayerInstruction>, AppError> {
     if policy.fiat_percentage != 100 {
         return Ok(None);
@@ -2627,20 +2700,20 @@ async fn fiat_only_instruction(
         .map_err(|_| AppError::DbError("invalid captured settlement product".into()))?;
     let currency = FiatCurrency::from_str(&policy.fiat_currency)
         .map_err(|_| AppError::DbError("invalid captured settlement currency".into()))?;
-    let network = match rail {
+    let network = match params.rail {
         PayerQuoteRail::Bitcoin => BitcoinNetwork::Bitcoin,
         PayerQuoteRail::Lightning => BitcoinNetwork::Lightning,
         PayerQuoteRail::Liquid => BitcoinNetwork::Liquid,
     };
-    let amount = BitcoinAmountSat::new(amount_sat)
+    let amount = BitcoinAmountSat::new(params.amount_sat)
         .map_err(|_| AppError::InvalidAmount("invalid fiat-settlement amount".into()))?;
     let request = FiatOnlyInstructionRequest {
         owner_npub: &policy.owner_npub,
         invoice_id: Some(invoice.id),
-        invoice_quote_version_id,
+        invoice_quote_version_id: params.invoice_quote_version_id,
         product,
         credential_id: policy.credential_id,
-        request_key,
+        request_key: params.request_key,
         fiat_currency: currency,
         network,
         bitcoin_amount: amount,
@@ -2649,9 +2722,19 @@ async fn fiat_only_instruction(
         // request the stronger transport without adding a payer-side toggle.
         use_payjoin: network == BitcoinNetwork::Bitcoin,
     };
-    let outcome = match bull_bitcoin_settlement::create_fiat_only_instruction(state, &request).await
-    {
-        Ok(outcome) => outcome,
+    let outcome = match params.mode {
+        FiatOnlyInstructionMode::CreateOrReplay => {
+            bull_bitcoin_settlement::create_fiat_only_instruction(state, &request)
+                .await
+                .map(Some)
+        }
+        FiatOnlyInstructionMode::ReplayOnly => {
+            bull_bitcoin_settlement::replay_existing_fiat_only_instruction(state, &request).await
+        }
+    };
+    let outcome = match outcome {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Ok(None),
         Err(
             SettlementServiceError::SourceIdentityUnavailable
             | SettlementServiceError::CredentialUnavailable,
@@ -2684,7 +2767,7 @@ async fn fiat_only_instruction(
             } else {
                 build_direct_bitcoin_bip21(
                     &address,
-                    u64::try_from(amount_sat).map_err(|_| {
+                    u64::try_from(params.amount_sat).map_err(|_| {
                         AppError::DbError("fiat-settlement Bitcoin amount is invalid".into())
                     })?,
                 )
@@ -2692,18 +2775,18 @@ async fn fiat_only_instruction(
             VersionedPayerInstruction::BitcoinDirect {
                 address,
                 bip21,
-                payer_amount_sat: amount_sat,
+                payer_amount_sat: params.amount_sat,
             }
         }
         PayerInstruction::Lightning { bolt11 } => VersionedPayerInstruction::LightningDirect {
             pr: bolt11,
-            payer_amount_sat: amount_sat,
+            payer_amount_sat: params.amount_sat,
         },
         PayerInstruction::Liquid {
             confidential_address,
         } => VersionedPayerInstruction::LiquidDirect {
             address: confidential_address,
-            payer_amount_sat: amount_sat,
+            payer_amount_sat: params.amount_sat,
         },
     };
     Ok(Some(PreparedPayerInstruction {
