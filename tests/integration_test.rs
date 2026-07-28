@@ -740,6 +740,7 @@ fn mixed_claim_basis(net_settlement_sat: i64) -> MixedClaimBasis {
     MixedClaimBasis {
         net_settlement_sat,
         additional_output_script_len: address.script_pubkey().len(),
+        provider_only: false,
     }
 }
 
