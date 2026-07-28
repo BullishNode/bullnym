@@ -486,6 +486,55 @@ Do not enable funded mixed tests if either authority pair is absent or if an
 exact current fee estimate differs from the stored budget; that state requires
 an explicit repricing or fee-bump policy, never an unaccounted merchant debit.
 
+## Migration 079 swap-backed 100%-fiat Lightning Addresses
+
+Apply `079_lightning_address_provider_only.sql` as the privileged owner of
+`bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Take and validate a
+fresh schema-078 backup first.
+
+The migration does not create, fund, reconcile, or rewrite provider orders. It
+leaves historical direct-provider `fiat_only` rows unchanged and adds the
+internal `provider_only` purpose for new Lightning Address reverse swaps whose
+captured allocation is exactly 100%. The one-output claim journal requires one
+confidential Bull Bitcoin output at vout 0, with no merchant output. Existing
+1–99% `mixed` claims retain the merchant and provider outputs.
+
+Before reopening admission, require `/ready` to validate the 1–100 swap-policy
+range, `provider_only` purpose, one-output constraint, and updated authority
+triggers. Record these postflight counts:
+
+```sql
+SELECT purpose, payer_rail, fiat_percentage, provider_state,
+       funding_route, settlement_status, COUNT(*)
+FROM bull_bitcoin_settlements
+WHERE purpose IN ('provider_only', 'mixed')
+GROUP BY purpose, payer_rail, fiat_percentage, provider_state,
+         funding_route, settlement_status
+ORDER BY purpose, payer_rail, fiat_percentage, provider_state;
+
+SELECT settlement.id
+FROM bull_bitcoin_settlements settlement
+LEFT JOIN bull_bitcoin_claim_outputs output
+  ON output.settlement_id = settlement.id
+WHERE settlement.purpose = 'provider_only'
+GROUP BY settlement.id, settlement.funding_committed_at
+HAVING (settlement.funding_committed_at IS NOT NULL AND
+        (COUNT(*) <> 1 OR
+         BOOL_OR(output.role <> 'bull_bitcoin' OR output.vout <> 0)))
+    OR (settlement.funding_committed_at IS NULL AND COUNT(*) <> 0);
+```
+
+The second query must return zero rows. Start only a matching schema-079
+binary. Then certify that a 100%-fiat Lightning Address callback returns a
+Boltz BOLT11 without creating a Bull Bitcoin order; after funded claim
+preparation, exactly one Liquid provider order/output appears and the signed
+merchant settlement projection remains the strict public `fiat` shape.
+
+After migration 079 commits, never start a schema-078-or-older writer: it does
+not understand the provider-only policy or one-output journal. Fix forward, or
+restore the matching validated pre-079 database backup and artifact together.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

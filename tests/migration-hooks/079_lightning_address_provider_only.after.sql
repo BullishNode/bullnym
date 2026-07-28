@@ -40,7 +40,7 @@ BEGIN
         SELECT COUNT(*) FROM bull_bitcoin_settlements
          WHERE purpose = 'fiat_only'
     ) THEN
-        RAISE EXCEPTION 'migration 078 changed a historical direct-provider settlement';
+        RAISE EXCEPTION 'migration 079 changed a historical direct-provider settlement';
     END IF;
 
     IF NOT EXISTS (
@@ -56,7 +56,7 @@ BEGIN
            AND convalidated
            AND pg_get_constraintdef(oid) LIKE '%provider_only%'
     ) THEN
-        RAISE EXCEPTION 'migration 078 did not install the provider-only schema boundary';
+        RAISE EXCEPTION 'migration 079 did not install the provider-only schema boundary';
     END IF;
 
     SELECT oid INTO STRICT runtime_role_oid
@@ -74,7 +74,7 @@ BEGIN
             'bullnym_app', 'bull_bitcoin_claim_outputs', 'SELECT,INSERT')
        OR has_table_privilege(
             'bullnym_app', 'bull_bitcoin_claim_outputs', 'UPDATE,DELETE') THEN
-        RAISE EXCEPTION 'migration 078 widened or broke the runtime-role boundary';
+        RAISE EXCEPTION 'migration 079 widened or broke the runtime-role boundary';
     END IF;
 END
 $$;
@@ -86,7 +86,7 @@ INSERT INTO public_names (name, owner_npub, kind)
 VALUES ('migration078provider', repeat('8', 64), 'nym');
 
 INSERT INTO users (nym, npub, ct_descriptor)
-VALUES ('migration078provider', repeat('8', 64), 'migration-078-descriptor');
+VALUES ('migration078provider', repeat('8', 64), 'migration-079-descriptor');
 
 INSERT INTO bull_bitcoin_credentials (
     id, owner_npub, ciphertext, nonce, encryption_format
@@ -112,7 +112,7 @@ INSERT INTO swap_records (
 )
 SELECT
     '78000000-0000-4000-8000-000000000002', 'migration078provider',
-    'migration-078-provider-only-reverse', 10000, 'lnbc-migration-078',
+    'migration-079-provider-only-reverse', 10000, 'lnbc-migration-079',
     repeat('87', 32), repeat('88', 32), '{}', NULL,
     780000, repeat('88', 8), allocation.id, 1, 1,
     '02' || repeat('85', 32), repeat('86', 32)
@@ -167,7 +167,7 @@ BEGIN
             repeat('8b', 32), repeat('8c', 32), repeat('8d', 32),
             repeat('8e', 32), repeat('8f', 32)
         );
-        RAISE EXCEPTION 'migration 078 accepted a merchant output for provider-only';
+        RAISE EXCEPTION 'migration 079 accepted a merchant output for provider-only';
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;
@@ -211,7 +211,7 @@ BEGIN
            AND output.authorized_amount_sat = 9999
     ) OR (SELECT COUNT(*) FROM bull_bitcoin_claim_outputs
            WHERE settlement_id = '78000000-0000-4000-8000-000000000003') <> 1 THEN
-        RAISE EXCEPTION 'migration 078 rejected its exact one-output provider path';
+        RAISE EXCEPTION 'migration 079 rejected its exact one-output provider path';
     END IF;
 END
 $$;

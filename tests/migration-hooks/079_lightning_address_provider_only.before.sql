@@ -12,7 +12,7 @@ SELECT id, owner_npub, invoice_id, reverse_swap_id, chain_swap_id,
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM migration_078_fiat_only_snapshot) THEN
-        RAISE EXCEPTION 'migration 078 fixture requires a historical direct-provider row';
+        RAISE EXCEPTION 'migration 079 fixture requires a historical direct-provider row';
     END IF;
 END
 $$;

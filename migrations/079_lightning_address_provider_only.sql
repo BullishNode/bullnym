@@ -27,11 +27,11 @@ BEGIN
     SELECT oid INTO runtime_role_oid
       FROM pg_roles WHERE rolname = runtime_role_name;
     IF runtime_role_name IS NULL OR runtime_role_oid IS NULL THEN
-        RAISE EXCEPTION 'migration 078 requires an existing runtime role'
+        RAISE EXCEPTION 'migration 079 requires an existing runtime role'
             USING ERRCODE = '42501';
     END IF;
     IF current_user = runtime_role_name THEN
-        RAISE EXCEPTION 'migration 078 must run as the schema owner, not the runtime role'
+        RAISE EXCEPTION 'migration 079 must run as the schema owner, not the runtime role'
             USING ERRCODE = '42501';
     END IF;
     SELECT relowner, pg_get_userbyid(relowner)
@@ -39,13 +39,13 @@ BEGIN
       FROM pg_class
      WHERE oid = to_regclass('public.bull_bitcoin_settlements');
     IF table_owner_name IS NULL OR table_owner_name <> current_user THEN
-        RAISE EXCEPTION 'migration 078 must run as the Bull Bitcoin settlement table owner'
+        RAISE EXCEPTION 'migration 079 must run as the Bull Bitcoin settlement table owner'
             USING ERRCODE = '42501';
     END IF;
     IF runtime_role_oid = table_owner_oid
        OR pg_has_role(runtime_role_oid, table_owner_oid, 'USAGE')
        OR pg_has_role(runtime_role_oid, table_owner_oid, 'SET') THEN
-        RAISE EXCEPTION 'migration 078 runtime role can assume the settlement table owner'
+        RAISE EXCEPTION 'migration 079 runtime role can assume the settlement table owner'
             USING ERRCODE = '42501';
     END IF;
 END
@@ -369,7 +369,7 @@ BEGIN
     ) OR NOT has_table_privilege(
         runtime_role_name, 'bull_bitcoin_claim_outputs', 'INSERT'
     ) THEN
-        RAISE EXCEPTION 'migration 078 requires the established least-privilege runtime grants'
+        RAISE EXCEPTION 'migration 079 requires the established least-privilege runtime grants'
             USING ERRCODE = '42501';
     END IF;
 END

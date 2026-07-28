@@ -331,10 +331,10 @@ assert_mixed_claim_fee_migration_owner_boundary() {
           psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" \
             --dbname "$runtime_scratch" --set "runtime_role=$RUNTIME_ROLE" 2>&1
   )"; then
-    die "migration 079 unexpectedly ran as the runtime role"
+    die "migration 078 unexpectedly ran as the runtime role"
   fi
   [[ "$refusal_output" == *"must run as the schema owner, not the runtime role"* ]] \
-    || die "migration 079 returned the wrong runtime-role failure: $refusal_output"
+    || die "migration 078 returned the wrong runtime-role failure: $refusal_output"
   rollback_state="$(
     docker exec "$CONTAINER" \
       psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
@@ -342,9 +342,9 @@ assert_mixed_claim_fee_migration_owner_boundary() {
         --command "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name IN ('swap_records', 'chain_swap_records') AND column_name IN ('mixed_claim_path', 'mixed_claim_fee_budget_sat');"
   )"
   [[ "$rollback_state" == "0" ]] \
-    || die "migration 079 runtime-role refusal leaked authority columns ($rollback_state)"
+    || die "migration 078 runtime-role refusal leaked authority columns ($rollback_state)"
   docker exec "$CONTAINER" dropdb --username "$PG_USER" "$runtime_scratch"
-  echo "test-db: migration 079 refused runtime-role execution transactionally"
+  echo "test-db: migration 078 refused runtime-role execution transactionally"
 }
 
 apply_migrations() {
