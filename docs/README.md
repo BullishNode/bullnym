@@ -21,6 +21,7 @@ in the [archive](../archive/README.md).
 - [Payment lifecycle](architecture/payment-lifecycle.md)
 - [Data and workers](architecture/data-and-workers.md)
 - [Identity and authentication](architecture/identity-and-auth.md)
+- [One seed: identity, product wallets, and the fallback destination](architecture/one-seed-identity-and-fallback.md)
 - [Abuse controls and readiness](architecture/abuse-and-readiness.md)
 - [PWA runtime](architecture/pwa.md)
 
