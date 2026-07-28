@@ -463,6 +463,24 @@ pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Return whether another invocation has already crossed the durable claim
+/// preparation boundary and still owns its broadcast lease. Callers hold the
+/// per-swap advisory lock and this query row-locks the swap, so a webhook
+/// cannot race the decision by rewriting `claiming` to another claimable
+/// provider status between the check and the rest of preparation.
+pub async fn reverse_claim_broadcast_lease_active<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT status = 'claiming' AND next_claim_attempt_at > NOW() \
+         FROM swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Forward-only status update. Refuses to write through a row whose
 /// status is already in a terminal state (claimed, expired, claim_stuck,
 /// MRH-direct, lockup_refunded). Closes the race where, e.g., a `transaction.failed`

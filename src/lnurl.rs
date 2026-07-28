@@ -250,6 +250,26 @@ enum FiatOnlyLnurlDecision {
     BitcoinFallback,
 }
 
+fn settlement_error_class(error: SettlementServiceError) -> &'static str {
+    match error {
+        SettlementServiceError::SourceIdentityUnavailable => "source_identity_unavailable",
+        SettlementServiceError::CredentialUnavailable => "credential_unavailable",
+        SettlementServiceError::RequestKeyConflict => "request_key_conflict",
+        SettlementServiceError::ProviderCreateAmbiguous => "provider_create_ambiguous",
+        SettlementServiceError::StoredState => "stored_state",
+        SettlementServiceError::Database => "database",
+    }
+}
+
+fn private_settlement_unavailable(event: &'static str, error_class: &'static str) -> AppError {
+    tracing::warn!(
+        event,
+        error_class,
+        "private settlement operation made this LNURL instruction temporarily unavailable"
+    );
+    AppError::MoneyAdmissionUnavailable
+}
+
 async fn fiat_only_lnurl_instruction(
     state: &AppState,
     user: &db::User,
@@ -259,9 +279,9 @@ async fn fiat_only_lnurl_instruction(
     amount_sat: u64,
 ) -> Result<FiatOnlyLnurlDecision, AppError> {
     let amount_sat = i64::try_from(amount_sat)
-        .map_err(|_| AppError::InvalidAmount("amount exceeds settlement range".into()))?;
+        .map_err(|_| AppError::InvalidAmount("amount exceeds supported range".into()))?;
     let bitcoin_amount = BitcoinAmountSat::new(amount_sat)
-        .map_err(|_| AppError::InvalidAmount("invalid fiat-settlement amount".into()))?;
+        .map_err(|_| AppError::InvalidAmount("amount must be positive".into()))?;
     let request_key = format!(
         "lnurl:{}:{}:{}",
         intent_key.as_str(),
@@ -279,9 +299,10 @@ async fn fiat_only_lnurl_instruction(
     )
     .await
     .map_err(|error| {
-        AppError::ServiceUnavailable(format!(
-            "fiat settlement replay is temporarily unavailable: {error}"
-        ))
+        private_settlement_unavailable(
+            "lnurl_private_settlement_replay_failed",
+            settlement_error_class(error),
+        )
     })?;
     if let Some(outcome) = replay {
         return Ok(match outcome {
@@ -298,12 +319,17 @@ async fn fiat_only_lnurl_instruction(
         return Ok(FiatOnlyLnurlDecision::NotApplicable);
     };
     if setting.owner_npub != user.npub {
-        return Err(AppError::DbError(
-            "Lightning Address fiat setting identity is invalid".into(),
+        return Err(private_settlement_unavailable(
+            "lnurl_private_settlement_identity_invalid",
+            "identity_mismatch",
         ));
     }
-    let currency = FiatCurrency::from_str(&setting.fiat_currency)
-        .map_err(|_| AppError::DbError("invalid Lightning Address fiat currency".into()))?;
+    let currency = FiatCurrency::from_str(&setting.fiat_currency).map_err(|_| {
+        private_settlement_unavailable(
+            "lnurl_private_settlement_currency_invalid",
+            "currency_invalid",
+        )
+    })?;
     let request = FiatOnlyInstructionRequest {
         owner_npub: &user.npub,
         invoice_id: None,
@@ -325,14 +351,10 @@ async fn fiat_only_lnurl_instruction(
             SettlementServiceError::SourceIdentityUnavailable
             | SettlementServiceError::CredentialUnavailable,
         ) => Ok(FiatOnlyLnurlDecision::BitcoinFallback),
-        Err(SettlementServiceError::ProviderCreateAmbiguous) => {
-            // Public LNURL callers must not learn that the recipient uses a
-            // settlement provider or that an operator reconciliation exists.
-            Err(AppError::MoneyAdmissionUnavailable)
-        }
-        Err(error) => Err(AppError::ServiceUnavailable(format!(
-            "fiat settlement is temporarily unavailable: {error}"
-        ))),
+        Err(error) => Err(private_settlement_unavailable(
+            "lnurl_private_settlement_create_failed",
+            settlement_error_class(error),
+        )),
     }
 }
 
@@ -643,8 +665,9 @@ async fn serve_liquid(
                 confidential_address,
             } = instruction
             else {
-                return Err(LiquidOutcome::Hard(AppError::DbError(
-                    "Bull Bitcoin returned the wrong Lightning Address rail".into(),
+                return Err(LiquidOutcome::Hard(private_settlement_unavailable(
+                    "lnurl_private_settlement_instruction_invalid",
+                    "wrong_rail",
                 )));
             };
             let response = serde_json::json!({
@@ -656,9 +679,9 @@ async fn serve_liquid(
         FiatOnlyLnurlDecision::BitcoinFallback => {}
         FiatOnlyLnurlDecision::NotApplicable => {
             if setting_is_mixed(fiat_setting) {
-                return Err(LiquidOutcome::Hard(AppError::InvalidAmount(
-                    "L-BTC is unavailable when this Lightning Address uses mixed Bitcoin/fiat settlement"
-                        .into(),
+                return Err(LiquidOutcome::Hard(private_settlement_unavailable(
+                    "lnurl_private_settlement_rail_unavailable",
+                    "rail_policy",
                 )));
             }
         }
@@ -702,8 +725,9 @@ async fn serve_lightning(
     {
         FiatOnlyLnurlDecision::BullBitcoin(instruction) => {
             let PayerInstruction::Lightning { bolt11 } = instruction else {
-                return Err(AppError::DbError(
-                    "Bull Bitcoin returned the wrong Lightning Address rail".into(),
+                return Err(private_settlement_unavailable(
+                    "lnurl_private_settlement_instruction_invalid",
+                    "wrong_rail",
                 ));
             };
             return Ok(Json(lightning_response(nym, &state.config.domain, bolt11)).into_response());
@@ -895,10 +919,11 @@ async fn create_lightning_swap(
             fiat_setting,
         )
         .await
-        .map_err(|error| {
-            AppError::ServiceUnavailable(format!(
-                "Lightning Address settlement setting changed; refresh and retry: {error}"
-            ))
+        .map_err(|_| {
+            private_settlement_unavailable(
+                "lnurl_private_settlement_policy_capture_failed",
+                "policy_changed",
+            )
         })?
     } else {
         // A dormant saved setting is intentionally ignored while rollout is
@@ -906,8 +931,9 @@ async fn create_lightning_swap(
         false
     };
     if captured != setting_uses_swap_fiat(fiat_setting) {
-        return Err(AppError::DbError(
-            "Lightning Address fiat policy capture mismatch".into(),
+        return Err(private_settlement_unavailable(
+            "lnurl_private_settlement_policy_capture_mismatch",
+            "policy_capture_mismatch",
         ));
     }
     if let Some(binding) = comment_binding {

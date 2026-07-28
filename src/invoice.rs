@@ -5223,6 +5223,21 @@ async fn create_invoice_inner(
             .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
     }
 
+    // A direct address is an accounting identity, not merely a destination.
+    // Refuse pre-existing chain history before publishing the invoice so old
+    // wallet activity can never be imported as payment for a new request.
+    state
+        .invoice_address_admission
+        .assert_fresh(
+            canonical_bitcoin_address
+                .as_deref()
+                .filter(|_| req.accept_btc),
+            canonical_liquid_address
+                .as_deref()
+                .filter(|_| req.accept_liquid),
+        )
+        .await?;
+
     let new_invoice = db::NewInvoice {
         nym_owner: linked_nym.as_deref(),
         public_slug: None,

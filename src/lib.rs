@@ -1,3 +1,4 @@
+pub mod address_admission;
 pub mod admission;
 pub mod auth;
 pub mod bitcoin_fee_adapter;
@@ -94,6 +95,7 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub config: Arc<config::Config>,
     pub admission: admission::MoneyAdmission,
+    pub invoice_address_admission: Arc<dyn address_admission::InvoiceAddressAdmission>,
     pub boltz: Arc<boltz::BoltzService>,
     /// Narrow scoped capability: create sell-to-balance and read only the
     /// exact orders created by that same key.

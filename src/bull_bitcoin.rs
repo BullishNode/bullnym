@@ -486,6 +486,17 @@ pub trait BullBitcoinApi: Send + Sync {
         request: &CreateSellRequest,
     ) -> Result<CreatedSellOrder, BullBitcoinError>;
 
+    /// Recover one response-lost create through the provider's scoped,
+    /// immutable client request identity. Implementations that predate the
+    /// correlation endpoint fail closed as unavailable rather than guessing.
+    async fn recover_created_sell_to_balance_by_request_id(
+        &self,
+        _key: &ScopedApiKey,
+        _request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        Err(BullBitcoinError::Upstream)
+    }
+
     async fn get_created_order(
         &self,
         key: &ScopedApiKey,
