@@ -1,6 +1,8 @@
 # 001 Product and Feature Boundaries
 
 - Status: Accepted
+- Amended: 2026-07-28 — mobile boundary map updated to the shipping feature
+  layout (#274)
 - Scope: Cross-repository; verify mobile paths against `bullbitcoin-mobile`
 
 ## Decision
@@ -8,26 +10,29 @@
 Bullnym is the server-side payment and identity service. Bull Bitcoin Mobile
 owns the wallet UX, local wallet creation, seed recovery, and product screens.
 Get Paid is the mobile product shell that coordinates Lightning Address,
-Payment Page, Invoices, and BTCPay without absorbing their implementation
+Payment Page, POS, Invoices, and BTCPay without absorbing their implementation
 boundaries.
 
-Mobile feature boundaries:
+Mobile feature boundaries (all top-level under `lib/features/`):
 
 - `features/bullnym` owns the Bullnym HTTP client, DTOs, signing helpers,
   constants, and transport errors.
-- `features/get_paid` owns the dashboard shell, Get Paid settings, and routing
-  into Get Paid sub-features.
+- `features/get_paid` owns the dashboard shell and routing into Get Paid
+  products; `features/get_paid_settings` owns the Get Paid settings screens.
 - `features/lightning_address` owns Lightning Address product state and NIP-05
   profile behavior.
-- `features/get_paid/payment_page` owns the payment-page editor and
-  page-management use cases.
-- `features/get_paid/invoices` owns invoice list/create/detail routes.
-- `features/get_paid/btcpay` owns SamRock URL parsing, local wallet
-  preparation, and server pairing state.
-- `features/external_receive_wallets` owns shared external receive wallet
-  lifecycle primitives.
-- `features/wallet_manifest` owns neutral deterministic wallet recovery and
-  encrypted manifest publish/fetch.
+- `features/payment_page` owns the payment-page editor and page-management
+  use cases.
+- `features/invoices` owns invoice list/create/detail routes.
+- `features/pos` owns POS product state and its reserved wallet preparation.
+- `features/btcpay` owns SamRock URL parsing, local wallet preparation, and
+  server pairing state; its entry point is Bitcoin Settings.
+- `features/deterministic_wallets` owns shared BIP85 child-wallet
+  materialization primitives; `features/bip85_registry` owns reserved
+  derivation-path policy.
+- `features/keychain_manifest`, `features/keychain_recovery`, and
+  `features/wallet_backup` own deterministic wallet-inventory recovery and
+  encrypted backup publish/fetch (see ADR 003).
 - `features/nostr_identity` owns Bull's reserved Nostr role mapping.
 
 Server boundaries:
@@ -54,10 +59,11 @@ does not import product flows.
 ## Consequences
 
 - Product screens must not duplicate Bullnym wire logic.
-- Wallet manifest restore must not call `external_receive_wallets`, because
-  that would create a feature cycle.
+- Keychain-manifest restore must not import product features; wallet creation
+  flows through `deterministic_wallets`, so restore cannot create a feature
+  cycle.
 - Get Paid can orchestrate dashboard state and settings, but feature-specific
   server pairing, page editing, invoice state, and Lightning Address actions
-  stay in their owning sub-features.
+  stay in their owning features.
 - Architecture docs should describe current component contracts, not testing
   history.
