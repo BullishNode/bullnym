@@ -1485,6 +1485,14 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
                    AND table_name = 'bull_bitcoin_settlements' \
+                   AND column_name = 'provider_payment_first_observed_at' \
+                   AND data_type = 'timestamp with time zone' \
+                   AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
                    AND column_name = 'quote_payment_first_observed_at' \
                    AND data_type = 'timestamp with time zone' \
                    AND is_nullable = 'YES' \
@@ -1689,7 +1697,11 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND array_to_string(function_info.proconfig, ',') LIKE \
                            '%search_path=pg_catalog, public%' \
                    AND POSITION( \
-                       'new.quote_payment_first_observed_at := clock_timestamp()' \
+                       'new.provider_payment_first_observed_at' \
+                       IN LOWER(pg_get_functiondef(function_info.oid)) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'delayed delivery without payment-time evidence' \
                        IN LOWER(pg_get_functiondef(function_info.oid)) \
                    ) > 0 \
                    AND POSITION( \

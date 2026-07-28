@@ -69,6 +69,7 @@ pub struct StoredBullBitcoinSettlement {
     pub retention_until_unix: Option<i64>,
     pub reconcile_attempts: i32,
     pub actual_received_sat: Option<i64>,
+    pub provider_payment_first_observed_at_unix_micros: Option<i64>,
     pub quote_payment_first_observed_at_unix_micros: Option<i64>,
     pub credited_fiat_minor: Option<i64>,
     pub quoted_fiat_minor: Option<i64>,
@@ -224,6 +225,8 @@ const SETTLEMENT_PROJECTION: &str =
      extract(epoch FROM funding_committed_at)::BIGINT AS funding_committed_at_unix, \
      extract(epoch FROM retention_until)::BIGINT AS retention_until_unix, reconcile_attempts, \
      actual_received_sat, \
+     (EXTRACT(EPOCH FROM provider_payment_first_observed_at) * 1000000)::BIGINT \
+         AS provider_payment_first_observed_at_unix_micros, \
      (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
          AS quote_payment_first_observed_at_unix_micros, \
      credited_fiat_minor, quoted_fiat_minor, \
@@ -1269,6 +1272,10 @@ pub async fn record_bull_bitcoin_observation(
         "UPDATE bull_bitcoin_settlements \
             SET order_status = $2, payin_status = $3, payout_status = $4, \
                 actual_received_sat = COALESCE($5, actual_received_sat), \
+                provider_payment_first_observed_at = CASE \
+                    WHEN actual_received_sat IS NULL AND $5 IS NOT NULL \
+                    THEN to_timestamp($13::NUMERIC / 1000000) \
+                    ELSE provider_payment_first_observed_at END, \
                 credited_fiat_minor = CASE WHEN $8 THEN NULL ELSE $6 END, \
                 quoted_fiat_minor = COALESCE($10, quoted_fiat_minor), \
                 execution_rate_minor_per_btc = COALESCE( \
@@ -1346,6 +1353,7 @@ pub async fn record_bull_bitcoin_observation(
             .map(|amount| amount.as_minor()),
     )
     .bind(late_watch_poll_secs)
+    .bind(observation.payin_first_observed_at_unix_micros)
     .fetch_optional(&mut *transaction)
     .await?;
     if let (

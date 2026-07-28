@@ -368,6 +368,24 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         None if payment_observed => Some(parse_bitcoin_field(order, "payinAmount")?.as_sat()),
         None => None,
     };
+    let payin_first_observed_at_unix_micros = order
+        .get("payinFirstObservedAt")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let raw = value.as_str().ok_or(BullBitcoinError::MalformedResponse)?;
+            let parsed = DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| BullBitcoinError::MalformedResponse)?
+                .with_timezone(&chrono::Utc);
+            let micros = parsed.timestamp_micros();
+            if micros <= 0 || parsed > chrono::Utc::now() + chrono::Duration::seconds(30) {
+                return Err(BullBitcoinError::Integrity);
+            }
+            Ok(micros)
+        })
+        .transpose()?;
+    if payin_first_observed_at_unix_micros.is_some() && actual_received_sat.is_none() {
+        return Err(BullBitcoinError::Integrity);
+    }
     let provider_terminal =
         is_terminal_provider_outcome(&order_status, &payin_status, &payout_status);
     // The locked fiat quote is present at any payout status, including a
@@ -392,6 +410,7 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         payin_status,
         payout_status,
         actual_received_sat,
+        payin_first_observed_at_unix_micros,
         credited_fiat_minor,
         quoted_fiat_minor,
         execution_rate_minor_per_btc,
@@ -1014,12 +1033,17 @@ mod tests {
                 "requestedAmount": 0.001,
                 "receivedAmount": 0.00100001
             },
+            "payinFirstObservedAt": "2026-07-28T20:17:03.250Z",
             "payoutAmount": 61.23,
             "exchangeRateAmount": 61230.45,
             "exchangeRateCurrency": "EUR"
         }))
         .unwrap();
         assert_eq!(observation.actual_received_sat, Some(100_001));
+        assert_eq!(
+            observation.payin_first_observed_at_unix_micros,
+            Some(1_785_269_823_250_000)
+        );
         assert_eq!(observation.credited_fiat_minor.unwrap().as_minor(), 6_123);
         assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 6_123);
         assert_eq!(
@@ -1123,6 +1147,33 @@ mod tests {
         assert_eq!(observation.quoted_fiat_minor, None);
         assert_eq!(observation.credited_fiat_minor, None);
         assert_eq!(observation.execution_rate_minor_per_btc, None);
+        assert_eq!(observation.payin_first_observed_at_unix_micros, None);
+    }
+
+    #[test]
+    fn observation_rejects_malformed_or_unfunded_payment_time() {
+        let base = serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payoutCurrency": "CAD",
+            "orderStatus": "In progress",
+            "payinStatus": "Awaiting payment",
+            "payoutStatus": "Not started",
+            "payinAmount": 0.001,
+        });
+
+        let mut malformed = base.clone();
+        malformed["payinFirstObservedAt"] = serde_json::json!("July 28, 2026");
+        assert_eq!(
+            parse_order_observation(&malformed),
+            Err(BullBitcoinError::MalformedResponse)
+        );
+
+        let mut no_payment_evidence = base;
+        no_payment_evidence["payinFirstObservedAt"] = serde_json::json!("2026-07-28T20:17:03.250Z");
+        assert_eq!(
+            parse_order_observation(&no_payment_evidence),
+            Err(BullBitcoinError::Integrity)
+        );
     }
 
     #[test]

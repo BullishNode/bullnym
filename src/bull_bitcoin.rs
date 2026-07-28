@@ -454,6 +454,9 @@ pub struct OrderObservation {
     pub payin_status: String,
     pub payout_status: String,
     pub actual_received_sat: Option<i64>,
+    /// Earliest authoritative pay-in observation reported by the provider's
+    /// chain watcher. This is payment-time evidence, not API delivery time.
+    pub payin_first_observed_at_unix_micros: Option<i64>,
     pub credited_fiat_minor: Option<FiatAmountMinor>,
     /// The locked fiat quote (payoutAmount) observed for this order at any
     /// payout status. Distinct from `credited_fiat_minor`, which is only the
