@@ -4693,10 +4693,10 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
     // Record a second authenticated NotFound while the elapsed threshold is
     // still open; the count is retained but admission remains pending.
     sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
-    .bind(settlement_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+        .bind(settlement_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
         .await
         .unwrap();
@@ -4720,10 +4720,10 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
                 next_attempt_at = now() \
           WHERE id = $1",
     )
-        .bind(settlement_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    .bind(settlement_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
         .await
         .unwrap();
