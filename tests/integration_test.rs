@@ -38497,6 +38497,10 @@ async fn versioned_fiat_bitcoin_quote_uses_permanent_page_owner_while_lnurl_is_o
         ..Default::default()
     };
     state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    state
+        .boltz
+        .provider_limits()
+        .record_successful_chain_refresh(Some(issue84_chain_pair()), Instant::now());
     state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     let app = test_app(state);
 
