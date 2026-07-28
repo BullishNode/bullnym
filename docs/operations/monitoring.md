@@ -41,6 +41,21 @@ funded swaps whose recovery schedule does not advance, or disagreement between
 chain evidence and recorded terminal state. Alert on sustained webhook loss,
 settlement repair failures, and growing watcher backlogs.
 
+## Targeted Liquid status refreshes
+
+Invoice-status polling uses a bounded, invoice-keyed Liquid wake queue. It is a
+latency optimization only; the scheduled recent and historical lanes remain the
+completeness and recovery mechanism.
+
+Track `liquid_watcher_targeted_wakeup_completed` separately from background
+lane turns. Its stable fields include `outcome`, `latency_ms`, `request_count`,
+`coalesced_requests`, `queue_depth_after_dequeue`, `queue_depth`, and
+`outstanding`. The paired `invoice_status_direct_watcher_wakeup` event reports
+`liquid_wait_timed_out`, `liquid_backpressured`, and whether that request was
+coalesced. Alert on sustained backpressure, rising queue depth, or targeted
+latency above the two-second status wait; do not interpret wake completion as
+payment evidence. Payment authority remains the refreshed database projection.
+
 Logs and metrics contain sensitive payment linkage. Restrict access, define a
 retention period, and avoid exporting raw descriptors, private keys, transaction
 hex, signatures, or bearer invoice URLs to third-party telemetry.

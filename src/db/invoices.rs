@@ -1963,6 +1963,20 @@ pub(crate) const LIQUID_WATCHER_LANE_PAGE_SQL: &str = "WITH targets AS ( \
      ORDER BY created_at ASC, id ASC \
      LIMIT $8";
 
+/// Exact invoice lookup for payer-triggered Liquid refreshes. It deliberately
+/// reuses the background watcher's eligibility predicate while omitting lane
+/// membership and cursor state: status polling may prioritize one already
+/// valid obligation, but it cannot create a new watch obligation.
+pub(crate) const LIQUID_WATCHER_TARGET_SQL: &str = "SELECT invoices.id, \
+              invoices.id AS invoice_id, liquid_address, \
+              GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
+              liquid_blinding_key_hex, fiat_currency, \
+              created_at::TEXT AS created_at_cursor \
+         FROM invoices \
+        WHERE {eligible} \
+          AND invoices.id = $3::uuid \
+        LIMIT 1";
+
 pub(crate) const LIQUID_WATCHER_LANE_LAG_SQL: &str = "WITH targets AS ( \
        SELECT invoices.id, created_at, presentation_status, direct_settlement_status \
          FROM invoices WHERE {eligible} \
@@ -2094,6 +2108,24 @@ fn liquid_watcher_lane_sql(template: &str, recent: bool) -> String {
     template
         .replace("{eligible}", LIQUID_WATCHER_ELIGIBLE_PREDICATE_SQL)
         .replace("{lane_predicate}", &lane_predicate)
+}
+
+fn liquid_watcher_target_sql() -> String {
+    LIQUID_WATCHER_TARGET_SQL.replace("{eligible}", LIQUID_WATCHER_ELIGIBLE_PREDICATE_SQL)
+}
+
+pub async fn liquid_watcher_invoice_target(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+    invoice_id: Uuid,
+) -> Result<Option<LiquidWatcherInvoicePageRow>, sqlx::Error> {
+    let snapshot = watcher_scan_snapshot(pool).await?;
+    sqlx::query_as::<_, LiquidWatcherInvoicePageRow>(&liquid_watcher_target_sql())
+        .bind(payment_grace_secs as i64)
+        .bind(snapshot)
+        .bind(invoice_id)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn list_liquid_watcher_invoice_lane_page(
@@ -4138,11 +4170,11 @@ pub async fn latest_lightning_pr_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
 #[cfg(test)]
 mod status_tests {
     use super::{
-        invoice_payment_tolerance_sat, liquid_watcher_lane_sql,
+        invoice_payment_tolerance_sat, liquid_watcher_lane_sql, liquid_watcher_target_sql,
         resolve_invoice_presentation_status, resolve_invoice_status, truncate_to_watcher_batch,
         InvoiceAccountingTolerances, WatcherScanCursor, WatcherScanEpoch,
         LIQUID_WATCHER_BATCH_SIZE, LIQUID_WATCHER_LANE_LAG_SQL, LIQUID_WATCHER_LANE_PAGE_SQL,
-        LIQUID_WATCHER_PAGE_SQL, LIQUID_WATCHER_RECENT_PREDICATE_SQL,
+        LIQUID_WATCHER_PAGE_SQL, LIQUID_WATCHER_RECENT_PREDICATE_SQL, LIQUID_WATCHER_TARGET_SQL,
     };
     use uuid::Uuid;
 
@@ -4254,6 +4286,17 @@ mod status_tests {
             assert!(!sql.contains("{eligible}"));
             assert!(!sql.contains("{lane_predicate}"));
         }
+    }
+
+    #[test]
+    fn targeted_liquid_lookup_reuses_eligibility_and_selects_one_exact_invoice() {
+        let sql = liquid_watcher_target_sql();
+        assert!(sql.contains("invoices.id = $3::uuid"));
+        assert!(sql.contains("expires_at + ($1 || ' seconds')::interval > $2::timestamptz"));
+        assert!(sql.contains("direct_observation.source = 'liquid_direct'"));
+        assert!(!sql.contains("{eligible}"));
+        assert!(!sql.contains(LIQUID_WATCHER_RECENT_PREDICATE_SQL));
+        assert!(LIQUID_WATCHER_TARGET_SQL.contains("LIMIT 1"));
     }
 
     #[test]
