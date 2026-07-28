@@ -432,10 +432,10 @@ impl IntoResponse for AppError {
             AppError::BullBitcoinCredentialInvalid => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
             AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
-                "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
+                "This Bitcoin address is already assigned or has transaction history. Generate a fresh receive address and try again.".into()
             }
             AppError::LiquidAddressAlreadyUsed => {
-                "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
+                "This Liquid address is already assigned or has transaction history. Generate a fresh receive address and try again.".into()
             }
             AppError::InvoiceCreateConflict => {
                 "This invoice creation identifier was already used for different invoice data.".into()

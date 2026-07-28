@@ -166,6 +166,27 @@ fn creation_amount_errors_keep_existing_lnurl_contract() {
 }
 
 #[test]
+fn every_private_settlement_failure_maps_to_one_public_lnurl_error() {
+    let cases = [
+        SettlementServiceError::SourceIdentityUnavailable,
+        SettlementServiceError::CredentialUnavailable,
+        SettlementServiceError::RequestKeyConflict,
+        SettlementServiceError::ProviderCreateAmbiguous,
+        SettlementServiceError::StoredState,
+        SettlementServiceError::Database,
+    ];
+    for error in cases {
+        let class = settlement_error_class(error);
+        let public = private_settlement_unavailable("test_private_settlement_failure", class);
+        assert!(matches!(public, AppError::MoneyAdmissionUnavailable));
+        assert_eq!(public.code(), "ServiceUnavailable");
+        assert!(!class.contains("fiat"));
+        assert!(!class.contains("bull"));
+        assert!(!class.contains("provider_order"));
+    }
+}
+
+#[test]
 fn liquid_response_addr_index_uses_current_cursor_without_reservation() {
     assert_eq!(liquid_response_addr_index(7, None).unwrap(), 7);
 }

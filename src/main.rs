@@ -638,10 +638,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let direct_watcher_wakeups = Arc::new(watcher_wakeup::DirectWatcherWakeups::default());
+    let invoice_address_admission = Arc::new(
+        pay_service::address_admission::ChainInvoiceAddressAdmission::new(
+            config.bitcoin_watcher.clone(),
+            utxo_backend.clone(),
+        ),
+    );
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
         admission,
+        invoice_address_admission,
         boltz: boltz.clone(),
         bull_bitcoin,
         ip_whitelist: whitelist.clone(),

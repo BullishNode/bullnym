@@ -39,10 +39,80 @@ use uuid::Uuid;
 use crate::admission::WorkerReporter;
 use crate::config::BitcoinWatcherConfig;
 use crate::db;
+use crate::error::AppError;
 use crate::rate_limit::TokenBucket;
 use crate::watcher_schedule::{wait_for_epoch_resume, EpochResumeSchedule, WatcherTurn};
 
 type InvoiceForBtcPoll = db::BitcoinWatcherInvoicePageRow;
+
+const ADDRESS_ADMISSION_MAX_RESPONSE_BYTES: usize = 1_048_576;
+const ADDRESS_ADMISSION_AUTHORITIES_REQUIRED: usize = 2;
+
+/// Refuse a client-supplied Bitcoin address unless two independent Esplora
+/// authorities agree that it has no transaction history. Database uniqueness
+/// only prevents reuse inside Bullnym; without this chain-history admission
+/// check an old wallet address can make a brand-new invoice appear paid.
+pub async fn assert_fresh_invoice_address(
+    config: &BitcoinWatcherConfig,
+    address: &str,
+) -> Result<(), AppError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(config.request_timeout_ms))
+        .build()
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    let mut empty_authorities = 0usize;
+
+    for (authority_index, endpoint) in config.effective_endpoints().into_iter().enumerate() {
+        let url = format!("{}/address/{address}/txs", endpoint.trim_end_matches('/'));
+        let result: Result<bool, &'static str> = async {
+            let mut response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|_| "request_failed")?
+                .error_for_status()
+                .map_err(|_| "http_status")?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > ADDRESS_ADMISSION_MAX_RESPONSE_BYTES as u64)
+            {
+                return Err("response_too_large");
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| "body_read_failed")? {
+                if bytes.len().saturating_add(chunk.len()) > ADDRESS_ADMISSION_MAX_RESPONSE_BYTES {
+                    return Err("response_too_large");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid_json")?;
+            value
+                .as_array()
+                .map(|entries| entries.is_empty())
+                .ok_or("unexpected_shape")
+        }
+        .await;
+
+        match result {
+            Ok(false) => return Err(AppError::BitcoinAddressAlreadyUsed),
+            Ok(true) => {
+                empty_authorities += 1;
+                if empty_authorities >= ADDRESS_ADMISSION_AUTHORITIES_REQUIRED {
+                    return Ok(());
+                }
+            }
+            Err(error) => tracing::warn!(
+                event = "bitcoin_address_admission_authority_failed",
+                authority_index,
+                error,
+                "Bitcoin address history authority was unavailable"
+            ),
+        }
+    }
+
+    Err(AppError::MoneyAdmissionUnavailable)
+}
 
 /// Minimal subset of the mempool.space `/address/<addr>/txs` response
 /// shape. Fields outside this subset are ignored.
@@ -2129,6 +2199,58 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_address_history(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn fresh_invoice_address_requires_two_empty_authorities() {
+        let (first, first_task) = spawn_address_history("[]").await;
+        let (second, second_task) = spawn_address_history("[]").await;
+        let config = BitcoinWatcherConfig {
+            endpoint: first,
+            endpoints: vec![second],
+            request_timeout_ms: 1_000,
+            ..BitcoinWatcherConfig::default()
+        };
+
+        assert_fresh_invoice_address(&config, "bc1qtest")
+            .await
+            .unwrap();
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn any_observed_history_rejects_invoice_address() {
+        let (endpoint, task) = spawn_address_history(r#"[{"txid":"already-used"}]"#).await;
+        let config = BitcoinWatcherConfig {
+            endpoint,
+            request_timeout_ms: 1_000,
+            ..BitcoinWatcherConfig::default()
+        };
+
+        let error = assert_fresh_invoice_address(&config, "bc1qtest")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::BitcoinAddressAlreadyUsed));
+        task.abort();
+    }
 
     fn admission_fixture() -> (MoneyAdmission, WorkerReporter, TierHealth) {
         let admission = MoneyAdmission::healthy_test_fixture();

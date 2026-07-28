@@ -378,6 +378,9 @@ fn test_state_with_provider_limits(
         db: pool,
         config: Arc::new(config),
         admission: pay_service::admission::MoneyAdmission::healthy_test_fixture(),
+        invoice_address_admission: Arc::new(
+            pay_service::address_admission::AllowFreshInvoiceAddresses,
+        ),
         boltz,
         bull_bitcoin,
         ip_whitelist: Arc::new(IpWhitelist::default()),
@@ -487,6 +490,19 @@ impl BullBitcoinApi for ScriptedBullBitcoinApi {
         &self,
         _key: &ScopedApiKey,
         _order_id: Uuid,
+        _request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        self.recovery_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Err(BullBitcoinError::Upstream))
+    }
+
+    async fn recover_created_sell_to_balance_by_request_id(
+        &self,
+        _key: &ScopedApiKey,
         _request: &CreateSellRequest,
     ) -> Result<CreatedSellOrder, BullBitcoinError> {
         self.recovery_calls.fetch_add(1, Ordering::SeqCst);
@@ -3284,6 +3300,92 @@ async fn bull_bitcoin_invalid_create_with_order_id_recovers_without_redispatch()
             "provider_response".into(),
         )
     );
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bull_bitcoin_response_lost_create_recovers_by_request_id_without_redispatch() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Err(BullBitcoinError::Timeout)).await;
+    let order_id = Uuid::new_v4();
+    fake.push_recovery(Ok(scripted_created_order(order_id)))
+        .await;
+    let (mut state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-request-correlation").await;
+    let mut config = (*state.config).clone();
+    config.bull_bitcoin.request_timeout_ms = 0;
+    state.config = Arc::new(config);
+    let request = fiat_only_test_request(
+        &owner_npub,
+        credential_id,
+        "payer-intent-request-correlation",
+    );
+
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap_err(),
+        SettlementServiceError::ProviderCreateAmbiguous
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+
+    let recovered = sqlx::query_as::<_, (String, String, Uuid)>(
+        "SELECT provider_state, funding_route, bull_bitcoin_order_id \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&owner_npub)
+    .bind("payer-intent-request-correlation")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recovered, ("bound".into(), "bull_bitcoin".into(), order_id));
+    assert_eq!(fake.create_call_count(), 1);
+    assert_eq!(fake.recovery_call_count(), 1);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn provider_request_id_not_found_keeps_ambiguous_dispatch_fail_closed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_create(Err(BullBitcoinError::Timeout)).await;
+    fake.push_recovery(Err(BullBitcoinError::NotFound)).await;
+    let (mut state, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake.clone(), "fiat-request-absent").await;
+    let mut config = (*state.config).clone();
+    config.bull_bitcoin.request_timeout_ms = 0;
+    state.config = Arc::new(config);
+    let request = fiat_only_test_request(&owner_npub, credential_id, "payer-intent-request-absent");
+
+    assert_eq!(
+        pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request)
+            .await
+            .unwrap_err(),
+        SettlementServiceError::ProviderCreateAmbiguous
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+        .await
+        .unwrap();
+
+    let retained = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT provider_state, funding_route, fallback_category \
+           FROM bull_bitcoin_settlements WHERE owner_npub = $1 AND request_key = $2",
+    )
+    .bind(&owner_npub)
+    .bind("payer-intent-request-absent")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, ("dispatch_started".into(), None, None));
+    assert_eq!(fake.create_call_count(), 1);
+    assert_eq!(fake.recovery_call_count(), 1);
     cleanup_db(&pool).await;
 }
 
@@ -11896,6 +11998,49 @@ async fn concurrent_same_reverse_swap_has_one_locked_preparation() {
     assert_eq!(swap.claim_attempts, 1);
 
     drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn active_reverse_broadcast_lease_coalesces_duplicate_webhook_claims() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reverseleaseactive").await;
+    let swap_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reverseleaseactive",
+        "REVERSE_LEASE_ACTIVE",
+        "{",
+        None,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE swap_records SET status = 'claiming', \
+             next_claim_attempt_at = NOW() + INTERVAL '2 minutes' \
+         WHERE id = $1",
+    )
+    .bind(swap_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let outcome = claimer::exercise_reverse_claim_with_malformed_response(
+        &admin,
+        swap_id,
+        &accepted_live_liquid_fee_decision(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, claimer::ClaimOutcome::SkippedLockHeld));
+    let swap = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_LEASE_ACTIVE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "claiming");
+    assert_eq!(swap.claim_attempts, 0);
+    assert!(swap.claim_tx_hex.is_none());
+    assert!(swap.address.is_none());
+
     cleanup_db(&admin).await;
 }
 

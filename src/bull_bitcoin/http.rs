@@ -181,6 +181,22 @@ impl BullBitcoinApi for HttpBullBitcoinApi {
         Ok(recovered)
     }
 
+    async fn recover_created_sell_to_balance_by_request_id(
+        &self,
+        key: &ScopedApiKey,
+        request: &CreateSellRequest,
+    ) -> Result<CreatedSellOrder, BullBitcoinError> {
+        let body = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"getSellToFiatBalanceOrderByRequestId\",\"params\":{{\"clientRequestId\":\"{}\"}}}}",
+            request.request_id
+        );
+        let result = self
+            .post_rpc(key, body, "bullnym", None, RpcCallKind::ReadOrder)
+            .await?;
+        let order = result.get("element").unwrap_or(&result);
+        parse_created_order(order, request, false)
+    }
+
     async fn get_created_order(
         &self,
         key: &ScopedApiKey,
@@ -702,6 +718,31 @@ mod tests {
         assert_eq!(body["params"]["fiatCurrency"], "CAD");
         assert_eq!(body["params"]["usePayjoin"], true);
         assert!(body["params"].get("fiatAmount").is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_lost_create_is_recovered_by_scoped_request_id() {
+        let (client, capture, task) = test_client().await;
+        let request = CreateSellRequest {
+            request_id: Uuid::new_v4(),
+            currency: FiatCurrency::CAD,
+            network: BitcoinNetwork::Bitcoin,
+            bitcoin_amount: BitcoinAmountSat::new(100_000).unwrap(),
+            use_payjoin: false,
+        };
+
+        let recovered = client
+            .recover_created_sell_to_balance_by_request_id(&key(), &request)
+            .await
+            .unwrap();
+        assert_eq!(recovered.requested_bitcoin, request.bitcoin_amount);
+        let (_, body) = capture.0.lock().await.take().unwrap();
+        assert_eq!(body["method"], "getSellToFiatBalanceOrderByRequestId");
+        assert_eq!(
+            body["params"]["clientRequestId"],
+            request.request_id.to_string()
+        );
         task.abort();
     }
 

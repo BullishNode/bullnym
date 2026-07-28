@@ -3615,6 +3615,22 @@ async fn claim_swap_inner(
         return Ok(ClaimOutcome::SkippedLockHeld);
     }
 
+    match db::reverse_claim_broadcast_lease_active(&mut *tx, swap_id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+    {
+        Some(true) => {
+            tracing::debug!(
+                event = "reverse_claim_webhook_coalesced",
+                swap_id = %swap_id,
+                "claim broadcast lease is active; coalescing duplicate invocation"
+            );
+            return Ok(ClaimOutcome::SkippedLockHeld);
+        }
+        Some(false) => {}
+        None => return Err(AppError::ClaimError(format!("swap not found: {swap_id}"))),
+    }
+
     let swap = db::get_swap_by_id(&mut *tx, swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?

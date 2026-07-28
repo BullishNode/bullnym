@@ -1295,24 +1295,16 @@ async fn reconcile_once(
     let mut first_row_error = None;
     for settlement in ambiguous_dispatches {
         let settlement_id = settlement.id;
-        if settlement.bull_bitcoin_order_id.is_some() {
-            if let Err(error) = reconcile_ambiguous_dispatch(state, settlement).await {
-                if error == SettlementServiceError::Database {
-                    return Err(error);
-                }
-                tracing::error!(
-                    %settlement_id,
-                    error = %error,
-                    "Ambiguous Bull Bitcoin create reconciliation row failed closed"
-                );
-                first_row_error.get_or_insert(error);
+        if let Err(error) = reconcile_ambiguous_dispatch(state, settlement).await {
+            if error == SettlementServiceError::Database {
+                return Err(error);
             }
-        } else {
-            tracing::warn!(
-                event = "bull_bitcoin_create_correlation_required",
-                settlement_id = %settlement.id,
-                "Ambiguous Bull Bitcoin create has no provider order ID; operator correlation is required"
+            tracing::error!(
+                %settlement_id,
+                error = %error,
+                "Ambiguous Bull Bitcoin create reconciliation row failed closed"
             );
+            first_row_error.get_or_insert(error);
         }
     }
 
@@ -1365,9 +1357,7 @@ async fn reconcile_ambiguous_dispatch(
     {
         return Err(SettlementServiceError::StoredState);
     }
-    let order_id = settlement
-        .bull_bitcoin_order_id
-        .ok_or(SettlementServiceError::StoredState)?;
+    let expected_order_id = settlement.bull_bitcoin_order_id;
     let currency = FiatCurrency::from_str(&settlement.fiat_currency)
         .map_err(|_| SettlementServiceError::StoredState)?;
     let network = if matches!(settlement.purpose.as_str(), "mixed" | "provider_only") {
@@ -1410,10 +1400,20 @@ async fn reconcile_ambiguous_dispatch(
         .map_err(|_| SettlementServiceError::CredentialUnavailable)?;
     drop(connection);
 
-    let recovered = state
-        .bull_bitcoin
-        .recover_created_sell_to_balance(&scoped_key, order_id, &request)
-        .await;
+    let recovered = match expected_order_id {
+        Some(order_id) => {
+            state
+                .bull_bitcoin
+                .recover_created_sell_to_balance(&scoped_key, order_id, &request)
+                .await
+        }
+        None => {
+            state
+                .bull_bitcoin
+                .recover_created_sell_to_balance_by_request_id(&scoped_key, &request)
+                .await
+        }
+    };
     drop(scoped_key);
     let order = match recovered {
         Ok(order) => order,
@@ -1421,6 +1421,18 @@ async fn reconcile_ambiguous_dispatch(
             db::invalidate_bull_bitcoin_credential(&state.db, settlement.credential_id)
                 .await
                 .map_err(|_| SettlementServiceError::Database)?;
+            return Ok(());
+        }
+        // A read-side NotFound cannot prove that a timed-out create handler
+        // will never commit later. Keep the dispatch ambiguous and retry the
+        // immutable request correlation instead of opening a second funding
+        // route that could create two financial obligations.
+        Err(BullBitcoinError::NotFound) if expected_order_id.is_none() => {
+            tracing::warn!(
+                event = "bull_bitcoin_request_correlation_not_found",
+                settlement_id = %settlement.id,
+                "Provider request correlation has not located the ambiguous create"
+            );
             return Ok(());
         }
         Err(
@@ -1433,7 +1445,7 @@ async fn reconcile_ambiguous_dispatch(
         ) => return Ok(()),
         Err(_) => return Err(SettlementServiceError::StoredState),
     };
-    if order.order_id != order_id
+    if expected_order_id.is_some_and(|order_id| order.order_id != order_id)
         || order.currency != currency
         || order.network != network
         || order.requested_bitcoin != request.bitcoin_amount
@@ -1463,7 +1475,7 @@ async fn reconcile_ambiguous_dispatch(
     let bound = db::bind_bull_bitcoin_order(
         &mut connection,
         settlement.id,
-        order_id,
+        order.order_id,
         kind,
         instruction,
         order.expires_at_unix,
