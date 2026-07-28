@@ -46,6 +46,8 @@ fn settlement_record(
         claim_attempts: 0,
         last_claim_error: None,
         cooperative_refused: false,
+        mixed_claim_path: None,
+        mixed_claim_fee_budget_sat: None,
         creation_terms: None,
         renegotiated_server_lock_amount_sat: None,
         refund_address: Some("bitcoin-recovery".to_owned()),

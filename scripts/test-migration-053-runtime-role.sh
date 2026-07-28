@@ -315,7 +315,10 @@ for later_migration in \
   migrations/074_bull_bitcoin_execution_rate.sql \
   migrations/075_fiat_only_quote_accounting.sql \
   migrations/076_unified_wallet_backup_stream.sql \
-  migrations/077_bull_bitcoin_create_correlation.sql; do
+  migrations/077_bull_bitcoin_create_correlation.sql \
+  migrations/078_mixed_claim_fee_authority.sql \
+  migrations/079_lightning_address_provider_only.sql \
+  migrations/080_persistent_provider_order_not_found.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \

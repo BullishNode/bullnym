@@ -1199,6 +1199,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !permanent_public_name_invariants_present(pool).await?
         || !lnurl_private_comment_invariants_present(pool).await?
         || !invoice_quote_foundation_invariants_present(pool).await?
+        || !mixed_claim_fee_authority_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -1325,6 +1326,52 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
 }
 
+async fn mixed_claim_fee_authority_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT \
+            (SELECT COUNT(*) = 4 \
+               FROM information_schema.columns \
+              WHERE table_schema = 'public' \
+                AND column_name IN ('mixed_claim_path', 'mixed_claim_fee_budget_sat') \
+                AND ((table_name = 'swap_records' \
+                      AND data_type IN ('text', 'bigint')) \
+                  OR (table_name = 'chain_swap_records' \
+                      AND data_type IN ('text', 'bigint')))) \
+        AND (SELECT COUNT(*) = 2 \
+               FROM pg_constraint \
+              WHERE conname IN ( \
+                    'swap_records_mixed_claim_fee_authority_chk', \
+                    'chain_swap_records_mixed_claim_fee_authority_chk' \
+              ) \
+                AND convalidated \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_path IS NULL%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_fee_budget_sat IS NULL%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_path = ''script''%' \
+                AND pg_get_constraintdef(oid) LIKE '%mixed_claim_fee_budget_sat > 0%') \
+        AND (SELECT COUNT(*) = 2 \
+               FROM pg_trigger \
+              WHERE tgname IN ( \
+                    'swap_records_mixed_claim_fee_authority_immutable', \
+                    'chain_swap_records_mixed_claim_fee_authority_immutable' \
+              ) \
+                AND NOT tgisinternal \
+                AND pg_get_triggerdef(oid) LIKE 'CREATE TRIGGER % BEFORE UPDATE OF mixed_claim_path, mixed_claim_fee_budget_sat ON %') \
+        AND EXISTS ( \
+              SELECT 1 \
+                FROM pg_proc function \
+                JOIN pg_namespace namespace ON namespace.oid = function.pronamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND function.proname = 'enforce_mixed_claim_fee_authority_immutability' \
+                 AND pg_get_functiondef(function.oid) LIKE '%mixed claim fee authority is immutable once captured%' \
+                 AND pg_get_functiondef(function.oid) LIKE '%OLD.claim_tx_hex IS NULL%' \
+        )",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 async fn get_paid_history_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS ( \
@@ -1412,6 +1459,20 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                    AND data_type = 'bigint' \
                    AND is_nullable = 'YES' \
             ) \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'bull_bitcoin_settlements' \
+                   AND (column_name, data_type, is_nullable) IN ( \
+                       ('provider_last_read_error_class', 'text', 'YES'), \
+                       ('provider_last_read_error_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_last_success_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_not_found_first_at', 'timestamp with time zone', 'YES'), \
+                       ('provider_not_found_consecutive', 'integer', 'NO'), \
+                       ('provider_missing_since', 'timestamp with time zone', 'YES'), \
+                       ('provider_missing_last_resolved_at', 'timestamp with time zone', 'YES') \
+                   ) \
+            ) = 7 \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
@@ -1485,6 +1546,10 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_funding_commitment_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_execution_rate_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_read_error_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_not_found_streak_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_missing_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_missing_resolution_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_invoice_quote_shape_chk'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_first_observation_shape_chk'), \
@@ -1505,6 +1570,49 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                                to_regclass('public.' || required.table_name) \
                        AND constraint_info.conname = required.constraint_name \
                        AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = \
+                           to_regclass('public.swap_fiat_settlement_policies') \
+                   AND constraint_info.conname = \
+                           'swap_fiat_settlement_policies_percentage_chk' \
+                   AND constraint_info.convalidated \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%fiat_percentage >= 1%' \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%fiat_percentage <= 100%' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint constraint_info \
+                 WHERE constraint_info.conrelid = \
+                           to_regclass('public.bull_bitcoin_settlements') \
+                   AND constraint_info.conname = \
+                           'bull_bitcoin_settlements_purpose_chk' \
+                   AND constraint_info.convalidated \
+                   AND pg_get_constraintdef(constraint_info.oid) LIKE \
+                           '%provider_only%' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('guard_bull_bitcoin_swap_binding', \
+                     'NEW.purpose NOT IN (''mixed'', ''provider_only'')'), \
+                    ('guard_bull_bitcoin_claim_output_insert', \
+                     'settlement_row.purpose NOT IN (''mixed'', ''provider_only'')'), \
+                    ('guard_bull_bitcoin_funding_commitment', \
+                     'NEW.purpose IN (''mixed'', ''provider_only'')') \
+                ) required(function_name, required_fragment) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_proc function_info \
+                     WHERE function_info.pronamespace = \
+                               to_regnamespace('public') \
+                       AND function_info.proname = required.function_name \
+                       AND function_info.pronargs = 0 \
+                       AND POSITION( \
+                           required.required_fragment \
+                           IN pg_get_functiondef(function_info.oid) \
+                       ) > 0 \
                  ) \
             ) \
             AND EXISTS ( \
@@ -1612,6 +1720,22 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
             AND to_regprocedure( \
                 'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)' \
             ) IS NOT NULL \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'public' \
+                   AND tablename = 'bull_bitcoin_settlements' \
+                   AND indexname = 'bull_bitcoin_settlements_provider_missing_due_idx' \
+                   AND indexdef LIKE '%provider_missing_since IS NOT NULL%' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_proc function_info \
+                 WHERE function_info.proname = \
+                           'enforce_bull_bitcoin_settlement_update' \
+                   AND pg_get_functiondef(function_info.oid) LIKE \
+                           '%OLD.provider_missing_since IS NOT NULL%' \
+                   AND pg_get_functiondef(function_info.oid) LIKE \
+                           '%NEW.provider_missing_last_resolved_at IS NOT NULL%' \
+            ) \
             AND NOT has_function_privilege( \
                 current_user, \
                 'public.attach_ambiguous_bull_bitcoin_order(uuid,uuid,text,uuid)', \

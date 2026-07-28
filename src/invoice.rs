@@ -1755,6 +1755,37 @@ pub async fn status(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
+    let current_quote = if inv.pricing_mode == "fiat_fixed" {
+        db::current_invoice_quote(&mut *snapshot, inv.id).await?
+    } else {
+        None
+    };
+    let current_quote_amount_sat = current_quote
+        .as_ref()
+        .map(|quote| quote.merchant_amount_sat)
+        .or_else(|| (inv.pricing_mode != "fiat_fixed").then_some(remaining_sat));
+    let existing_quote_chain_offer = if let Some(quote) = current_quote.as_ref() {
+        let offer =
+            db::invoice_quote_offer_for_rail(&mut *snapshot, inv.id, quote.id, "bitcoin").await?;
+        if let Some(offer) = offer {
+            match offer.provider_offer_id.as_deref() {
+                Some(provider_offer_id) => db::payer_exposable_chain_swap_for_quote_offer(
+                    &mut *snapshot,
+                    inv.id,
+                    quote.id,
+                    offer.id,
+                    provider_offer_id,
+                )
+                .await?
+                .is_some(),
+                None => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     let sat_fixed_instructions_payable =
         sat_fixed_payment_instructions_are_payable(&inv) && fiat_settlement_policy.is_none();
     let lightning_offer = if sat_fixed_instructions_payable {
@@ -1808,8 +1839,35 @@ pub async fn status(
         .as_ref()
         .filter(|_| sat_fixed_instructions_payable && remaining_sat > 0)
         .map(|_| remaining_sat);
-    let quote_rail_availability =
-        payer_quote_rail_availability(&inv, fiat_settlement_policy.as_ref());
+    let mixed_chain_fee_budget_sat = if existing_quote_chain_offer {
+        // Current limits never invalidate an already-created durable offer.
+        Some(0)
+    } else if fiat_settlement_policy
+        .as_ref()
+        .is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage))
+    {
+        current_mixed_claim_fee_budget_sat(&state).ok()
+    } else {
+        Some(0)
+    };
+    let bitcoin_chain_eligibility = Some(
+        current_quote_amount_sat
+            .and_then(|amount| u64::try_from(amount).ok())
+            .zip(mixed_chain_fee_budget_sat)
+            .map(|(amount, fee_budget_sat)| {
+                state
+                    .boltz
+                    .provider_limits()
+                    .bitcoin_chain_amount_eligibility(amount, fee_budget_sat)
+            })
+            .unwrap_or(crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable),
+    );
+    let quote_rail_availability = payer_quote_rail_availability(
+        &inv,
+        fiat_settlement_policy.as_ref(),
+        bitcoin_chain_eligibility,
+        existing_quote_chain_offer,
+    );
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -2023,7 +2081,7 @@ pub async fn payer_demand_quote(
             "sat-fixed invoices retain the remaining-aware status and Lightning offer flow".into(),
         ));
     }
-    validate_payer_quote_rail(&invoice, policy.as_ref(), request.rail)?;
+    validate_payer_quote_rail(&invoice, policy.as_ref(), request.rail, None)?;
     let response = if invoice.pricing_mode == "fiat_fixed" {
         let quote = resolve_current_fiat_quote(&state, &invoice).await?;
         let instruction =
@@ -2142,6 +2200,8 @@ async fn replay_pending_fiat_only_payer_quote(
 fn payer_quote_rail_availability(
     invoice: &db::Invoice,
     policy: Option<&db::InvoiceFiatSettlementPolicy>,
+    bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
+    existing_quote_chain_offer: bool,
 ) -> Option<PayerQuoteRailAvailability> {
     if invoice.pricing_mode != "fiat_fixed" && policy.is_none() {
         return None;
@@ -2176,16 +2236,39 @@ fn payer_quote_rail_availability(
         availability.lightning &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIGHTNING != 0;
         availability.liquid &= policy.allowed_rail_mask & FIAT_SETTLEMENT_RAIL_LIQUID != 0;
     }
+    if bitcoin_rail_uses_boltz_chain(invoice, policy)
+        && bitcoin_chain_eligibility.is_some()
+        && !existing_quote_chain_offer
+    {
+        availability.bitcoin &= matches!(
+            bitcoin_chain_eligibility,
+            Some(crate::provider_limits::ChainAmountEligibility::Eligible)
+        );
+    }
     Some(availability)
+}
+
+fn bitcoin_rail_uses_boltz_chain(
+    invoice: &db::Invoice,
+    policy: Option<&db::InvoiceFiatSettlementPolicy>,
+) -> bool {
+    let mixed_policy = policy.is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage));
+    let wallet_direct_bitcoin = invoice.origin == "wallet" && !mixed_policy;
+    let provider_direct_fiat = policy.is_some_and(|policy| policy.fiat_percentage == 100);
+    !wallet_direct_bitcoin && !provider_direct_fiat
 }
 
 fn validate_payer_quote_rail(
     invoice: &db::Invoice,
     policy: Option<&db::InvoiceFiatSettlementPolicy>,
     rail: PayerQuoteRail,
+    bitcoin_chain_eligibility: Option<crate::provider_limits::ChainAmountEligibility>,
 ) -> Result<(), AppError> {
-    let availability = payer_quote_rail_availability(invoice, policy)
-        .ok_or_else(|| AppError::InvalidAmount("invoice does not support fiat quotes".into()))?;
+    let availability =
+        payer_quote_rail_availability(invoice, policy, bitcoin_chain_eligibility, false)
+            .ok_or_else(|| {
+                AppError::InvalidAmount("invoice does not support fiat quotes".into())
+            })?;
     match rail {
         PayerQuoteRail::Lightning if !availability.lightning => Err(AppError::InvalidAmount(
             "invoice does not accept Lightning".into(),
@@ -2491,6 +2574,9 @@ async fn ensure_reusable_lightning_offer(
         state,
         derived_key,
         amount_sat as u64,
+        capture_mixed_policy
+            .then(|| current_mixed_claim_fee_budget_sat(state))
+            .transpose()?,
         payment_page_mrh_address(&current),
     )
     .await?;
@@ -2521,8 +2607,13 @@ async fn ensure_reusable_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
-    let captured =
-        db::capture_invoice_reverse_mixed_policy(&mut tx, reverse_swap_id, current.id).await?;
+    let captured = db::capture_invoice_reverse_mixed_policy(
+        &mut tx,
+        reverse_swap_id,
+        current.id,
+        capture_mixed_policy.then_some(prepared.claim_fee_budget_sat),
+    )
+    .await?;
     if captured != capture_mixed_policy {
         return Err(AppError::DbError(
             "reverse swap mixed-policy capture did not match its invoice snapshot".into(),
@@ -3049,6 +3140,9 @@ async fn ensure_versioned_lightning_offer(
             .admission
             .enforce(Rail::LightningReverse)
             .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+        let mixed_claim_fee_budget_sat = capture_mixed_policy
+            .then(|| current_mixed_claim_fee_budget_sat(state))
+            .transpose()?;
         let swap_key_index = db::next_swap_key_index(&mut *connection)
             .await
             .map_err(|error| {
@@ -3075,6 +3169,7 @@ async fn ensure_versioned_lightning_offer(
             state,
             derived_key,
             merchant_amount_sat,
+            mixed_claim_fee_budget_sat,
             payment_page_mrh_address(&current),
         )?;
         let (request_authority_json, request_authority_sha256) =
@@ -3252,8 +3347,13 @@ async fn ensure_versioned_lightning_offer(
             prepared.swap_id
         ))
     })?;
-    let captured =
-        db::capture_invoice_reverse_mixed_policy(&mut tx, reverse_swap_id, current.id).await?;
+    let captured = db::capture_invoice_reverse_mixed_policy(
+        &mut tx,
+        reverse_swap_id,
+        current.id,
+        capture_mixed_policy.then_some(prepared.claim_fee_budget_sat),
+    )
+    .await?;
     if captured != capture_mixed_policy {
         return Err(AppError::DbError(
             "reverse swap mixed-policy capture did not match its invoice snapshot".into(),
@@ -3300,19 +3400,6 @@ async fn ensure_versioned_bitcoin_chain_offer(
     requested_quote: &db::InvoiceQuoteVersion,
     capture_mixed_policy: bool,
 ) -> Result<(Uuid, BitcoinChainOffer), AppError> {
-    let liquid_address = invoice.liquid_address.as_deref().ok_or_else(|| {
-        AppError::InvalidAmount("invoice does not support Bitcoin-to-Liquid payment".into())
-    })?;
-    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
-        .map_err(|error| {
-            AppError::BoltzError(format!(
-                "chain swap invoice has an invalid Liquid destination: {error}"
-            ))
-        })?;
-    let nym = invoice.nym_owner.as_deref().ok_or_else(|| {
-        AppError::InvalidAmount("invoice does not support a Bitcoin chain offer".into())
-    })?;
-
     let mut lookup_connection = state.db.acquire().await?;
     if let ReusableVersionedBitcoinOffer::Ready { offer_id, offer } =
         reusable_versioned_bitcoin_chain_offer(&mut lookup_connection, invoice, requested_quote)
@@ -3321,6 +3408,37 @@ async fn ensure_versioned_bitcoin_chain_offer(
         return Ok((offer_id, offer));
     }
     drop(lookup_connection);
+    let mixed_claim_fee_budget_sat = capture_mixed_policy
+        .then(|| current_mixed_claim_fee_budget_sat(state))
+        .transpose()?;
+    // Reject a new offer before touching recovery ownership or provider
+    // mutation. Existing payer-exposable offers returned above remain
+    // replayable regardless of current limit freshness.
+    match state
+        .boltz
+        .provider_limits()
+        .bitcoin_chain_amount_eligibility(
+            u64::try_from(requested_quote.merchant_amount_sat).map_err(|_| {
+                AppError::InvalidAmount("Bitcoin is unavailable for this amount".into())
+            })?,
+            mixed_claim_fee_budget_sat.unwrap_or(0),
+        ) {
+        crate::provider_limits::ChainAmountEligibility::Eligible => {}
+        crate::provider_limits::ChainAmountEligibility::BelowMinimum
+        | crate::provider_limits::ChainAmountEligibility::AboveMaximum => {
+            return Err(AppError::InvalidAmount(
+                "Bitcoin is unavailable for this amount".into(),
+            ));
+        }
+        crate::provider_limits::ChainAmountEligibility::SnapshotUnavailable => {
+            return Err(AppError::ServiceUnavailable(
+                "Bitcoin is temporarily unavailable; retry shortly".into(),
+            ));
+        }
+    }
+    let nym = invoice.nym_owner.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support a Bitcoin chain offer".into())
+    })?;
 
     state
         .admission
@@ -3404,6 +3522,15 @@ async fn ensure_versioned_bitcoin_chain_offer(
         }
         ReusableVersionedBitcoinOffer::Missing => {}
     }
+    let liquid_address = invoice.liquid_address.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support Bitcoin-to-Liquid payment".into())
+    })?;
+    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
+        .map_err(|error| {
+            AppError::BoltzError(format!(
+                "chain swap invoice has an invalid Liquid destination: {error}"
+            ))
+        })?;
     if quote.expires_at_unix <= unix_now().saturating_add(120) {
         return Err(AppError::ServiceUnavailable(
             "invoice quote is near expiry; refresh after the countdown".into(),
@@ -3505,10 +3632,25 @@ async fn ensure_versioned_bitcoin_chain_offer(
         .map_err(|error| {
             AppError::DbError(format!("chain refund key reservation failed: {error}"))
         })?;
-        let provider_create = state
-            .boltz
-            .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
-            .await?;
+        let provider_create = match mixed_claim_fee_budget_sat {
+            Some(claim_fee_budget_sat) => {
+                state
+                    .boltz
+                    .prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(
+                        claim_key,
+                        refund_key,
+                        merchant_amount_sat,
+                        claim_fee_budget_sat,
+                    )
+                    .await?
+            }
+            None => {
+                state
+                    .boltz
+                    .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
+                    .await?
+            }
+        };
         let (request_authority_json, request_authority_sha256) =
             provider_create.canonical_authority()?;
         let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
@@ -3698,8 +3840,25 @@ async fn ensure_versioned_bitcoin_chain_offer(
             provider_result.swap_id
         ))
     })?;
-    let captured =
-        db::capture_invoice_chain_mixed_policy(&mut tx, canonical.id, current.id).await?;
+    let mixed_claim_fee_budget_sat = capture_mixed_policy
+        .then(|| {
+            provider_result
+                .server_lock_amount_sat
+                .checked_sub(merchant_amount_sat)
+                .and_then(|budget| i64::try_from(budget).ok())
+                .filter(|budget| *budget > 0)
+                .ok_or_else(|| {
+                    AppError::BoltzError("mixed Bitcoin offer lacks its funded claim budget".into())
+                })
+        })
+        .transpose()?;
+    let captured = db::capture_invoice_chain_mixed_policy(
+        &mut tx,
+        canonical.id,
+        current.id,
+        mixed_claim_fee_budget_sat,
+    )
+    .await?;
     if captured != capture_mixed_policy {
         return Err(AppError::DbError(
             "chain swap mixed-policy capture did not match its invoice snapshot".into(),
@@ -3827,7 +3986,7 @@ async fn reusable_versioned_bitcoin_chain_offer(
         exposed.server_lock_amount_sat,
     )
     .ok_or_else(|| AppError::DbError("Bitcoin offer amount evidence is invalid".into()))?;
-    if exposed.server_lock_amount_sat != quote.merchant_amount_sat
+    if chain_swap_merchant_target_sat(&exposed) != Some(quote.merchant_amount_sat)
         || payer_amount_sat != offer.payer_amount_sat
     {
         return Err(AppError::DbError(
@@ -3942,6 +4101,7 @@ struct PreparedLightningOffer {
     claim_key_hex: String,
     boltz_response_json: String,
     provider_response_sha256: String,
+    claim_fee_budget_sat: i64,
     mrh_address: Option<String>,
 }
 
@@ -3986,9 +4146,16 @@ async fn request_lightning_offer(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
+    mixed_claim_fee_budget_sat: Option<u64>,
     mrh_address: Option<&str>,
 ) -> Result<PreparedLightningOffer, AppError> {
-    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat, mrh_address)?;
+    let prepared = prepare_lightning_provider_create(
+        state,
+        derived_key,
+        amount_sat,
+        mixed_claim_fee_budget_sat,
+        mrh_address,
+    )?;
     let result = state
         .boltz
         .submit_fixed_checkout_reverse_swap(prepared)
@@ -4000,15 +4167,37 @@ fn prepare_lightning_provider_create(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
+    mixed_claim_fee_budget_sat: Option<u64>,
     mrh_address: Option<&str>,
 ) -> Result<crate::boltz::PreparedFixedCheckoutReverseCreate, AppError> {
-    state.boltz.prepare_fixed_checkout_reverse_swap(
-        derived_key,
-        amount_sat,
-        Some(BOLTZ_INVOICE_DESCRIPTION),
-        None,
-        mrh_address,
-    )
+    match mixed_claim_fee_budget_sat {
+        Some(claim_fee_budget_sat) => state
+            .boltz
+            .prepare_fixed_checkout_reverse_swap_with_claim_fee_budget(
+                derived_key,
+                amount_sat,
+                claim_fee_budget_sat,
+                Some(BOLTZ_INVOICE_DESCRIPTION),
+                None,
+                mrh_address,
+            ),
+        None => state.boltz.prepare_fixed_checkout_reverse_swap(
+            derived_key,
+            amount_sat,
+            Some(BOLTZ_INVOICE_DESCRIPTION),
+            None,
+            mrh_address,
+        ),
+    }
+}
+
+fn current_mixed_claim_fee_budget_sat(state: &AppState) -> Result<u64, AppError> {
+    let decision = state.fee_runtime.liquid_decision_now().map_err(|_| {
+        AppError::ServiceUnavailable(
+            "Liquid fee decision is unavailable for mixed payment pricing".into(),
+        )
+    })?;
+    crate::claimer::mixed_liquid_claim_fee_budget_sat(&decision)
 }
 
 fn payment_page_mrh_address(invoice: &db::Invoice) -> Option<&str> {
@@ -4037,6 +4226,8 @@ fn prepared_lightning_offer_from_result(
         claim_key_hex: hex::encode(swap.claim_keypair.secret_bytes()),
         boltz_response_json,
         provider_response_sha256,
+        claim_fee_budget_sat: i64::try_from(result.claim_fee_budget_sat)
+            .map_err(|_| AppError::BoltzError("claim fee budget exceeds storage range".into()))?,
         mrh_address: result.mrh_address,
     })
 }
@@ -4080,6 +4271,7 @@ async fn create_lightning_offer(
         state,
         derived_key,
         amount_sat,
+        None,
         payment_page_mrh_address(invoice),
     )
     .await?;
@@ -4156,6 +4348,20 @@ fn validated_payer_chain_amount_sat(
         .then_some(user_lock_amount_sat)
 }
 
+fn chain_swap_merchant_target_sat(swap: &db::ChainSwapRecord) -> Option<i64> {
+    match (
+        swap.mixed_claim_path.as_deref(),
+        swap.mixed_claim_fee_budget_sat,
+    ) {
+        (None, None) => (swap.server_lock_amount_sat > 0).then_some(swap.server_lock_amount_sat),
+        (Some("script"), Some(budget)) if budget > 0 => swap
+            .server_lock_amount_sat
+            .checked_sub(budget)
+            .filter(|target| *target > 0),
+        _ => None,
+    }
+}
+
 fn retain_persisted_offer_after_permit_release(
     offer: BitcoinChainOffer,
     release: Result<(), ChainSwapCreationPermitError>,
@@ -4230,11 +4436,112 @@ async fn create_bitcoin_chain_offer_with_faults(
     // provider boundary. The public invoice renderer uses this same predicate.
     // This is what turns a process loss after provider creation into one remote
     // swap rather than a second mutating request.
-    let amount_i64 = i64::try_from(amount_sat)
+    let capture_mixed_policy = db::invoice_fiat_settlement_policy(&state.db, invoice.id)
+        .await?
+        .is_some_and(|policy| (1..=99).contains(&policy.fiat_percentage));
+    let mixed_claim_fee_budget_sat = capture_mixed_policy
+        .then(|| current_mixed_claim_fee_budget_sat(state))
+        .transpose()?;
+    let expected_server_lock_amount = mixed_claim_fee_budget_sat
+        .map(|budget| {
+            amount_sat
+                .checked_add(budget)
+                .ok_or_else(|| AppError::InvalidAmount("mixed Bitcoin amount exceeds range".into()))
+        })
+        .transpose()?
+        .unwrap_or(amount_sat);
+    let expected_server_lock_amount_i64 = i64::try_from(expected_server_lock_amount)
         .map_err(|_| AppError::BoltzError("chain swap amount exceeds storage range".into()))?;
-    if let Some(existing) =
-        db::latest_payer_exposable_chain_swap_for_invoice(&state.db, invoice.id, amount_i64).await?
-    {
+    let merchant_amount_i64 = i64::try_from(amount_sat)
+        .map_err(|_| AppError::BoltzError("chain swap amount exceeds storage range".into()))?;
+    let mut existing = db::latest_payer_exposable_chain_swap_for_invoice(
+        &state.db,
+        invoice.id,
+        merchant_amount_i64,
+    )
+    .await?;
+    if existing.is_none() && expected_server_lock_amount_i64 != merchant_amount_i64 {
+        // Narrow crash repair: the canonical provider row and recovery
+        // manifest can precede split/fee capture. At that boundary the gross
+        // source amount is the only durable lookup authority.
+        existing = db::latest_payer_exposable_chain_swap_for_invoice(
+            &state.db,
+            invoice.id,
+            expected_server_lock_amount_i64,
+        )
+        .await?;
+    }
+    if let Some(existing) = existing {
+        if capture_mixed_policy {
+            let expected_budget = existing
+                .server_lock_amount_sat
+                .checked_sub(merchant_amount_i64)
+                .filter(|budget| *budget > 0)
+                .ok_or_else(|| {
+                    AppError::DbError(
+                        "persisted mixed Bitcoin offer has no funded claim budget".into(),
+                    )
+                })?;
+            let mut policy_connection = state.db.acquire().await?;
+            let captured_policy =
+                db::chain_swap_fiat_settlement_policy(&mut policy_connection, existing.id).await?;
+            drop(policy_connection);
+            match (
+                existing.mixed_claim_path.as_deref(),
+                existing.mixed_claim_fee_budget_sat,
+                captured_policy.is_some(),
+            ) {
+                (Some("script"), Some(actual_budget), true) if actual_budget == expected_budget => {
+                }
+                // Historical mixed rows intentionally retain their dynamic
+                // path/fee behavior. Their split was already captured before
+                // funded claim authority existed.
+                (None, None, true) => {}
+                (Some("script"), Some(actual_budget), false)
+                    if actual_budget == expected_budget =>
+                {
+                    let mut tx = state.db.begin().await?;
+                    let captured = db::capture_invoice_chain_mixed_policy(
+                        &mut tx,
+                        existing.id,
+                        invoice.id,
+                        Some(expected_budget),
+                    )
+                    .await?;
+                    if !captured {
+                        return Err(AppError::DbError(
+                            "persisted mixed Bitcoin offer lost its invoice policy".into(),
+                        ));
+                    }
+                    tx.commit().await?;
+                }
+                (None, None, false) => {
+                    // A process may have stopped after the provider row and
+                    // recovery manifest became durable but before the invoice
+                    // split snapshot committed. Repair that narrow boundary
+                    // before the payer instruction can be returned.
+                    let mut tx = state.db.begin().await?;
+                    let captured = db::capture_invoice_chain_mixed_policy(
+                        &mut tx,
+                        existing.id,
+                        invoice.id,
+                        Some(expected_budget),
+                    )
+                    .await?;
+                    if !captured {
+                        return Err(AppError::DbError(
+                            "persisted mixed Bitcoin offer lost its invoice policy".into(),
+                        ));
+                    }
+                    tx.commit().await?;
+                }
+                _ => {
+                    return Err(AppError::DbError(
+                        "persisted mixed Bitcoin offer has conflicting claim authority".into(),
+                    ));
+                }
+            }
+        }
         let payer_amount_sat = validated_payer_chain_amount_sat(
             existing.user_lock_amount_sat,
             existing.server_lock_amount_sat,
@@ -4373,10 +4680,26 @@ async fn create_bitcoin_chain_offer_with_faults(
             recovery_commitment.canonical_btc_address(),
         )),
     );
-    let result = state
-        .boltz
-        .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
-        .await?;
+    let result = match mixed_claim_fee_budget_sat {
+        Some(claim_fee_budget_sat) => {
+            let prepared = state
+                .boltz
+                .prepare_btc_to_lbtc_chain_swap_with_claim_fee_budget(
+                    claim_key,
+                    refund_key,
+                    amount_sat,
+                    claim_fee_budget_sat,
+                )
+                .await?;
+            state.boltz.submit_btc_to_lbtc_chain_swap(prepared).await?
+        }
+        None => {
+            state
+                .boltz
+                .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
+                .await?
+        }
+    };
     // Never forward the provider's BIP21. Its address and amount are merely
     // response fields until the complete response passes local validation;
     // this URI is constructed from those validated values under our own fixed
@@ -4389,7 +4712,7 @@ async fn create_bitcoin_chain_offer_with_faults(
         )
     })?;
 
-    crate::swap_manifest_persistence::persist_created_chain_swap_with_faults(
+    let canonical = crate::swap_manifest_persistence::persist_created_chain_swap_with_faults(
         &state.db,
         recovery_runtime,
         crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
@@ -4411,6 +4734,21 @@ async fn create_bitcoin_chain_offer_with_faults(
     )
     .await
     .map_err(|error| AppError::DbError(error.to_string()))?;
+    if capture_mixed_policy {
+        let budget =
+            i64::try_from(mixed_claim_fee_budget_sat.expect("mixed policy has a fee budget"))
+                .map_err(|_| AppError::InvalidAmount("mixed claim fee exceeds range".into()))?;
+        let mut tx = state.db.begin().await?;
+        let captured =
+            db::capture_invoice_chain_mixed_policy(&mut tx, canonical.id, invoice.id, Some(budget))
+                .await?;
+        if !captured {
+            return Err(AppError::DbError(
+                "new mixed Bitcoin offer lost its invoice policy".into(),
+            ));
+        }
+        tx.commit().await?;
+    }
 
     let offer = BitcoinChainOffer {
         lockup_address: result.lockup_address,

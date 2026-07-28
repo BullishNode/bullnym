@@ -74,6 +74,21 @@ pub struct StoredBullBitcoinSettlement {
     pub quoted_fiat_minor: Option<i64>,
     pub execution_rate_minor_per_btc: Option<i64>,
     pub provider_final: bool,
+    pub provider_last_read_error_class: Option<String>,
+    pub provider_last_read_error_at_unix_micros: Option<i64>,
+    pub provider_last_success_at_unix_micros: Option<i64>,
+    pub provider_not_found_first_at_unix_micros: Option<i64>,
+    pub provider_not_found_consecutive: i32,
+    pub provider_missing_since_unix_micros: Option<i64>,
+    pub provider_missing_last_resolved_at_unix_micros: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderNotFoundOutcome {
+    pub consecutive: i32,
+    pub escalated_now: bool,
+    pub persistent_missing: bool,
+    pub financial_evidence_present: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +227,19 @@ const SETTLEMENT_PROJECTION: &str =
      (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
          AS quote_payment_first_observed_at_unix_micros, \
      credited_fiat_minor, quoted_fiat_minor, \
-     execution_rate_minor_per_btc, provider_final";
+     execution_rate_minor_per_btc, provider_final, \
+     provider_last_read_error_class, \
+     (EXTRACT(EPOCH FROM provider_last_read_error_at) * 1000000)::BIGINT \
+         AS provider_last_read_error_at_unix_micros, \
+     (EXTRACT(EPOCH FROM provider_last_success_at) * 1000000)::BIGINT \
+         AS provider_last_success_at_unix_micros, \
+     (EXTRACT(EPOCH FROM provider_not_found_first_at) * 1000000)::BIGINT \
+         AS provider_not_found_first_at_unix_micros, \
+     provider_not_found_consecutive, \
+     (EXTRACT(EPOCH FROM provider_missing_since) * 1000000)::BIGINT \
+         AS provider_missing_since_unix_micros, \
+     (EXTRACT(EPOCH FROM provider_missing_last_resolved_at) * 1000000)::BIGINT \
+         AS provider_missing_last_resolved_at_unix_micros";
 
 /// Copy an invoice's immutable mixed policy onto the reverse swap in the same
 /// transaction that makes the Boltz obligation durable. A 0%/100% policy does
@@ -221,6 +248,7 @@ pub async fn capture_invoice_reverse_mixed_policy(
     tx: &mut Transaction<'_, Postgres>,
     reverse_swap_id: Uuid,
     invoice_id: Uuid,
+    mixed_claim_fee_budget_sat: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
@@ -237,7 +265,39 @@ pub async fn capture_invoice_reverse_mixed_policy(
     .bind(invoice_id)
     .execute(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    // Historical/manual fixtures predate the funded claim authority. They may
+    // still capture the immutable split policy with NULL authority so their
+    // existing dynamic claim behavior remains recoverable. Every newly
+    // payer-exposed mixed offer passes Some below.
+    let Some(budget) = mixed_claim_fee_budget_sat else {
+        return Ok(true);
+    };
+    if budget <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "mixed reverse policy has an invalid funded claim budget".into(),
+        ));
+    }
+    let authority = sqlx::query(
+        "UPDATE swap_records \
+            SET mixed_claim_path = 'script', mixed_claim_fee_budget_sat = $2 \
+          WHERE (id = $1 AND mixed_claim_path IS NULL \
+            AND mixed_claim_fee_budget_sat IS NULL) \
+             OR (id = $1 AND mixed_claim_path = 'script' \
+            AND mixed_claim_fee_budget_sat = $2)",
+    )
+    .bind(reverse_swap_id)
+    .bind(budget)
+    .execute(&mut **tx)
+    .await?;
+    if authority.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "mixed reverse policy could not bind its claim authority".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Chain-swap counterpart to [`capture_invoice_reverse_mixed_policy`].
@@ -245,6 +305,7 @@ pub async fn capture_invoice_chain_mixed_policy(
     tx: &mut Transaction<'_, Postgres>,
     chain_swap_id: Uuid,
     invoice_id: Uuid,
+    mixed_claim_fee_budget_sat: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO swap_fiat_settlement_policies ( \
@@ -261,7 +322,35 @@ pub async fn capture_invoice_chain_mixed_policy(
     .bind(invoice_id)
     .execute(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    let Some(budget) = mixed_claim_fee_budget_sat else {
+        return Ok(true);
+    };
+    if budget <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "mixed chain policy has an invalid funded claim budget".into(),
+        ));
+    }
+    let authority = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET mixed_claim_path = 'script', mixed_claim_fee_budget_sat = $2 \
+          WHERE (id = $1 AND mixed_claim_path IS NULL \
+            AND mixed_claim_fee_budget_sat IS NULL) \
+             OR (id = $1 AND mixed_claim_path = 'script' \
+            AND mixed_claim_fee_budget_sat = $2)",
+    )
+    .bind(chain_swap_id)
+    .bind(budget)
+    .execute(&mut **tx)
+    .await?;
+    if authority.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "mixed chain policy could not bind its claim authority".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Capture the current Lightning Address mixed policy after a Boltz response
@@ -291,8 +380,8 @@ pub async fn active_lightning_address_fiat_setting(
     .await
 }
 
-/// Revalidate the exact setting observed before Boltz I/O and, for a mixed
-/// setting, capture it onto the newly inserted swap. `None` means the callback
+/// Revalidate the exact setting observed before Boltz I/O and, for any nonzero
+/// fiat allocation, capture it onto the newly inserted swap. `None` means the callback
 /// observed no fiat policy and requires that to remain true at commit.
 pub async fn validate_and_capture_lightning_address_policy(
     tx: &mut Transaction<'_, Postgres>,
@@ -335,41 +424,9 @@ pub async fn validate_and_capture_lightning_address_policy(
     let expected = expected.ok_or_else(|| {
         sqlx::Error::Protocol("Lightning Address fiat policy disappeared during validation".into())
     })?;
-    if expected.fiat_percentage == 100 {
-        let exact: bool = sqlx::query_scalar(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM fiat_settlement_settings setting \
-                 JOIN bull_bitcoin_credentials credential \
-                   ON credential.id = setting.credential_id \
-                  AND credential.owner_npub = setting.owner_npub \
-                 JOIN users account ON account.npub = setting.owner_npub \
-                  AND account.nym = $2 AND account.is_active \
-                  WHERE setting.owner_npub = $1 \
-                    AND setting.product = 'lightning_address' \
-                    AND setting.credential_id = $3 \
-                    AND setting.fiat_percentage = 100 \
-                    AND setting.fiat_currency = $4 \
-                    AND credential.admitted_for_new_orders \
-                    AND credential.ciphertext IS NOT NULL \
-                    AND credential.nonce IS NOT NULL \
-             )",
-        )
-        .bind(&owner_npub)
-        .bind(nym)
-        .bind(expected.credential_id)
-        .bind(&expected.fiat_currency)
-        .fetch_one(&mut **tx)
-        .await?;
-        if !exact {
-            return Err(sqlx::Error::Protocol(
-                "Lightning Address fiat setting changed during offer creation".into(),
-            ));
-        }
-        return Ok(false);
-    }
-    if !(1..=99).contains(&expected.fiat_percentage) {
+    if !(1..=100).contains(&expected.fiat_percentage) {
         return Err(sqlx::Error::Protocol(
-            "only a mixed Lightning Address policy can bind a Boltz swap".into(),
+            "only a nonzero Lightning Address fiat policy can bind a Boltz swap".into(),
         ));
     }
     let result = sqlx::query(
@@ -883,7 +940,7 @@ pub async fn route_unfunded_mixed_settlement_to_fallback(
                 instruction_kind = NULL, payer_instruction = NULL, \
                 instruction_expires_at = NULL, next_attempt_at = NULL, \
                 updated_at = now() \
-          WHERE id = $1 AND purpose = 'mixed' \
+          WHERE id = $1 AND purpose IN ('mixed', 'provider_only') \
             AND provider_state = 'bound' AND funding_route IS NULL \
             AND funding_committed_at IS NULL AND settlement_status = 'none'",
     )
@@ -942,6 +999,55 @@ pub async fn commit_mixed_bull_bitcoin_funding(
     if updated.rows_affected() != 1 {
         return Err(sqlx::Error::Protocol(
             "mixed Bull Bitcoin funding transition lost its exact row".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Persist the sole provider output for a swap-backed 100%-fiat Lightning
+/// Address and make the exact order eligible for reconciliation atomically.
+pub async fn commit_provider_only_bull_bitcoin_funding(
+    tx: &mut Transaction<'_, Postgres>,
+    settlement_id: Uuid,
+    bull_bitcoin: &NewBullBitcoinClaimOutput<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO bull_bitcoin_claim_outputs ( \
+             settlement_id, role, txid, vout, script_pubkey_hex, \
+             authorized_amount_sat, asset_commitment_sha256, \
+             value_commitment_sha256, nonce_commitment_sha256, \
+             surjection_proof_sha256, rangeproof_sha256 \
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(settlement_id)
+    .bind(bull_bitcoin.role)
+    .bind(bull_bitcoin.txid)
+    .bind(bull_bitcoin.vout)
+    .bind(bull_bitcoin.script_pubkey_hex)
+    .bind(bull_bitcoin.authorized_amount_sat)
+    .bind(bull_bitcoin.asset_commitment_sha256)
+    .bind(bull_bitcoin.value_commitment_sha256)
+    .bind(bull_bitcoin.nonce_commitment_sha256)
+    .bind(bull_bitcoin.surjection_proof_sha256)
+    .bind(bull_bitcoin.rangeproof_sha256)
+    .execute(&mut **tx)
+    .await?;
+    let updated = sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET funding_route = 'bull_bitcoin', funding_committed_at = now(), \
+                settlement_status = 'pending', instruction_kind = NULL, \
+                payer_instruction = NULL, instruction_expires_at = NULL, \
+                next_attempt_at = now(), updated_at = now() \
+          WHERE id = $1 AND purpose = 'provider_only' \
+            AND provider_state = 'bound' AND funding_route IS NULL \
+            AND funding_committed_at IS NULL AND settlement_status = 'none'",
+    )
+    .bind(settlement_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "provider-only Bull Bitcoin funding transition lost its exact row".into(),
         ));
     }
     Ok(())
@@ -1102,6 +1208,9 @@ pub async fn claim_bull_bitcoin_reconciliation_batch(
                 AND ( \
                     (settlement_status = 'pending' \
                      AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
+                    OR (settlement_status = 'integrity_error' \
+                        AND provider_missing_since IS NOT NULL \
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
                     OR (settlement_status = 'settled' AND purpose = 'fiat_only' \
                         AND invoice_id IS NOT NULL \
                         AND NOT EXISTS ( \
@@ -1165,6 +1274,15 @@ pub async fn record_bull_bitcoin_observation(
                 execution_rate_minor_per_btc = COALESCE( \
                     $11, execution_rate_minor_per_btc), \
                 provider_final = $7, \
+                provider_last_read_error_class = NULL, \
+                provider_last_read_error_at = NULL, \
+                provider_last_success_at = now(), \
+                provider_not_found_first_at = NULL, \
+                provider_not_found_consecutive = 0, \
+                provider_missing_last_resolved_at = CASE \
+                    WHEN provider_missing_since IS NOT NULL THEN now() \
+                    ELSE provider_missing_last_resolved_at END, \
+                provider_missing_since = NULL, \
                 settlement_status = CASE \
                     WHEN $7 THEN 'settled' \
                     WHEN $8 THEN 'unavailable' \
@@ -1196,7 +1314,9 @@ pub async fn record_bull_bitcoin_observation(
                 updated_at = now() \
           WHERE id = $1 AND provider_state = 'bound' \
             AND funding_route = 'bull_bitcoin' \
-            AND settlement_status = 'pending' \
+            AND (settlement_status = 'pending' \
+                 OR (settlement_status = 'integrity_error' \
+                     AND provider_missing_since IS NOT NULL)) \
          RETURNING invoice_id, \
                    invoice_quote_version_id AS instruction_quote_version_id, \
                    (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
@@ -1291,6 +1411,208 @@ pub async fn record_bull_bitcoin_retry(
     Ok(())
 }
 
+/// Persist one authenticated exact-order 404. Escalation requires both the
+/// configured consecutive count and elapsed-time thresholds. The immutable
+/// provider binding is retained in every outcome; this function never routes,
+/// abandons, or replaces an order.
+pub async fn record_bull_bitcoin_provider_not_found(
+    pool: &PgPool,
+    settlement_id: Uuid,
+    delay_secs: i64,
+    persistent_watch_secs: i64,
+    escalation_attempts: i32,
+    escalation_secs: i64,
+    provider_api_healthy: bool,
+) -> Result<ProviderNotFoundOutcome, sqlx::Error> {
+    let outcome = sqlx::query_as::<_, (i32, bool, bool, bool)>(
+        "WITH target AS ( \
+             SELECT settlement.*, \
+                    (settlement.actual_received_sat IS NOT NULL \
+                     OR (settlement.purpose = 'mixed' \
+                         AND settlement.funding_committed_at IS NOT NULL) \
+                     OR EXISTS ( \
+                         SELECT 1 FROM bull_bitcoin_claim_outputs output \
+                          WHERE output.settlement_id = settlement.id \
+                     ) \
+                     OR EXISTS ( \
+                         SELECT 1 FROM invoice_payment_events event \
+                          WHERE event.bull_bitcoin_settlement_id = settlement.id \
+                     )) AS financial_evidence_present \
+               FROM bull_bitcoin_settlements settlement \
+              WHERE settlement.id = $1 \
+                AND settlement.provider_state = 'bound' \
+                AND settlement.funding_route = 'bull_bitcoin' \
+                AND (settlement.settlement_status = 'pending' \
+                     OR (settlement.settlement_status = 'integrity_error' \
+                         AND settlement.provider_missing_since IS NOT NULL)) \
+              FOR UPDATE \
+         ), decision AS ( \
+             SELECT target.*, \
+                    CASE WHEN $6 \
+                         THEN target.provider_not_found_consecutive + 1 \
+                         ELSE 0 END AS next_consecutive, \
+                    CASE WHEN $6 \
+                         THEN COALESCE(target.provider_not_found_first_at, now()) \
+                         ELSE NULL END AS next_first_at, \
+                    ($6 \
+                     AND target.provider_not_found_consecutive + 1 >= $4 \
+                     AND now() >= COALESCE(target.provider_not_found_first_at, now()) \
+                         + make_interval(secs => $5::DOUBLE PRECISION)) \
+                        AS should_escalate \
+               FROM target \
+         ), updated AS ( \
+             UPDATE bull_bitcoin_settlements settlement \
+                SET provider_last_read_error_class = CASE WHEN $6 \
+                        THEN 'not_found' ELSE 'not_found_unverified' END, \
+                    provider_last_read_error_at = now(), \
+                    provider_not_found_first_at = decision.next_first_at, \
+                    provider_not_found_consecutive = decision.next_consecutive, \
+                    provider_missing_since = CASE \
+                        WHEN decision.should_escalate \
+                        THEN COALESCE(settlement.provider_missing_since, now()) \
+                        ELSE settlement.provider_missing_since END, \
+                    settlement_status = CASE \
+                        WHEN decision.should_escalate THEN 'integrity_error' \
+                        ELSE settlement.settlement_status END, \
+                    payer_instruction = CASE \
+                        WHEN decision.should_escalate THEN NULL \
+                        ELSE settlement.payer_instruction END, \
+                    instruction_kind = CASE \
+                        WHEN decision.should_escalate THEN NULL \
+                        ELSE settlement.instruction_kind END, \
+                    last_checked_at = now(), \
+                    reconcile_attempts = settlement.reconcile_attempts + 1, \
+                    next_attempt_at = now() + make_interval(secs => (CASE \
+                        WHEN settlement.provider_missing_since IS NOT NULL \
+                             OR decision.should_escalate THEN $3 \
+                        ELSE $2 END)::DOUBLE PRECISION), \
+                    updated_at = now() \
+               FROM decision \
+              WHERE settlement.id = decision.id \
+          RETURNING decision.next_consecutive, \
+                    (decision.provider_missing_since IS NULL \
+                     AND decision.should_escalate) AS escalated_now, \
+                    (decision.provider_missing_since IS NOT NULL \
+                     OR decision.should_escalate) AS persistent_missing, \
+                    decision.financial_evidence_present \
+         ) \
+         SELECT * FROM updated",
+    )
+    .bind(settlement_id)
+    .bind(delay_secs)
+    .bind(persistent_watch_secs)
+    .bind(escalation_attempts)
+    .bind(escalation_secs)
+    .bind(provider_api_healthy)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)?;
+    Ok(ProviderNotFoundOutcome {
+        consecutive: outcome.0,
+        escalated_now: outcome.1,
+        persistent_missing: outcome.2,
+        financial_evidence_present: outcome.3,
+    })
+}
+
+/// Return the conservative local/provider evidence predicate used to classify
+/// a missing-order hold. This never makes an abandonment decision.
+pub async fn bull_bitcoin_financial_evidence_present(
+    pool: &PgPool,
+    settlement_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT settlement.actual_received_sat IS NOT NULL \
+                OR (settlement.purpose = 'mixed' \
+                    AND settlement.funding_committed_at IS NOT NULL) \
+                OR EXISTS ( \
+                    SELECT 1 FROM bull_bitcoin_claim_outputs output \
+                     WHERE output.settlement_id = settlement.id \
+                ) \
+                OR EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events event \
+                     WHERE event.bull_bitcoin_settlement_id = settlement.id \
+                        OR (settlement.invoice_id IS NOT NULL \
+                            AND event.invoice_id = settlement.invoice_id) \
+                ) \
+           FROM bull_bitcoin_settlements settlement WHERE settlement.id = $1",
+    )
+    .bind(settlement_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Record a retryable transport/upstream exact-order read failure separately
+/// from authenticated NotFound. A transient failure breaks a 404 streak but
+/// cannot clear an already-escalated missing-order integrity hold.
+pub async fn record_bull_bitcoin_provider_transient_retry(
+    pool: &PgPool,
+    settlement_id: Uuid,
+    delay_secs: i64,
+    persistent_watch_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET provider_last_read_error_class = 'transient', \
+                provider_last_read_error_at = now(), \
+                provider_not_found_first_at = NULL, \
+                provider_not_found_consecutive = 0, \
+                reconcile_attempts = reconcile_attempts + 1, \
+                last_checked_at = now(), \
+                next_attempt_at = now() + make_interval(secs => (CASE \
+                    WHEN provider_missing_since IS NOT NULL THEN $3 \
+                    ELSE $2 END)::DOUBLE PRECISION), \
+                updated_at = now() \
+          WHERE id = $1 AND provider_state = 'bound' \
+            AND funding_route = 'bull_bitcoin' \
+            AND (settlement_status = 'pending' \
+                 OR (settlement_status = 'integrity_error' \
+                     AND provider_missing_since IS NOT NULL))",
+    )
+    .bind(settlement_id)
+    .bind(delay_secs)
+    .bind(persistent_watch_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// An authentication failure while reading a previously bound order is an
+/// access incident, not proof that the financial obligation disappeared.
+/// Preserve the credential generation, order, instruction, and ordinary retry
+/// path so an operator/provider correction can recover the same order.
+pub async fn record_bull_bitcoin_provider_authentication_retry(
+    pool: &PgPool,
+    settlement_id: Uuid,
+    delay_secs: i64,
+    persistent_watch_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET provider_last_read_error_class = 'authentication', \
+                provider_last_read_error_at = now(), \
+                provider_not_found_first_at = NULL, \
+                provider_not_found_consecutive = 0, \
+                reconcile_attempts = reconcile_attempts + 1, \
+                last_checked_at = now(), \
+                next_attempt_at = now() + make_interval(secs => (CASE \
+                    WHEN provider_missing_since IS NOT NULL THEN $3 \
+                    ELSE $2 END)::DOUBLE PRECISION), \
+                updated_at = now() \
+          WHERE id = $1 AND provider_state = 'bound' \
+            AND funding_route = 'bull_bitcoin' \
+            AND (settlement_status = 'pending' \
+                 OR (settlement_status = 'integrity_error' \
+                     AND provider_missing_since IS NOT NULL))",
+    )
+    .bind(settlement_id)
+    .bind(delay_secs)
+    .bind(persistent_watch_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn record_bull_bitcoin_terminal_problem(
     pool: &PgPool,
     settlement_id: Uuid,
@@ -1346,7 +1668,7 @@ pub async fn invalidate_bull_bitcoin_credential_on_connection(
                 instruction_kind = NULL, payer_instruction = NULL, \
                 instruction_expires_at = NULL, next_attempt_at = NULL, \
                 updated_at = now() \
-          WHERE credential_id = $1 AND purpose = 'mixed' \
+          WHERE credential_id = $1 AND purpose IN ('mixed', 'provider_only') \
             AND provider_state = 'bound' AND funding_route IS NULL \
             AND funding_committed_at IS NULL AND settlement_status = 'none'",
     )

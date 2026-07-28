@@ -286,7 +286,7 @@ pub async fn request_bull_bitcoin_credential_deletion(
                     instruction_kind = NULL, payer_instruction = NULL, \
                     instruction_expires_at = NULL, next_attempt_at = NULL, \
                     updated_at = now() \
-              WHERE credential_id = $1 AND purpose = 'mixed' \
+              WHERE credential_id = $1 AND purpose IN ('mixed', 'provider_only') \
                 AND provider_state = 'bound' AND funding_route IS NULL \
                 AND funding_committed_at IS NULL AND settlement_status = 'none'",
         )

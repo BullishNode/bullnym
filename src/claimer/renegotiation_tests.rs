@@ -609,6 +609,8 @@ fn chain_swap_with_pair_limits(
         claim_attempts: 0,
         last_claim_error: None,
         cooperative_refused: true,
+        mixed_claim_path: None,
+        mixed_claim_fee_budget_sat: None,
         creation_terms: Some(db::ChainSwapCreationTerms {
             pinned_pair_hash: pair.hash,
             canonical_pair_quote_json,

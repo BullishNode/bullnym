@@ -455,6 +455,130 @@ stale-dispatch recovery can abandon an uncertain provider create and permit a
 second economic path. Roll forward with the schema-077 build, or stop every
 writer and restore the matching validated schema-076 backup and artifact.
 
+## Migration 078 mixed claim fee authority
+
+Apply `078_mixed_claim_fee_authority.sql` as the privileged owner of both swap
+tables, with `--set runtime_role=bullnym_app`, while every Bullnym writer is
+stopped. Never apply it as `bullnym_app`. Before applying it, verify that no
+columns with these names already exist and retain the result:
+
+```sql
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name IN ('swap_records', 'chain_swap_records')
+  AND column_name IN ('mixed_claim_path', 'mixed_claim_fee_budget_sat')
+ORDER BY table_name, column_name;
+```
+
+The expected pre-migration result is empty. Migration 078 adds nullable paired
+authority only; it does not backfill, relabel, or infer authority for any
+historical swap. The only permitted runtime transition is `NULL/NULL` to
+`script/positive-budget` before claim bytes exist. The pair is immutable after
+capture. Readiness verifies both columns, both paired constraints, and both
+immutability triggers.
+
+After startup and before funded admission, create one mixed Lightning offer and
+one mixed Bitcoin offer. For each, verify that the persisted Liquid source is
+the immutable invoice target plus the stored claim budget, the path is
+`script`, and a repeated offer read returns the identical provider obligation.
+Do not enable funded mixed tests if either authority pair is absent or if an
+exact current fee estimate differs from the stored budget; that state requires
+an explicit repricing or fee-bump policy, never an unaccounted merchant debit.
+
+## Migration 079 swap-backed 100%-fiat Lightning Addresses
+
+Apply `079_lightning_address_provider_only.sql` as the privileged owner of
+`bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Take and validate a
+fresh schema-078 backup first.
+
+The migration does not create, fund, reconcile, or rewrite provider orders. It
+leaves historical direct-provider `fiat_only` rows unchanged and adds the
+internal `provider_only` purpose for new Lightning Address reverse swaps whose
+captured allocation is exactly 100%. The one-output claim journal requires one
+confidential Bull Bitcoin output at vout 0, with no merchant output. Existing
+1–99% `mixed` claims retain the merchant and provider outputs.
+
+Before reopening admission, require `/ready` to validate the 1–100 swap-policy
+range, `provider_only` purpose, one-output constraint, and updated authority
+triggers. Record these postflight counts:
+
+```sql
+SELECT purpose, payer_rail, fiat_percentage, provider_state,
+       funding_route, settlement_status, COUNT(*)
+FROM bull_bitcoin_settlements
+WHERE purpose IN ('provider_only', 'mixed')
+GROUP BY purpose, payer_rail, fiat_percentage, provider_state,
+         funding_route, settlement_status
+ORDER BY purpose, payer_rail, fiat_percentage, provider_state;
+
+SELECT settlement.id
+FROM bull_bitcoin_settlements settlement
+LEFT JOIN bull_bitcoin_claim_outputs output
+  ON output.settlement_id = settlement.id
+WHERE settlement.purpose = 'provider_only'
+GROUP BY settlement.id, settlement.funding_committed_at
+HAVING (settlement.funding_committed_at IS NOT NULL AND
+        (COUNT(*) <> 1 OR
+         BOOL_OR(output.role <> 'bull_bitcoin' OR output.vout <> 0)))
+    OR (settlement.funding_committed_at IS NULL AND COUNT(*) <> 0);
+```
+
+The second query must return zero rows. Start only a matching schema-079
+binary. Then certify that a 100%-fiat Lightning Address callback returns a
+Boltz BOLT11 without creating a Bull Bitcoin order; after funded claim
+preparation, exactly one Liquid provider order/output appears and the signed
+merchant settlement projection remains the strict public `fiat` shape.
+
+After migration 079 commits, never start a schema-078-or-older writer: it does
+not understand the provider-only policy or one-output journal. Fix forward, or
+restore the matching validated pre-079 database backup and artifact together.
+
+## Migration 080 persistent provider-order NotFound
+
+Apply `080_persistent_provider_order_not_found.sql` as the privileged owner of
+`bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
+Bullnym writer is stopped. Never apply it as `bullnym_app`. Retain a validated
+schema-079 database backup and its matching artifact before applying 080.
+
+Before migration, record the count of bound, non-final provider rows and verify
+that none of the seven migration-080 columns already exists:
+
+```sql
+SELECT COUNT(*) AS bound_nonfinal_orders
+FROM bull_bitcoin_settlements
+WHERE provider_state = 'bound' AND NOT provider_final;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'bull_bitcoin_settlements'
+  AND column_name IN (
+      'provider_last_read_error_class',
+      'provider_last_read_error_at',
+      'provider_last_success_at',
+      'provider_not_found_first_at',
+      'provider_not_found_consecutive',
+      'provider_missing_since',
+      'provider_missing_last_resolved_at'
+  )
+ORDER BY column_name;
+```
+
+The expected column result is empty. Migration 080 adds nullable observation
+state plus a zero-valued streak counter; it does not infer NotFound or success
+evidence for historical rows. After applying it, require `/ready` and
+`/version` from the matching schema-080 binary, then run the historical audit
+in [Bull Bitcoin provider-order missing audit](bull-bitcoin-provider-missing.md)
+before enabling new fiat admission.
+
+Do not start a schema-079-or-older writer after migration 080 commits: it cannot
+maintain the missing-order state or recover its integrity hold. Operational
+recovery is to keep writers stopped and repair forward with the schema-080
+binary. Restoring schema 079 requires restoring the matching pre-080 database
+backup and artifact together; never downgrade only the binary.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

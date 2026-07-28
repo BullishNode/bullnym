@@ -60,7 +60,7 @@ use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
-use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy};
+use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy, SatPerVbyte};
 use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
 use crate::ip_whitelist;
@@ -73,6 +73,12 @@ use crate::validators;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+/// Discounted vbytes for the pinned boltz-client two-confidential-output
+/// Liquid claim shape. Both reverse and chain claims have the same measured
+/// size; the script path is the larger safe budget used before payer exposure.
+#[cfg(test)]
+const MIXED_COOPERATIVE_CLAIM_DISCOUNT_VBYTES: usize = 247;
+const MIXED_SCRIPT_CLAIM_DISCOUNT_VBYTES: usize = 287;
 const REVERSE_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed reverse response without persisted claim bytes";
 const CHAIN_TEST_GUARD_REJECTED: &str =
@@ -2995,6 +3001,11 @@ async fn prepare_reverse_mixed_claim(
             .await
             .map_err(|error| AppError::DbError(error.to_string()))?
             .ok_or_else(|| AppError::ClaimError(format!("swap not found: {reverse_swap_id}")))?;
+        let policy = db::reverse_swap_fiat_settlement_policy(&mut tx, reverse_swap_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?
+            .ok_or_else(|| AppError::ClaimError("reverse swap fiat policy disappeared".into()))?;
+        let provider_only = policy.fiat_percentage == 100;
         let status = swap
             .parsed_status()
             .map_err(|error| AppError::ClaimError(format!("invalid swap status: {error}")))?;
@@ -3036,8 +3047,15 @@ async fn prepare_reverse_mixed_claim(
             claim_clients,
             boltz_url,
             &builder_fee,
+            provider_only,
         )
         .await?;
+        validate_funded_mixed_claim_fee(
+            "mixed reverse claim",
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+            claim_fee_sat,
+        )?;
         let net_settlement_sat = response
             .onchain_amount
             .checked_sub(claim_fee_sat)
@@ -3046,9 +3064,28 @@ async fn prepare_reverse_mixed_claim(
             .ok_or_else(|| {
                 AppError::ClaimError("mixed reverse claim has no positive net settlement".into())
             })?;
+        if let Some(budget) = pinned_mixed_claim_fee_budget(
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )? {
+            let expected_target = response
+                .onchain_amount
+                .checked_sub(budget)
+                .and_then(|target| i64::try_from(target).ok())
+                .ok_or_else(|| {
+                    AppError::ClaimError("mixed reverse funded target is invalid".into())
+                })?;
+            if expected_target != swap.amount_sat || net_settlement_sat != swap.amount_sat {
+                return Err(AppError::ClaimError(
+                    "mixed reverse funded source no longer equals invoice target plus claim fee"
+                        .into(),
+                ));
+            }
+        }
         let basis = bull_bitcoin_settlement::MixedClaimBasis {
             net_settlement_sat,
             additional_output_script_len: confidential_liquid_script_len(&output_address)?,
+            provider_only,
         };
         bull_bitcoin_settlement::prepare_reverse_mixed_settlement_on_locked_connection(
             state,
@@ -3152,6 +3189,12 @@ async fn prepare_chain_mixed_claim(
             &builder_fee,
         )
         .await?;
+        validate_funded_mixed_claim_fee(
+            "mixed chain claim",
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+            claim_fee_sat,
+        )?;
         let net_settlement_sat = source_total_sat
             .checked_sub(claim_fee_sat)
             .and_then(|amount| i64::try_from(amount).ok())
@@ -3159,9 +3202,28 @@ async fn prepare_chain_mixed_claim(
             .ok_or_else(|| {
                 AppError::ClaimError("mixed chain claim has no positive net settlement".into())
             })?;
+        if let Some(budget) = pinned_mixed_claim_fee_budget(
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )? {
+            let expected_target = u64::try_from(swap.server_lock_amount_sat)
+                .ok()
+                .and_then(|source| source.checked_sub(budget))
+                .and_then(|target| i64::try_from(target).ok())
+                .ok_or_else(|| {
+                    AppError::ClaimError("mixed chain funded target is invalid".into())
+                })?;
+            if net_settlement_sat != expected_target {
+                return Err(AppError::ClaimError(
+                    "mixed chain funded source no longer equals invoice target plus claim fee"
+                        .into(),
+                ));
+            }
+        }
         let basis = bull_bitcoin_settlement::MixedClaimBasis {
             net_settlement_sat,
             additional_output_script_len: confidential_liquid_script_len(&output_address)?,
+            provider_only: false,
         };
         bull_bitcoin_settlement::prepare_chain_mixed_settlement_on_locked_connection(
             state,
@@ -3617,9 +3679,11 @@ async fn claim_swap_inner(
             MixedSettlementPreparation::BullBitcoinOutput {
                 confidential_address,
                 bull_bitcoin_amount_sat,
+                provider_only,
                 ..
             } => {
                 !had_persisted_claim
+                    && (settlement.purpose == "provider_only") == *provider_only
                     && settlement.provider_state == "bound"
                     && settlement.funding_route.is_none()
                     && settlement.funding_committed_at_unix.is_none()
@@ -3629,9 +3693,11 @@ async fn claim_swap_inner(
             }
             MixedSettlementPreparation::Journaled {
                 bull_bitcoin_amount_sat,
+                provider_only,
                 ..
             } => {
                 had_persisted_claim
+                    && (settlement.purpose == "provider_only") == *provider_only
                     && settlement.provider_state == "bound"
                     && settlement.funding_route.as_deref() == Some("bull_bitcoin")
                     && settlement.funding_committed_at_unix.is_some()
@@ -3646,19 +3712,31 @@ async fn claim_swap_inner(
         }
     }
 
-    let mixed_output_is_authorized = matches!(
+    let provider_output_is_authorized = matches!(
         mixed_preparation.as_ref(),
         Some(
             MixedSettlementPreparation::BullBitcoinOutput { .. }
                 | MixedSettlementPreparation::Journaled { .. }
         )
     );
-    let merchant_blinding_key_hex = if mixed_output_is_authorized {
+    let provider_only_output = matches!(
+        mixed_preparation.as_ref(),
+        Some(
+            MixedSettlementPreparation::BullBitcoinOutput {
+                provider_only: true,
+                ..
+            } | MixedSettlementPreparation::Journaled {
+                provider_only: true,
+                ..
+            }
+        )
+    );
+    let merchant_blinding_key_hex = if provider_output_is_authorized && !provider_only_output {
         Some(resolve_claim_blinding_key_hex(&mut tx, &swap, &output_address).await?)
     } else {
         None
     };
-    let reverse_response = if mixed_output_is_authorized {
+    let reverse_response = if provider_output_is_authorized {
         let response_json = swap.boltz_response_json.as_deref().ok_or_else(|| {
             AppError::ClaimError("mixed reverse swap has no Boltz response".into())
         })?;
@@ -3670,7 +3748,7 @@ async fn claim_swap_inner(
     } else {
         None
     };
-    let mixed_backend = if mixed_output_is_authorized {
+    let mixed_backend = if provider_output_is_authorized {
         Some(utxo_backend.ok_or_else(|| {
             AppError::ClaimError(
                 "Liquid source-evidence backend is unavailable for mixed settlement".into(),
@@ -3700,6 +3778,7 @@ async fn claim_swap_inner(
                     settlement_id,
                     bull_bitcoin_amount_sat,
                     fiat_percentage,
+                    provider_only,
                 }) = mixed_preparation.as_ref()
                 {
                     let stored_outputs =
@@ -3726,28 +3805,42 @@ async fn claim_swap_inner(
                                 "mixed reverse lockup blinding key is missing".into(),
                             )
                         })?;
-                    let verified = verify_mixed_claim_evidence(
-                        &claim_tx,
-                        &output_address,
-                        merchant_blinding_key_hex.as_deref().ok_or_else(|| {
-                            AppError::ClaimError(
-                                "journaled mixed reverse claim lacks its merchant blinding key"
-                                    .into(),
-                            )
-                        })?,
-                        &response.lockup_address,
-                        source_blinding_key,
-                        mixed_backend.ok_or_else(|| {
-                            AppError::ClaimError(
-                                "journaled mixed reverse claim lacks its evidence backend".into(),
-                            )
-                        })?,
-                        BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
-                        *bull_bitcoin_amount_sat,
-                        *fiat_percentage,
-                    )
-                    .await?;
-                    require_exact_mixed_claim_evidence(&stored_outputs, &verified)?;
+                    let backend = mixed_backend.ok_or_else(|| {
+                        AppError::ClaimError(
+                            "journaled swap-backed fiat claim lacks its evidence backend".into(),
+                        )
+                    })?;
+                    if *provider_only {
+                        let verified = verify_provider_only_claim_evidence(
+                            &claim_tx,
+                            &response.lockup_address,
+                            source_blinding_key,
+                            backend,
+                            BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
+                            *bull_bitcoin_amount_sat,
+                        )
+                        .await?;
+                        require_exact_provider_only_claim_evidence(&stored_outputs, &verified)?;
+                    } else {
+                        let verified = verify_mixed_claim_evidence(
+                            &claim_tx,
+                            &output_address,
+                            merchant_blinding_key_hex.as_deref().ok_or_else(|| {
+                                AppError::ClaimError(
+                                    "journaled mixed reverse claim lacks its merchant blinding key"
+                                        .into(),
+                                )
+                            })?,
+                            &response.lockup_address,
+                            source_blinding_key,
+                            backend,
+                            BullBitcoinOutputAuthority::JournaledScript(bull_bitcoin_script),
+                            *bull_bitcoin_amount_sat,
+                            *fiat_percentage,
+                        )
+                        .await?;
+                        require_exact_mixed_claim_evidence(&stored_outputs, &verified)?;
+                    }
                 }
                 claim_tx
             }
@@ -3764,11 +3857,24 @@ async fn claim_swap_inner(
         //     a known cooperative-refusal error (below).
         // Once it flips, the row stays on script-path forever — no
         // ping-pong. `cooperative_refused` is a one-way flag.
-        let use_cooperative = !swap.cooperative_refused;
+        let use_cooperative = mixed_claim_uses_cooperative(
+            swap.cooperative_refused,
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )?;
+        let claim_output_address = match mixed_preparation.as_ref() {
+            Some(MixedSettlementPreparation::BullBitcoinOutput {
+                confidential_address,
+                provider_only: true,
+                ..
+            }) => confidential_address.as_str(),
+            _ => output_address.as_str(),
+        };
         let additional_output = match mixed_preparation.as_ref() {
             Some(MixedSettlementPreparation::BullBitcoinOutput {
                 confidential_address,
                 bull_bitcoin_amount_sat,
+                provider_only: false,
                 ..
             }) => Some((
                 confidential_address.as_str(),
@@ -3780,7 +3886,7 @@ async fn claim_swap_inner(
         };
         let first_construction = construct_claim_tx(
             &swap,
-            &output_address,
+            claim_output_address,
             claim_clients,
             boltz_url,
             &fee_decision,
@@ -3855,10 +3961,11 @@ async fn claim_swap_inner(
             actual_vbytes,
             fee_record,
         )?;
-        let fresh_mixed_evidence = if let Some(MixedSettlementPreparation::BullBitcoinOutput {
+        let fresh_provider_evidence = if let Some(MixedSettlementPreparation::BullBitcoinOutput {
             confidential_address,
             bull_bitcoin_amount_sat,
             fiat_percentage,
+            provider_only,
             ..
         }) = mixed_preparation.as_ref()
         {
@@ -3868,28 +3975,43 @@ async fn claim_swap_inner(
             let source_blinding_key = response.blinding_key.as_deref().ok_or_else(|| {
                 AppError::ClaimError("mixed reverse lockup blinding key is missing".into())
             })?;
-            Some(
-                verify_mixed_claim_evidence(
-                    &constructed,
-                    &output_address,
-                    merchant_blinding_key_hex.as_deref().ok_or_else(|| {
-                        AppError::ClaimError(
-                            "fresh mixed reverse claim lacks its merchant blinding key".into(),
-                        )
-                    })?,
-                    &response.lockup_address,
-                    source_blinding_key,
-                    mixed_backend.ok_or_else(|| {
-                        AppError::ClaimError(
-                            "fresh mixed reverse claim lacks its evidence backend".into(),
-                        )
-                    })?,
-                    BullBitcoinOutputAuthority::FreshAddress(confidential_address),
-                    *bull_bitcoin_amount_sat,
-                    *fiat_percentage,
+            let backend = mixed_backend.ok_or_else(|| {
+                AppError::ClaimError(
+                    "fresh swap-backed fiat claim lacks its evidence backend".into(),
                 )
-                .await?,
-            )
+            })?;
+            if *provider_only {
+                Some(VerifiedProviderFunding::ProviderOnly(
+                    verify_provider_only_claim_evidence(
+                        &constructed,
+                        &response.lockup_address,
+                        source_blinding_key,
+                        backend,
+                        BullBitcoinOutputAuthority::FreshAddress(confidential_address),
+                        *bull_bitcoin_amount_sat,
+                    )
+                    .await?,
+                ))
+            } else {
+                Some(VerifiedProviderFunding::Mixed(
+                    verify_mixed_claim_evidence(
+                        &constructed,
+                        &output_address,
+                        merchant_blinding_key_hex.as_deref().ok_or_else(|| {
+                            AppError::ClaimError(
+                                "fresh mixed reverse claim lacks its merchant blinding key".into(),
+                            )
+                        })?,
+                        &response.lockup_address,
+                        source_blinding_key,
+                        backend,
+                        BullBitcoinOutputAuthority::FreshAddress(confidential_address),
+                        *bull_bitcoin_amount_sat,
+                        *fiat_percentage,
+                    )
+                    .await?,
+                ))
+            }
         } else {
             None
         };
@@ -3972,7 +4094,7 @@ async fn claim_swap_inner(
                 swap.id
             )));
         }
-        if let Some(verified) = fresh_mixed_evidence.as_ref() {
+        if let Some(verified) = fresh_provider_evidence.as_ref() {
             let settlement_id = match mixed_preparation.as_ref() {
                 Some(MixedSettlementPreparation::BullBitcoinOutput { settlement_id, .. }) => {
                     *settlement_id
@@ -3983,13 +4105,36 @@ async fn claim_swap_inner(
                     ))
                 }
             };
-            let merchant = new_bull_bitcoin_claim_output(&verified.merchant);
-            let bull_bitcoin = new_bull_bitcoin_claim_output(&verified.bull_bitcoin);
-            db::commit_mixed_bull_bitcoin_funding(&mut tx, settlement_id, &merchant, &bull_bitcoin)
-                .await
-                .map_err(|error| {
-                    AppError::DbError(format!("commit mixed reverse claim evidence: {error}"))
-                })?;
+            match verified {
+                VerifiedProviderFunding::Mixed(verified) => {
+                    let merchant = new_bull_bitcoin_claim_output(&verified.merchant);
+                    let bull_bitcoin = new_bull_bitcoin_claim_output(&verified.bull_bitcoin);
+                    db::commit_mixed_bull_bitcoin_funding(
+                        &mut tx,
+                        settlement_id,
+                        &merchant,
+                        &bull_bitcoin,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AppError::DbError(format!("commit mixed reverse claim evidence: {error}"))
+                    })?;
+                }
+                VerifiedProviderFunding::ProviderOnly(verified) => {
+                    let bull_bitcoin = new_bull_bitcoin_claim_output(&verified.bull_bitcoin);
+                    db::commit_provider_only_bull_bitcoin_funding(
+                        &mut tx,
+                        settlement_id,
+                        &bull_bitcoin,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AppError::DbError(format!(
+                            "commit provider-only reverse claim evidence: {error}"
+                        ))
+                    })?;
+                }
+            }
         }
         constructed
     };
@@ -4392,6 +4537,121 @@ struct PreparedChainClaimJournal {
     fee_rate_sat_vb: f64,
 }
 
+async fn load_provider_only_claim_sources(
+    claim_tx: &BtcLikeTransaction,
+    source_lockup_address: &str,
+    source_blinding_key_hex: &str,
+    backend: &Arc<dyn UtxoBackend>,
+) -> Result<(Vec<boltz_elements::TxOut>, u64), AppError> {
+    let BtcLikeTransaction::Liquid(transaction) = claim_tx else {
+        return Err(AppError::ClaimError(
+            "provider-only claim construction returned a non-Liquid transaction".into(),
+        ));
+    };
+    if transaction.input.is_empty() || transaction.input.len() > MAX_MERCHANT_OUTPUT_SOURCE_PREVOUTS
+    {
+        return Err(AppError::ClaimError(
+            "provider-only claim transaction has an invalid source count".into(),
+        ));
+    }
+    let source_address =
+        boltz_elements::Address::from_str(source_lockup_address).map_err(|error| {
+            AppError::ClaimError(format!("invalid committed Liquid lockup address: {error}"))
+        })?;
+    if source_address.params != &boltz_elements::AddressParams::LIQUID
+        || source_address.blinding_pubkey.is_none()
+    {
+        return Err(AppError::ClaimError(
+            "committed Liquid lockup address is not confidential mainnet".into(),
+        ));
+    }
+    let source_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::from_str(
+        source_blinding_key_hex,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "invalid committed Liquid lockup blinding key: {error}"
+        ))
+    })?;
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let source_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &source_blinding_key);
+    if source_address.blinding_pubkey != Some(source_blinding_pubkey) {
+        return Err(AppError::ClaimError(
+            "committed Liquid lockup blinding key does not match its address".into(),
+        ));
+    }
+    let source_script = source_address.script_pubkey();
+    let mut source_outpoints = Vec::with_capacity(transaction.input.len());
+    let mut source_outputs = Vec::with_capacity(transaction.input.len());
+    let mut total_source_sat = 0u64;
+    for input in &transaction.input {
+        if input.is_pegin || !input.asset_issuance.is_null() {
+            return Err(AppError::ClaimError(
+                "provider-only claim contains an unsupported source input".into(),
+            ));
+        }
+        let source_txid = input.previous_output.txid.to_string();
+        let source_vout = input.previous_output.vout;
+        if source_outpoints
+            .iter()
+            .any(|(txid, vout)| txid == &source_txid && *vout == source_vout)
+        {
+            return Err(AppError::ClaimError(
+                "provider-only claim repeats a source outpoint".into(),
+            ));
+        }
+        source_outpoints.push((source_txid.clone(), source_vout));
+        let raw_source = backend.get_raw_tx(&source_txid).await?;
+        if raw_source.is_empty() || raw_source.len() > MAX_MERCHANT_OUTPUT_RAW_TRANSACTION_BYTES {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source transaction {source_txid} exceeds the journal bounds"
+            )));
+        }
+        let source_transaction: boltz_elements::Transaction =
+            boltz_elements::encode::deserialize(&raw_source).map_err(|error| {
+                AppError::ClaimError(format!(
+                    "decode Liquid claim source transaction {source_txid}: {error}"
+                ))
+            })?;
+        if source_transaction.txid() != input.previous_output.txid {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source bytes do not match txid {source_txid}"
+            )));
+        }
+        let source_output = source_transaction
+            .output
+            .get(source_vout as usize)
+            .ok_or_else(|| {
+                AppError::ClaimError(format!(
+                    "Liquid claim source {source_txid}:{source_vout} has no such output"
+                ))
+            })?;
+        if source_output.script_pubkey != source_script {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source {source_txid}:{source_vout} is not the committed lockup script"
+            )));
+        }
+        let opened = source_output
+            .unblind(&secp, source_blinding_key)
+            .map_err(|error| {
+                AppError::ClaimError(format!(
+                    "unblind Liquid claim source {source_txid}:{source_vout}: {error}"
+                ))
+            })?;
+        if opened.asset != boltz_elements::AssetId::LIQUID_BTC || opened.value == 0 {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source {source_txid}:{source_vout} has the wrong asset or amount"
+            )));
+        }
+        total_source_sat = total_source_sat
+            .checked_add(opened.value)
+            .ok_or_else(|| AppError::ClaimError("Liquid claim source amount overflow".into()))?;
+        source_outputs.push(source_output.clone());
+    }
+    Ok((source_outputs, total_source_sat))
+}
+
 fn ensure_chain_claim_journal_fee_matches_actual(
     journal_fee_amount_sat: u64,
     journal_fee_rate_sat_vb: f64,
@@ -4670,6 +4930,50 @@ enum BullBitcoinOutputAuthority<'a> {
     JournaledScript(&'a str),
 }
 
+enum VerifiedProviderFunding {
+    Mixed(VerifiedMixedClaim),
+    ProviderOnly(bull_bitcoin_claim::VerifiedProviderOnlyClaim),
+}
+
+async fn verify_provider_only_claim_evidence(
+    claim_tx: &BtcLikeTransaction,
+    source_lockup_address: &str,
+    source_blinding_key_hex: &str,
+    backend: &Arc<dyn UtxoBackend>,
+    bull_bitcoin_authority: BullBitcoinOutputAuthority<'_>,
+    bull_bitcoin_amount_sat: i64,
+) -> Result<bull_bitcoin_claim::VerifiedProviderOnlyClaim, AppError> {
+    let (source_outputs, source_total_sat) = load_provider_only_claim_sources(
+        claim_tx,
+        source_lockup_address,
+        source_blinding_key_hex,
+        backend,
+    )
+    .await?;
+    let verified = match bull_bitcoin_authority {
+        BullBitcoinOutputAuthority::FreshAddress(address) => {
+            bull_bitcoin_claim::verify_provider_only_liquid_claim(
+                claim_tx,
+                &source_outputs,
+                source_total_sat,
+                address,
+                bull_bitcoin_amount_sat,
+            )
+        }
+        BullBitcoinOutputAuthority::JournaledScript(script_pubkey_hex) => {
+            bull_bitcoin_claim::verify_provider_only_liquid_claim_for_script(
+                claim_tx,
+                &source_outputs,
+                source_total_sat,
+                script_pubkey_hex,
+                bull_bitcoin_amount_sat,
+            )
+        }
+    }
+    .map_err(|error| AppError::ClaimError(format!("verify provider-only Liquid claim: {error}")))?;
+    Ok(verified)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn verify_mixed_claim_evidence(
     claim_tx: &BtcLikeTransaction,
@@ -4819,6 +5123,32 @@ fn require_exact_mixed_claim_evidence(
     {
         return Err(AppError::ClaimError(
             "persisted mixed-claim evidence does not match exact claim bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_provider_only_claim_evidence(
+    stored: &[db::StoredBullBitcoinClaimOutput],
+    verified: &bull_bitcoin_claim::VerifiedProviderOnlyClaim,
+) -> Result<(), AppError> {
+    let expected = &verified.bull_bitcoin;
+    if stored.len() != 1
+        || stored.first().is_none_or(|stored| {
+            stored.role != expected.role
+                || stored.txid != expected.txid
+                || stored.vout != expected.vout
+                || stored.script_pubkey_hex != expected.script_pubkey_hex
+                || stored.authorized_amount_sat != expected.authorized_amount_sat
+                || stored.asset_commitment_sha256 != expected.asset_commitment_sha256
+                || stored.value_commitment_sha256 != expected.value_commitment_sha256
+                || stored.nonce_commitment_sha256 != expected.nonce_commitment_sha256
+                || stored.surjection_proof_sha256 != expected.surjection_proof_sha256
+                || stored.rangeproof_sha256 != expected.rangeproof_sha256
+        })
+    {
+        return Err(AppError::ClaimError(
+            "persisted provider-only claim evidence does not match exact claim bytes".into(),
         ));
     }
     Ok(())
@@ -5148,7 +5478,11 @@ async fn claim_chain_swap_inner(
         // expiry is interpreted by the shared evidence reducer and cannot flip
         // this execution selector by itself. One-way flag, so no
         // cooperative/script ping-pong. Mirrors claim_swap_inner (reverse path).
-        let use_cooperative = !swap.cooperative_refused;
+        let use_cooperative = mixed_claim_uses_cooperative(
+            swap.cooperative_refused,
+            swap.mixed_claim_path.as_deref(),
+            swap.mixed_claim_fee_budget_sat,
+        )?;
         let additional_output = match mixed_preparation.as_ref() {
             Some(MixedSettlementPreparation::BullBitcoinOutput {
                 confidential_address,
@@ -5270,6 +5604,7 @@ async fn claim_chain_swap_inner(
             settlement_id,
             bull_bitcoin_amount_sat,
             fiat_percentage,
+            ..
         }) => {
             let stored_outputs = db::load_bull_bitcoin_claim_outputs(&mut *tx, *settlement_id)
                 .await
@@ -5702,13 +6037,68 @@ fn exact_relative_fee_sat(
     vsize: usize,
     fee_decision: &LiquidBuilderFeeDecision,
 ) -> Result<u64, AppError> {
-    let fee = vsize as f64 * fee_decision.rate().as_f64();
+    exact_liquid_fee_sat(vsize, fee_decision.rate())
+}
+
+fn exact_liquid_fee_sat(vsize: usize, rate: SatPerVbyte) -> Result<u64, AppError> {
+    let fee = vsize as f64 * rate.as_f64();
     if vsize == 0 || !fee.is_finite() || fee <= 0.0 || fee.ceil() > u64::MAX as f64 {
         return Err(AppError::ClaimError(
             "Liquid claim fee estimate is outside the supported range".into(),
         ));
     }
     Ok(fee.ceil() as u64)
+}
+
+/// Reserve enough source value for either supported mixed claim path before a
+/// payer instruction is exposed. The live claim still records and verifies
+/// its exact actual fee; this value is a payer-side source budget, not an
+/// accounting credit or tolerance.
+pub(crate) fn mixed_liquid_claim_fee_budget_sat(
+    decision: &LiquidFeeDecision,
+) -> Result<u64, AppError> {
+    exact_liquid_fee_sat(MIXED_SCRIPT_CLAIM_DISCOUNT_VBYTES, decision.rate())
+}
+
+fn pinned_mixed_claim_fee_budget(
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+) -> Result<Option<u64>, AppError> {
+    match (path, budget_sat) {
+        (None, None) => Ok(None),
+        (Some("script"), Some(budget_sat)) if budget_sat > 0 => {
+            u64::try_from(budget_sat).map(Some).map_err(|_| {
+                AppError::ClaimError("mixed claim fee budget exceeds supported range".into())
+            })
+        }
+        _ => Err(AppError::ClaimError(
+            "mixed claim has incomplete or unsupported funded fee authority".into(),
+        )),
+    }
+}
+
+fn mixed_claim_uses_cooperative(
+    cooperative_refused: bool,
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+) -> Result<bool, AppError> {
+    Ok(pinned_mixed_claim_fee_budget(path, budget_sat)?.is_none() && !cooperative_refused)
+}
+
+fn validate_funded_mixed_claim_fee(
+    context: &str,
+    path: Option<&str>,
+    budget_sat: Option<i64>,
+    actual_fee_sat: u64,
+) -> Result<(), AppError> {
+    if let Some(budget_sat) = pinned_mixed_claim_fee_budget(path, budget_sat)? {
+        if actual_fee_sat != budget_sat {
+            return Err(AppError::ClaimError(format!(
+                "{context} requires {actual_fee_sat} sat but its payer-funded authority is {budget_sat} sat; explicit repricing or fee-bump policy is required"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn confidential_liquid_script_len(address: &str) -> Result<usize, AppError> {
@@ -5733,6 +6123,7 @@ async fn estimate_reverse_mixed_claim_fee_sat(
     claim_clients: &LiquidClaimClientFactory,
     boltz_url: &str,
     fee_decision: &LiquidBuilderFeeDecision,
+    provider_only: bool,
 ) -> Result<u64, AppError> {
     let claim_key_hex = swap
         .claim_key_hex
@@ -5760,13 +6151,19 @@ async fn estimate_reverse_mixed_claim_fee_sat(
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
-    let options = TransactionOptions::default()
-        .with_cooperative(!swap.cooperative_refused)
-        .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
+    let use_cooperative = mixed_claim_uses_cooperative(
+        swap.cooperative_refused,
+        swap.mixed_claim_path.as_deref(),
+        swap.mixed_claim_fee_budget_sat,
+    )?;
+    let mut options = TransactionOptions::default().with_cooperative(use_cooperative);
+    if !provider_only {
+        options = options.with_additional_outputs(vec![(output_address.to_owned(), 1)]);
+    }
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: output_address.to_owned(),
-        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        fee: liquid_claim_fee(fee_decision, use_cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
@@ -5901,14 +6298,19 @@ async fn estimate_chain_mixed_claim_fee_sat(
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
+    let use_cooperative = mixed_claim_uses_cooperative(
+        swap.cooperative_refused,
+        swap.mixed_claim_path.as_deref(),
+        swap.mixed_claim_fee_budget_sat,
+    )?;
     let options = TransactionOptions::default()
         .with_chain_claim(refund_keypair, lockup_script)
-        .with_cooperative(!swap.cooperative_refused)
+        .with_cooperative(use_cooperative)
         .with_additional_outputs(vec![(output_address.to_owned(), 1)]);
     let params = SwapTransactionParams {
         keys: claim_keypair,
         output_address: output_address.to_owned(),
-        fee: liquid_claim_fee(fee_decision, !swap.cooperative_refused),
+        fee: liquid_claim_fee(fee_decision, use_cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,

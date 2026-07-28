@@ -442,7 +442,7 @@ fn project_merchant_settlement(
     };
 
     match transaction.settlement_purpose.as_deref() {
-        Some("fiat_only") => (
+        Some("fiat_only" | "provider_only") => (
             GetPaidSettlementKind::Fiat,
             Some(GetPaidSettlementDetails::Fiat {
                 fiat_percentage,
@@ -759,6 +759,15 @@ mod tests {
             fiat["settlement_details"]["fiat"][0]["execution_rate_minor_per_btc"],
             6_390_000
         );
+
+        let mut provider_only = settlement_transaction();
+        provider_only.settlement_purpose = Some("provider_only".into());
+        let provider_only =
+            serde_json::to_value(project_transaction(provider_only).unwrap()).unwrap();
+        assert_eq!(provider_only["settlement_kind"], "fiat");
+        assert_eq!(provider_only["settlement_details"]["kind"], "fiat");
+        assert_eq!(provider_only["settlement_details"]["fiat_percentage"], 100);
+        assert!(provider_only["settlement_details"].get("bitcoin").is_none());
 
         let mut sat_priced = settlement_transaction();
         sat_priced.creation_rate_minor_per_btc = None;

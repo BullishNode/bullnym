@@ -20,8 +20,23 @@ dependency health separately.
   candidate emits `bull_bitcoin_create_correlation_required`;
 - unfunded-provider-watch depth, oldest due age, and reconciliation delay,
   separate from funded payout-pending work;
+- exact-order provider reads split into transient failures, temporary
+  authenticated `NotFound`, unverified `NotFound`, authentication failures,
+  persistent-missing escalations, low-cadence persistent watches, and successful
+  recovery; alert on persistent holds and page immediately when any such hold
+  has local money evidence. Use the stable event names
+  `bull_bitcoin_provider_order_temporarily_not_found`,
+  `bull_bitcoin_provider_order_not_found_unverified`,
+  `bull_bitcoin_provider_order_read_authentication_failure`,
+  `bull_bitcoin_provider_order_persistently_missing`,
+  `bull_bitcoin_provider_order_persistent_missing_watch`, and
+  `bull_bitcoin_provider_order_missing_resolved`;
 - `money_admission_creation_circuit_changed` state/reason transitions and its
   monotonic provider-creation transition count;
+- `chain_provider_limits_startup_*` and `chain_provider_limits_refresh_*`
+  outcomes. Alert when the exact BTC-to-L-BTC chain snapshot remains missing,
+  invalid, or stale long enough to hide Bitcoin from otherwise payable
+  checkouts; do not substitute reverse-swap limits;
 - Bitcoin and Liquid direct-watcher recent/historical backlog counts,
   oldest-due timestamps, and lag from each frozen lane-start log;
 - descriptor allocation failures and uniqueness violations;
@@ -29,6 +44,10 @@ dependency health separately.
 - funded fiat-only Bull Bitcoin rows retaining a payer instruction (must stay
   zero), and attempts to quote or reserve a second payer intent after provider
   funds are observed;
+- swap-backed `provider_only` rows by reserved/dispatch/bound/funded/final
+  phase, time from Boltz funding to provider binding, and any funded row whose
+  immutable journal is not exactly one Bull Bitcoin vout-0 output (must stay
+  zero);
 - fiat-fixed Bull Bitcoin payment events without immutable quote valuation,
   split by legacy-unattributable and current-schema rows (the latter must stay
   zero);

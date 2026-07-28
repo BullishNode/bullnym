@@ -52,6 +52,17 @@ recovery commitment and the request is bound to it. Do not work around either
 the fee or recovery boundary with certification, an IP whitelist, or a
 temporary runtime override.
 
+Bull Bitcoin exact-order reads use
+`provider_not_found_escalation_attempts` (default `3`) together with
+`provider_not_found_escalation_secs` (default `120`). Both thresholds and a
+successful authenticated provider preflight are required before a bound order
+enters the persistent-missing integrity hold. A failed preflight breaks the
+qualifying streak rather than contributing evidence toward the hold. Keep the low-cadence
+`late_payment_watch_interval_secs` comfortably above the ordinary reconcile
+interval; it also bounds polling for an escalated missing-order hold. These
+settings suppress stale payer admission and reduce retry noise. They never
+authorize order abandonment or replacement.
+
 Do not enable broad IP or certification bypasses for ordinary internet traffic.
 After every configuration change, call `/ready` and exercise a non-monetary
 preflight before allowing payment traffic.

@@ -1,4 +1,4 @@
-//! Pure provider-limit contract for truthful Lightning Address offers.
+//! Pure provider-limit contracts for truthful Lightning and Bitcoin offers.
 //!
 //! Metadata and the later creation callback must each use a fresh, validated
 //! snapshot of the exact BTC -> L-BTC reverse pair. This module deliberately
@@ -9,12 +9,14 @@
 //! no reverse-pair zero-conf field. [`ProviderZeroConfLimit`] keeps that absence
 //! explicit. Standard reverse offers may use the validated minimum/maximum;
 //! only a caller that requires zero-conf fails when it was not reported by the
-//! same authoritative observation. Chain/submarine limits must not be borrowed.
+//! same authoritative observation. The Bitcoin payer rail uses its own exact
+//! BTC -> L-BTC chain-pair snapshot; neither endpoint's limits may be borrowed
+//! for the other.
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use boltz_client::swaps::boltz::ReversePair;
+use boltz_client::swaps::boltz::{ChainPair, ReversePair};
 
 const MSAT_PER_SAT: u64 = 1_000;
 
@@ -277,6 +279,131 @@ pub enum ReversePairSnapshotState {
     Available(ReversePairSnapshot),
 }
 
+/// Validated, privacy-safe limits for exactly the BTC -> L-BTC chain pair.
+///
+/// This is deliberately separate from [`ReversePairSnapshot`]. Boltz exposes
+/// different minimums for chain and reverse swaps, and borrowing the reverse
+/// minimum would make the payer UI advertise a Bitcoin amount that the chain
+/// endpoint will deterministically reject (or hide one it accepts).
+#[derive(Debug, Clone)]
+pub struct ChainPairSnapshot {
+    minimum_sat: u64,
+    maximum_sat: u64,
+    server_miner_fee_sat: u64,
+    percentage_fee: f64,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainPairValidationError {
+    ExactPairMissing,
+    InvalidPairHash,
+    InvalidPairRate,
+    MinimumIsZero,
+    MaximumBelowMinimum,
+    InvalidPercentageFee,
+}
+
+impl fmt::Display for ChainPairValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::ExactPairMissing => "exact_pair_missing",
+            Self::InvalidPairHash => "invalid_pair_hash",
+            Self::InvalidPairRate => "invalid_pair_rate",
+            Self::MinimumIsZero => "minimum_is_zero",
+            Self::MaximumBelowMinimum => "maximum_below_minimum",
+            Self::InvalidPercentageFee => "invalid_percentage_fee",
+        };
+        formatter.write_str(code)
+    }
+}
+
+impl std::error::Error for ChainPairValidationError {}
+
+#[derive(Debug, Clone, Default)]
+pub enum ChainPairSnapshotState {
+    #[default]
+    Missing,
+    Invalid(ChainPairValidationError),
+    Available(ChainPairSnapshot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainAmountEligibility {
+    Eligible,
+    BelowMinimum,
+    AboveMaximum,
+    SnapshotUnavailable,
+}
+
+impl ChainPairSnapshotState {
+    pub fn from_pair(pair: ChainPair, observed_at: Instant) -> Self {
+        let invalid = if !is_lower_hex_32(&pair.hash) {
+            Some(ChainPairValidationError::InvalidPairHash)
+        } else if pair.rate.to_bits() != 1.0_f64.to_bits() {
+            Some(ChainPairValidationError::InvalidPairRate)
+        } else if pair.limits.minimal == 0 {
+            Some(ChainPairValidationError::MinimumIsZero)
+        } else if pair.limits.maximal < pair.limits.minimal {
+            Some(ChainPairValidationError::MaximumBelowMinimum)
+        } else if !pair.fees.percentage.is_finite() || !(0.0..100.0).contains(&pair.fees.percentage)
+        {
+            Some(ChainPairValidationError::InvalidPercentageFee)
+        } else {
+            None
+        };
+
+        match invalid {
+            Some(error) => Self::Invalid(error),
+            None => Self::Available(ChainPairSnapshot {
+                minimum_sat: pair.limits.minimal,
+                maximum_sat: pair.limits.maximal,
+                server_miner_fee_sat: pair.fees.miner_fees.server,
+                percentage_fee: pair.fees.percentage,
+                observed_at,
+            }),
+        }
+    }
+
+    pub fn amount_eligibility(
+        &self,
+        merchant_amount_sat: u64,
+        additional_server_lock_sat: u64,
+        now: Instant,
+        maximum_age: Duration,
+    ) -> ChainAmountEligibility {
+        let Self::Available(snapshot) = self else {
+            return ChainAmountEligibility::SnapshotUnavailable;
+        };
+        let Some(age) = now.checked_duration_since(snapshot.observed_at) else {
+            return ChainAmountEligibility::SnapshotUnavailable;
+        };
+        if age > maximum_age {
+            return ChainAmountEligibility::SnapshotUnavailable;
+        }
+        let Some(server_lock_sat) = merchant_amount_sat.checked_add(additional_server_lock_sat)
+        else {
+            return ChainAmountEligibility::AboveMaximum;
+        };
+        let Some(numerator) = server_lock_sat.checked_add(snapshot.server_miner_fee_sat) else {
+            return ChainAmountEligibility::AboveMaximum;
+        };
+        let denominator = 1.0 - snapshot.percentage_fee / 100.0;
+        let payer_amount_sat = ((numerator as f64) / denominator).ceil();
+        if !payer_amount_sat.is_finite() || payer_amount_sat > u64::MAX as f64 {
+            return ChainAmountEligibility::AboveMaximum;
+        }
+        let payer_amount_sat = payer_amount_sat as u64;
+        if payer_amount_sat < snapshot.minimum_sat {
+            ChainAmountEligibility::BelowMinimum
+        } else if payer_amount_sat > snapshot.maximum_sat {
+            ChainAmountEligibility::AboveMaximum
+        } else {
+            ChainAmountEligibility::Eligible
+        }
+    }
+}
+
 impl ReversePairSnapshotState {
     pub fn from_observation(observation: ReversePairObservation) -> Self {
         match observation.validate() {
@@ -378,13 +505,39 @@ pub fn fixed_checkout_reverse_quote(
     now: Instant,
     maximum_age: Duration,
 ) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
+    fixed_checkout_reverse_quote_with_claim_fee_budget(
+        state,
+        merchant_amount_sat,
+        None,
+        now,
+        maximum_age,
+    )
+}
+
+/// Price a fixed checkout while reserving an explicit Liquid claim budget.
+///
+/// Ordinary one-output claims use the provider packet's claim fee. Mixed
+/// claims pass the larger locally-authorized two-output fee so adding the
+/// provider output cannot reduce the immutable merchant target. The provider
+/// fee remains a floor: callers can never use this seam to undercut the pair
+/// packet that was accepted for the request.
+pub fn fixed_checkout_reverse_quote_with_claim_fee_budget(
+    state: &ReversePairSnapshotState,
+    merchant_amount_sat: u64,
+    claim_fee_budget_sat: Option<u64>,
+    now: Instant,
+    maximum_age: Duration,
+) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
     if merchant_amount_sat == 0 {
         return Err(FixedCheckoutReverseQuoteError::MerchantAmountZero);
     }
     let snapshot = current_snapshot(state, now, maximum_age)
         .map_err(FixedCheckoutReverseQuoteError::SnapshotUnavailable)?;
+    let claim_fee_budget_sat = claim_fee_budget_sat
+        .unwrap_or(snapshot.claim_fee_sat)
+        .max(snapshot.claim_fee_sat);
     let onchain_amount_sat = merchant_amount_sat
-        .checked_add(snapshot.claim_fee_sat)
+        .checked_add(claim_fee_budget_sat)
         .ok_or(FixedCheckoutReverseQuoteError::AmountOverflow)?;
     let numerator = onchain_amount_sat
         .checked_add(snapshot.lockup_fee_sat)
@@ -439,7 +592,7 @@ pub fn fixed_checkout_reverse_quote(
         merchant_amount_sat,
         payer_amount_sat,
         onchain_amount_sat,
-        claim_fee_budget_sat: snapshot.claim_fee_sat,
+        claim_fee_budget_sat,
     })
 }
 
@@ -548,10 +701,128 @@ pub fn revalidate_lightning_address_creation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boltz_client::swaps::boltz::{PairMinerFees, ReverseFees, ReverseLimits};
+    use boltz_client::swaps::boltz::{
+        ChainFees, ChainMinerFees, PairLimits, PairMinerFees, ReverseFees, ReverseLimits,
+    };
 
     const HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const FRESH_FOR: Duration = Duration::from_secs(30);
+
+    fn chain_pair(minimum_sat: u64, maximum_sat: u64) -> ChainPair {
+        ChainPair {
+            hash: HASH.to_owned(),
+            rate: 1.0,
+            limits: PairLimits {
+                minimal: minimum_sat,
+                maximal: maximum_sat,
+                maximal_zero_conf: maximum_sat,
+            },
+            fees: ChainFees {
+                percentage: 0.5,
+                miner_fees: ChainMinerFees {
+                    server: 20,
+                    user: PairMinerFees {
+                        lockup: 30,
+                        claim: 40,
+                    },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn exact_chain_pair_amount_boundaries_are_inclusive() {
+        let observed_at = Instant::now();
+        let state = ChainPairSnapshotState::from_pair(chain_pair(25_000, 1_000_000), observed_at);
+
+        assert_eq!(
+            state.amount_eligibility(24_854, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::BelowMinimum
+        );
+        assert_eq!(
+            state.amount_eligibility(24_855, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+        assert_eq!(
+            state.amount_eligibility(24_999, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+        assert_eq!(
+            state.amount_eligibility(994_981, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::AboveMaximum
+        );
+    }
+
+    #[test]
+    fn mixed_claim_budget_is_conserved_before_chain_limit_evaluation() {
+        let observed_at = Instant::now();
+        let state = ChainPairSnapshotState::from_pair(chain_pair(25_000, 1_000_000), observed_at);
+
+        // Pair pricing is ceil((server lock + 20) / 0.995). A 29-sat mixed
+        // claim budget raises this merchant amount from a 24,971-sat payer
+        // lock to exactly the inclusive 25,000-sat provider minimum.
+        assert_eq!(
+            state.amount_eligibility(24_826, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::BelowMinimum
+        );
+        assert_eq!(
+            state.amount_eligibility(24_826, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+
+        // The same budget must also count at the upper boundary. Without it
+        // the gross payer amount is 999,972 sats; with it the amount exceeds
+        // the provider maximum and admission must close before mutation.
+        assert_eq!(
+            state.amount_eligibility(994_952, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::Eligible
+        );
+        assert_eq!(
+            state.amount_eligibility(994_952, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::AboveMaximum
+        );
+
+        assert_eq!(
+            state.amount_eligibility(u64::MAX, 29, observed_at, FRESH_FOR),
+            ChainAmountEligibility::AboveMaximum
+        );
+    }
+
+    #[test]
+    fn chain_pair_missing_invalid_future_and_stale_snapshots_fail_closed() {
+        let observed_at = Instant::now();
+        assert_eq!(
+            ChainPairSnapshotState::Missing.amount_eligibility(25_000, 0, observed_at, FRESH_FOR),
+            ChainAmountEligibility::SnapshotUnavailable
+        );
+
+        let mut invalid = chain_pair(25_000, 1_000_000);
+        invalid.limits.minimal = 0;
+        assert!(matches!(
+            ChainPairSnapshotState::from_pair(invalid, observed_at),
+            ChainPairSnapshotState::Invalid(ChainPairValidationError::MinimumIsZero)
+        ));
+
+        let state = ChainPairSnapshotState::from_pair(chain_pair(25_000, 1_000_000), observed_at);
+        assert_eq!(
+            state.amount_eligibility(
+                25_000,
+                0,
+                observed_at + FRESH_FOR + Duration::from_nanos(1),
+                FRESH_FOR
+            ),
+            ChainAmountEligibility::SnapshotUnavailable
+        );
+        assert_eq!(
+            state.amount_eligibility(
+                25_000,
+                0,
+                observed_at.checked_sub(Duration::from_secs(1)).unwrap(),
+                FRESH_FOR
+            ),
+            ChainAmountEligibility::SnapshotUnavailable
+        );
+    }
 
     fn quote(minimum_sat: u64, maximum_sat: u64) -> ReversePair {
         ReversePair {
@@ -663,6 +934,41 @@ mod tests {
         assert_eq!(quote.payer_amount_sat(), 1_050);
         // ceil(1_050 * 0.25%) = 3; 1_050 - 3 - 27 = 1_020.
         assert_eq!(1_050 - 3 - 27, quote.onchain_amount_sat());
+    }
+
+    #[test]
+    fn mixed_fixed_checkout_reserves_the_larger_claim_budget_without_undercutting_provider_fee() {
+        let now = Instant::now();
+        let snapshot = state(
+            now,
+            100,
+            25_000_000,
+            ProviderZeroConfLimit::NotReportedByReversePairContract,
+        );
+        let mixed = fixed_checkout_reverse_quote_with_claim_fee_budget(
+            &snapshot,
+            1_000,
+            Some(29),
+            now,
+            FRESH_FOR,
+        )
+        .unwrap();
+        assert_eq!(mixed.merchant_amount_sat(), 1_000);
+        assert_eq!(mixed.claim_fee_budget_sat(), 29);
+        assert_eq!(mixed.onchain_amount_sat(), 1_029);
+        assert_eq!(mixed.payer_amount_sat(), 1_059);
+        assert_eq!(1_059 - 3 - 27, mixed.onchain_amount_sat());
+
+        let attempted_underbudget = fixed_checkout_reverse_quote_with_claim_fee_budget(
+            &snapshot,
+            1_000,
+            Some(10),
+            now,
+            FRESH_FOR,
+        )
+        .unwrap();
+        assert_eq!(attempted_underbudget.claim_fee_budget_sat(), 20);
+        assert_eq!(attempted_underbudget.onchain_amount_sat(), 1_020);
     }
 
     #[test]

@@ -268,6 +268,41 @@ impl FeeRuntime {
         })
     }
 
+    /// Construct a runtime with one explicitly restored, durable Liquid fee.
+    ///
+    /// This is test plumbing for integration paths that must exercise a funded
+    /// Liquid construction without contacting an operator fee source. Ordinary
+    /// test state remains fail-closed; callers must opt into this fixture.
+    #[doc(hidden)]
+    pub fn liquid_ready_test_fixture(rate_sat_per_vbyte: f64) -> Self {
+        let config = FeePolicyConfig::default();
+        let source_id = config
+            .liquid
+            .sources
+            .first()
+            .expect("default Liquid fee source must exist")
+            .id
+            .as_str();
+        let runtime = Self::from_config(&config, Arc::new(UnavailableFeeRuntimePersistence))
+            .expect("default fee policy must build");
+        let observed_at_unix = unix_now().expect("test clock must be after the Unix epoch");
+        let observation = crate::fee_policy::LiquidLastKnownGood::new(
+            crate::fee_policy::SatPerVbyte::try_from(rate_sat_per_vbyte)
+                .expect("test Liquid fee rate must be valid"),
+            observed_at_unix,
+            crate::fee_policy::FeeProvenance::new(format!(
+                "liquid_esplora_target_1_fee:{source_id}"
+            ))
+            .expect("default Liquid fee provenance must be valid"),
+        );
+        runtime
+            .snapshot
+            .restore_liquid_last_known_good(observation)
+            .expect("test Liquid fee evidence must restore");
+        runtime.liquid_lkg_authorized.store(true, Ordering::Release);
+        runtime
+    }
+
     /// Restore persisted evidence, refresh both live rails, persist newly
     /// accepted live decisions, and only then compute the startup fact.
     pub async fn initialize(&self) -> FeeRuntimeRefreshReport {
