@@ -78,6 +78,10 @@ impl Default for EpochResumeSchedule {
 }
 
 impl EpochResumeSchedule {
+    pub(crate) const fn has_pending(&self) -> bool {
+        self.recent_pending || self.historical_pending
+    }
+
     pub(crate) fn observe(&mut self, lane: WatcherLane, intent: ResumeIntent) {
         let incomplete = intent == ResumeIntent::ContinueSoon;
         let pending = match lane {
@@ -134,13 +138,19 @@ mod tests {
     #[test]
     fn startup_incomplete_prefers_recent_then_alternates() {
         let mut schedule = EpochResumeSchedule::default();
+        assert!(!schedule.has_pending());
         schedule.observe(WatcherLane::Recent, ResumeIntent::ContinueSoon);
         schedule.observe(WatcherLane::Historical, ResumeIntent::ContinueSoon);
 
+        assert!(schedule.has_pending());
         assert_eq!(schedule.wait(), ResumeWait::After(Duration::from_secs(1)));
         assert_eq!(schedule.take_next(), Some(WatcherLane::Recent));
         assert_eq!(schedule.take_next(), Some(WatcherLane::Historical));
         assert_eq!(schedule.take_next(), Some(WatcherLane::Recent));
+
+        schedule.observe(WatcherLane::Recent, ResumeIntent::None);
+        schedule.observe(WatcherLane::Historical, ResumeIntent::None);
+        assert!(!schedule.has_pending());
     }
 
     #[test]
@@ -233,5 +243,28 @@ mod tests {
             tokio::time::Instant::now().duration_since(waiting_since),
             EPOCH_RESUME_INTERVAL
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_epoch_blocks_a_recent_tick_that_became_due_during_work() {
+        let mut recent_tick = tokio::time::interval(Duration::from_secs(5));
+        recent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        recent_tick.tick().await;
+
+        let mut schedule = EpochResumeSchedule::default();
+        schedule.observe(WatcherLane::Historical, ResumeIntent::ContinueSoon);
+
+        // The just-finished recent scan took longer than its cadence, so the
+        // next cadence tick is already ready when the event loop resumes.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let selected = tokio::select! {
+            biased;
+            _ = recent_tick.tick(), if !schedule.has_pending() => WatcherLane::Recent,
+            _ = wait_for_epoch_resume(schedule.wait()) => {
+                schedule.take_next().expect("historical continuation")
+            }
+        };
+
+        assert_eq!(selected, WatcherLane::Historical);
     }
 }

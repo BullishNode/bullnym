@@ -713,7 +713,13 @@ pub async fn run(
                 reporter.intentional_shutdown();
                 return;
             }
-            _ = active_tick.tick() => {
+            // A fresh cadence epoch must not preempt an unfinished bounded
+            // traversal. A recent turn can itself run longer than the active
+            // cadence; without this guard, the biased select sees another
+            // recent tick immediately ready forever and the historical
+            // startup wrap never completes, leaving direct-Liquid admission
+            // closed on an otherwise healthy backend.
+            _ = active_tick.tick(), if !resume_schedule.has_pending() => {
                 let turn = poll_cycle(
                     ChainWatcherPollCtx {
                         pool: &pool,
@@ -781,7 +787,7 @@ pub async fn run(
                 report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
                 resume_schedule.observe(tier.lane(), turn.resume);
             }
-            _ = idle_tick.tick() => {
+            _ = idle_tick.tick(), if !resume_schedule.has_pending() => {
                 let turn = poll_cycle(
                     ChainWatcherPollCtx {
                         pool: &pool,
