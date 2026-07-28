@@ -43,11 +43,8 @@ master seed (the default wallet)
 ```
 
 The product wallet indexes above reflect the shipping mobile
-implementation (`bip85_registry`). ADR 002 currently documents an earlier
-index scheme (75/77/102/103 with a network-family qualifier) and needs
-amendment; until then, treat the registry as ground truth for the numbers
-and ADR 002 as ground truth for the reservation *principles* (deterministic
-product wallets, blocked manual indexes, one-seed recovery).
+implementation (`bip85_registry`); ADR 002 as amended (#273, PR #275)
+documents the same scheme.
 
 Consequences:
 
