@@ -22,19 +22,32 @@ master seed (the default wallet)
 │                                        committed to Bullnym before
 │                                        the first chain swap exists
 │
-├── BIP85 child wallet seeds (ADR 002; each child is its own seed
-│   with its own master fingerprint)
-│     ├── 75'  + liquid   → Lightning Address wallet (CT descriptor)
-│     ├── 102' + liquid   → Payment Page wallet      (CT descriptor)
-│     ├── 103' + liquid   → POS wallet               (CT descriptor)
-│     └── 77'  + liquid & bitcoin → BTCPay wallets
+├── BIP85 child wallet seeds, m/83696968'/39'/0'/12'/{index}'
+│   (application 39' = BIP39 mnemonic; each child is its own 12-word
+│   seed with its own master fingerprint; the network is NOT in the
+│   path — wallets are created from the child seed per product need)
+│     ├── 100' → BTCPay        (wallets on Bitcoin AND Liquid)
+│     ├── 101' → Lightning Address wallet (Liquid CT descriptor)
+│     ├── 102' → Payment Page wallet      (Liquid CT descriptor)
+│     └── 103' → POS wallet               (Liquid CT descriptor)
 │
-└── BIP85 Nostr keys, m/83696968'/128002'/{identity}'/{account}' (ADR 004)
-      ├── 100'/1' → unified wallet-backup key   (wallet_backup stream)
-      ├── 101'/1' → Bullnym server auth key     (this key's npub is the
-      │                                          identity Bullnym sees)
-      └── 102'/1' → NIP-05 public verification key
+├── BIP85 Nostr keys, m/83696968'/128002'/{identity}'/1' (ADR 004;
+│   identities 100'–199' reserved for application roles)
+│     ├── 100' → unified wallet-backup key   (wallet_backup stream)
+│     ├── 101' → Bullnym server auth key     (this key's npub is the
+│     │                                       identity Bullnym sees)
+│     └── 102' → NIP-05 public verification key
+│
+└── BIP85 backup encryption key, m/83696968'/1642'/0'/1'
+      (encrypts the wallet_backup ciphertext the server stores opaquely)
 ```
+
+The product wallet indexes above reflect the shipping mobile
+implementation (`bip85_registry`). ADR 002 currently documents an earlier
+index scheme (75/77/102/103 with a network-family qualifier) and needs
+amendment; until then, treat the registry as ground truth for the numbers
+and ADR 002 as ground truth for the reservation *principles* (deterministic
+product wallets, blocked manual indexes, one-seed recovery).
 
 Consequences:
 
