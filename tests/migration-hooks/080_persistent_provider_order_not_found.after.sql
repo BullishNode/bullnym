@@ -10,6 +10,7 @@ BEGIN
        AND column_name IN (
            'provider_last_read_error_class',
            'provider_last_read_error_at',
+           'provider_last_success_at',
            'provider_not_found_first_at',
            'provider_not_found_consecutive',
            'provider_missing_since',
@@ -37,6 +38,7 @@ BEGIN
         SELECT 1 FROM bull_bitcoin_settlements
          WHERE provider_last_read_error_class IS NOT NULL
             OR provider_last_read_error_at IS NOT NULL
+            OR provider_last_success_at IS NOT NULL
             OR provider_not_found_first_at IS NOT NULL
             OR provider_not_found_consecutive <> 0
             OR provider_missing_since IS NOT NULL

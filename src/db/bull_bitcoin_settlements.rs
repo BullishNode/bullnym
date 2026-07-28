@@ -1474,6 +1474,12 @@ pub async fn record_bull_bitcoin_provider_not_found(
                     settlement_status = CASE \
                         WHEN decision.should_escalate THEN 'integrity_error' \
                         ELSE settlement.settlement_status END, \
+                    payer_instruction = CASE \
+                        WHEN decision.should_escalate THEN NULL \
+                        ELSE settlement.payer_instruction END, \
+                    instruction_kind = CASE \
+                        WHEN decision.should_escalate THEN NULL \
+                        ELSE settlement.instruction_kind END, \
                     last_checked_at = now(), \
                     reconcile_attempts = settlement.reconcile_attempts + 1, \
                     next_attempt_at = now() + make_interval(secs => (CASE \

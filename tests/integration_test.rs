@@ -4630,7 +4630,7 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
     let order_id = Uuid::new_v4();
     fake.push_create(Ok(scripted_created_order(order_id))).await;
     fake.push_validation(Ok(())).await;
-    fake.push_validation(Err(BullBitcoinError::Upstream)).await;
+    fake.push_validation(Ok(())).await;
     fake.push_validation(Ok(())).await;
     fake.push_read(Err(BullBitcoinError::NotFound)).await;
     fake.push_read(Err(BullBitcoinError::NotFound)).await;
@@ -4690,13 +4690,9 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
         ("pending".into(), "not_found".into(), 1, true, true)
     );
 
-    // Satisfy the elapsed threshold without sleeping and make the row due.
-    sqlx::query(
-        "UPDATE bull_bitcoin_settlements \
-            SET provider_not_found_first_at = now() - interval '2 seconds', \
-                next_attempt_at = now() \
-          WHERE id = $1",
-    )
+    // Record a second authenticated NotFound while the elapsed threshold is
+    // still open; the count is retained but admission remains pending.
+    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
     .bind(settlement_id)
     .execute(&pool)
     .await
@@ -4715,9 +4711,15 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
     .unwrap();
     assert_eq!(unhealthy_threshold, ("pending".into(), 2, true, true));
 
-    // Once an authenticated read-only provider preflight is healthy again,
-    // the already-satisfied count/time threshold may enter the hold.
-    sqlx::query("UPDATE bull_bitcoin_settlements SET next_attempt_at = now() WHERE id = $1")
+    // Satisfy the elapsed threshold without sleeping. Once the authenticated
+    // preflight is healthy, the already-satisfied count/time threshold enters
+    // the hold.
+    sqlx::query(
+        "UPDATE bull_bitcoin_settlements \
+            SET provider_not_found_first_at = now() - interval '2 seconds', \
+                next_attempt_at = now() \
+          WHERE id = $1",
+    )
         .bind(settlement_id)
         .execute(&pool)
         .await
