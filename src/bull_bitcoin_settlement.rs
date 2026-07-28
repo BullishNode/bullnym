@@ -1924,6 +1924,7 @@ mod tests {
             retention_until_unix: None,
             reconcile_attempts: 0,
             actual_received_sat: None,
+            provider_payment_first_observed_at_unix_micros: None,
             quote_payment_first_observed_at_unix_micros: None,
             credited_fiat_minor: Some(500),
             quoted_fiat_minor: Some(500),

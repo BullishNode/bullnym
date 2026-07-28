@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=80
+EXPECTED_MIGRATION_COUNT=81
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "080_persistent_provider_order_not_found.sql" ]] \
-  || die "unexpected migration-080 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "081_provider_payment_first_observed_at.sql" ]] \
+  || die "unexpected migration-081 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -439,7 +439,8 @@ apply_migrations() {
        || "$base" == "077_bull_bitcoin_create_correlation" \
        || "$base" == "078_mixed_claim_fee_authority" \
        || "$base" == "079_lightning_address_provider_only" \
-       || "$base" == "080_persistent_provider_order_not_found" ]]; then
+       || "$base" == "080_persistent_provider_order_not_found" \
+       || "$base" == "081_provider_payment_first_observed_at" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

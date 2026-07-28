@@ -3268,6 +3268,7 @@ async fn bull_bitcoin_invalid_create_with_order_id_recovers_without_redispatch()
         payin_status: "Awaiting payment".into(),
         payout_status: "Not started".into(),
         actual_received_sat: None,
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -3824,6 +3825,7 @@ async fn get_paid_history_marks_terminal_mixed_fiat_outcome_as_problem() {
         payin_status: "Completed".into(),
         payout_status: "Failed".into(),
         actual_received_sat: Some(40_100),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -3978,6 +3980,7 @@ async fn bull_bitcoin_mixed_reverse_is_idempotent_private_repairable_and_exact()
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(40_500),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -4609,6 +4612,7 @@ async fn bull_bitcoin_reconciliation_records_only_minimal_exact_settlement_and_d
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(27_500),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -4745,6 +4749,7 @@ async fn bull_bitcoin_persistent_not_found_escalates_without_replacement_and_rec
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(25_000),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(11_111).unwrap()),
         quoted_fiat_minor: Some(FiatAmountMinor::new(11_111).unwrap()),
         execution_rate_minor_per_btc: Some(FiatAmountMinor::new(44_444_000).unwrap()),
@@ -4985,6 +4990,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
             payin_status: payin_status.into(),
             payout_status: payout_status.into(),
             actual_received_sat: Some(25_001),
+            payin_first_observed_at_unix_micros: None,
             // The persistence boundary must not trust an amount attached to a
             // provider-declared terminal failure.
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
@@ -5079,6 +5085,7 @@ async fn bull_bitcoin_reconciliation_stops_on_documented_terminal_outcomes() {
         payin_status: "Not started".into(),
         payout_status: "Not started".into(),
         actual_received_sat: None,
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5129,6 +5136,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         payin_status: "Not started".into(),
         payout_status: "Not started".into(),
         actual_received_sat: None,
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5143,6 +5151,7 @@ async fn bull_bitcoin_rate_expiry_remains_pending_and_can_settle_late() {
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(25_001),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5213,6 +5222,7 @@ async fn bull_bitcoin_lightning_address_settlement_list_is_private_minimal_and_i
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(27_500),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5492,6 +5502,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         payin_status: "Payment deadline expired".into(),
         payout_status: "Initialized".into(),
         actual_received_sat: None,
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5542,6 +5553,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         payin_status: "Awaiting confirmation".into(),
         payout_status: "Initialized".into(),
         actual_received_sat: Some(25_000),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: None,
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5584,6 +5596,7 @@ async fn expired_unfunded_fiat_invoice_uses_low_cost_watch_and_late_money_wins()
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(25_000),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: None,
@@ -5772,6 +5785,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
             payin_status: "Completed".into(),
             payout_status: "Completed".into(),
             actual_received_sat: Some(27_500),
+            payin_first_observed_at_unix_micros: None,
             credited_fiat_minor: Some(FiatAmountMinor::new(12_345).unwrap()),
             quoted_fiat_minor: None,
             execution_rate_minor_per_btc: None,
@@ -5903,7 +5917,7 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
 }
 
 #[tokio::test]
-async fn fiat_only_cross_currency_uses_payer_quote_and_closes_admission_on_funds() {
+async fn fiat_only_delayed_provider_callback_uses_payment_time_quote_and_closes_admission() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let fake = ScriptedBullBitcoinApi::default();
@@ -6007,6 +6021,47 @@ async fn fiat_only_cross_currency_uses_payer_quote_and_closes_admission_on_funds
         };
     assert_eq!(fake.create_call_count(), 1);
 
+    // Reproduce a provider callback delivered after the five-minute quote
+    // window even though the chain authority observed the payment while that
+    // exact payer quote was live.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions SET \
+             rate_observed_at = boundary.now - INTERVAL '602 seconds', \
+             rate_fetched_at = boundary.now - INTERVAL '601 seconds', \
+             rate_fresh_until = boundary.now - INTERVAL '1 second', \
+             created_at = boundary.now - INTERVAL '601 seconds', \
+             expires_at = boundary.now - INTERVAL '301 seconds' \
+         FROM boundary WHERE id = $1",
+    )
+    .bind(quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let provider_first_observed_at_unix_micros: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM created_at + INTERVAL '60 seconds') \
+                    * 1000000)::BIGINT \
+           FROM invoice_quote_versions WHERE id = $1",
+    )
+    .bind(quote.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
     // Bull Bitcoin locks the conversion when it first observes funds. That
     // observation is therefore also Bullnym's irreversible payer-admission
     // boundary, even though the payout is not provider-final yet.
@@ -6020,6 +6075,7 @@ async fn fiat_only_cross_currency_uses_payer_quote_and_closes_admission_on_funds
             payin_status: "Awaiting confirmation".into(),
             payout_status: "Initialized".into(),
             actual_received_sat: Some(10_000),
+            payin_first_observed_at_unix_micros: Some(provider_first_observed_at_unix_micros),
             credited_fiat_minor: None,
             quoted_fiat_minor: None,
             execution_rate_minor_per_btc: None,
@@ -6032,16 +6088,28 @@ async fn fiat_only_cross_currency_uses_payer_quote_and_closes_admission_on_funds
     )
     .await
     .unwrap();
-    let funded: (Option<String>, Option<String>, bool, Option<Uuid>) = sqlx::query_as(
+    let funded: (
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<Uuid>,
+        bool,
+        bool,
+    ) = sqlx::query_as(
         "SELECT instruction_kind, payer_instruction, \
-                quote_payment_first_observed_at IS NOT NULL, invoice_quote_version_id \
+                quote_payment_first_observed_at IS NOT NULL, invoice_quote_version_id, \
+                provider_payment_first_observed_at = quote_payment_first_observed_at, \
+                quote_payment_first_observed_at < ( \
+                    SELECT expires_at FROM invoice_quote_versions \
+                     WHERE id = invoice_quote_version_id \
+                ) \
            FROM bull_bitcoin_settlements WHERE id = $1",
     )
     .bind(settlement_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(funded, (None, None, true, Some(quote.id)));
+    assert_eq!(funded, (None, None, true, Some(quote.id), true, true));
 
     assert!(matches!(
         pay_service::bull_bitcoin_settlement::create_fiat_only_instruction(&state, &request).await,
@@ -6095,6 +6163,7 @@ async fn fiat_only_cross_currency_uses_payer_quote_and_closes_admission_on_funds
             payin_status: "Completed".into(),
             payout_status: "Completed".into(),
             actual_received_sat: Some(10_000),
+            payin_first_observed_at_unix_micros: Some(provider_first_observed_at_unix_micros),
             // Provider payout evidence is CAD. It must remain distinct from
             // the USD invoice face valuation derived from the payer quote.
             credited_fiat_minor: Some(FiatAmountMinor::new(31_406).unwrap()),
@@ -6294,6 +6363,7 @@ async fn fiat_only_late_provider_funds_use_covering_bullnym_rate() {
     .unwrap();
 
     let observation_now = i64::try_from(auth_timestamp()).unwrap();
+    let provider_first_observed_at_unix_micros = observation_now * 1_000_000;
     let covering_candidate = pay_service::db::NewInvoiceQuoteVersion {
         rate_minor_per_btc: 20_000_000,
         rate_source: "test:fiat-only-observation-rate",
@@ -6313,6 +6383,7 @@ async fn fiat_only_late_provider_funds_use_covering_bullnym_rate() {
             payin_status: "Awaiting confirmation".into(),
             payout_status: "Initialized".into(),
             actual_received_sat: Some(10_000),
+            payin_first_observed_at_unix_micros: Some(provider_first_observed_at_unix_micros),
             credited_fiat_minor: None,
             quoted_fiat_minor: None,
             execution_rate_minor_per_btc: None,
@@ -6355,6 +6426,7 @@ async fn fiat_only_late_provider_funds_use_covering_bullnym_rate() {
             payin_status: "Completed".into(),
             payout_status: "Completed".into(),
             actual_received_sat: Some(10_000),
+            payin_first_observed_at_unix_micros: Some(provider_first_observed_at_unix_micros),
             credited_fiat_minor: Some(FiatAmountMinor::new(31_406).unwrap()),
             quoted_fiat_minor: None,
             execution_rate_minor_per_btc: Some(FiatAmountMinor::new(314_060_000).unwrap()),
@@ -6455,7 +6527,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "080_persistent_provider_order_not_found"
+        "081_provider_payment_first_observed_at"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -6696,7 +6768,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "080_persistent_provider_order_not_found"
+        "081_provider_payment_first_observed_at"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -19680,6 +19752,7 @@ async fn mixed_fiat_fixed_quote_values_both_payer_legs_from_bullnym_rate() {
         payin_status: "Completed".into(),
         payout_status: "Completed".into(),
         actual_received_sat: Some(5_000),
+        payin_first_observed_at_unix_micros: None,
         credited_fiat_minor: Some(FiatAmountMinor::new(31_406).unwrap()),
         quoted_fiat_minor: None,
         execution_rate_minor_per_btc: Some(FiatAmountMinor::new(6_390_000).unwrap()),
