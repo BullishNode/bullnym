@@ -16,7 +16,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence written atomically by the live direct-payment reducer and by compatibility-safe Boltz supersession. |
 | `watcher_lane_progress` | Direct-watcher scheduling | Last fully visited `(created_at, invoice id)` rotation offset per direct worker and recent/historical lane. It is never worker-health evidence. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
-| `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
+| `chain_swap_records` | Boltz chain swaps | Bitcoin-to-Liquid state for Payment Page/POS checkout and linked mixed-fiat wallet invoices: lockup and claim data, refund data, retry state, and derivation metadata. |
 | `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
 | `outpoint_addresses` | LUD-22 reservations | `(nym, outpoint)` to descriptor index cache for Liquid shortcut idempotency and TTL cleanup of unfulfilled rows. |
 | `nym_access_events` | Abuse controls | Sliding-window distinct-nym access counters. |

@@ -36,7 +36,13 @@ accounting, retry stuck claims, and prune operational tables.
 | Lightning Address | Lightning reverse swap, or direct Liquid through LUD-22 | Liquid address derived from the nym descriptor |
 | Payment Page | Lightning reverse swap, direct Liquid, or Bitcoin chain swap | Liquid address allocated from the surface descriptor |
 | POS | Lightning reverse swap, direct Liquid, or Bitcoin chain swap | Liquid address allocated from the POS descriptor |
-| Invoice | Lightning reverse swap, direct Liquid, or direct Bitcoin | Concrete Liquid and Bitcoin addresses supplied when the invoice is created |
+| Invoice | Lightning reverse swap, direct Liquid, or direct Bitcoin (a Bitcoin chain swap under a mixed fiat policy) | Concrete Liquid and Bitcoin addresses supplied when the invoice is created |
+
+Merchant settlement above assumes no Bull Bitcoin fiat settlement policy. A
+captured opt-in policy redirects the allocated share to Bull Bitcoin
+settlement outputs — one confidential provider output for a 100% allocation,
+or added provider legs beside the merchant output for a mixed split — and the
+merchant receives that share as a fiat credit.
 
 Rendering a public page does not allocate an address. Checkout creation
 allocates and persists the concrete destination used by all offers for that
