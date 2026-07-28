@@ -1607,12 +1607,6 @@ impl BoltzService {
         // below remains necessary if its limits change between these reads.
         validate_chain_create_amount(&pair, server_lock_amount_sat)?;
 
-        // Reject known deterministic limit failures before reserving a
-        // provider attempt or crossing its irreversible dispatch boundary.
-        // The provider still validates the request, so submit-time mapping
-        // below remains necessary if its limits change between these reads.
-        validate_chain_create_amount(&pair, amount_sat)?;
-
         // Heights are captured before the mutating request and bound the
         // timeout-order validation. A block arriving during the request only
         // makes the resulting windows more conservative by one block.
