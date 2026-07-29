@@ -68,7 +68,49 @@ async fn main() {
     let recovery_commitment = db::persist_recovery_address_commitment(&pool, &verified_recovery)
         .await
         .unwrap();
-    let invoice = db::insert_invoice(
+    sqlx::query(
+        "INSERT INTO donation_pages \
+            (nym, kind, ct_descriptor, header, description, display_currency, enabled) \
+         VALUES ($1, 'payment_page', $2, 'Recovery probe', '', 'USD', TRUE) \
+         ON CONFLICT (nym, kind) DO NOTHING",
+    )
+    .bind(&nym)
+    .bind(DESCRIPTOR)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let descriptor_generation: i64 = sqlx::query_scalar(
+        "SELECT descriptor_generation FROM donation_pages \
+         WHERE nym = $1 AND kind = 'payment_page'",
+    )
+    .bind(&nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let reservation_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO checkout_liquid_address_reservations \
+            (nym, kind, descriptor_generation, address_index, address) \
+         VALUES ($1, 'payment_page', $2, 2000000000, 'lq1probe') \
+         RETURNING id",
+    )
+    .bind(&nym)
+    .bind(descriptor_generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    db::certify_checkout_liquid_reservation(&pool, reservation_id)
+        .await
+        .unwrap();
+    let reservation = db::CheckoutLiquidReservation {
+        id: reservation_id,
+        nym: nym.clone(),
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
+        descriptor_generation,
+        address_index: 2_000_000_000,
+        address: "lq1probe".to_string(),
+        ct_descriptor: DESCRIPTOR.to_string(),
+    };
+    let invoice = db::insert_checkout_invoice(
         &pool,
         &db::NewInvoice {
             nym_owner: Some(&nym),
@@ -90,6 +132,7 @@ async fn main() {
             liquid_blinding_key_hex: Some(&"11".repeat(32)),
             expires_in_secs: 3_600,
         },
+        &reservation,
     )
     .await
     .unwrap();

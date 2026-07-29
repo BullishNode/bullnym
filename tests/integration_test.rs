@@ -17,7 +17,7 @@ use object_store::{
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{Barrier, Mutex};
+use tokio::sync::{Barrier, Mutex, Notify, Semaphore};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -147,6 +147,53 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
 impl CapturedLogWriter {
     fn contents(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[derive(Clone, Default)]
+struct RejectSpecificLiquidAddresses {
+    rejected: Arc<HashSet<String>>,
+}
+
+impl RejectSpecificLiquidAddresses {
+    fn new(rejected: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            rejected: Arc::new(rejected.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl pay_service::address_admission::InvoiceAddressAdmission for RejectSpecificLiquidAddresses {
+    async fn assert_fresh(
+        &self,
+        _bitcoin_address: Option<&str>,
+        liquid_address: Option<&str>,
+    ) -> Result<(), AppError> {
+        if liquid_address.is_some_and(|address| self.rejected.contains(address)) {
+            Err(AppError::LiquidAddressAlreadyUsed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct BlockingFreshAddressAdmission {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl pay_service::address_admission::InvoiceAddressAdmission for BlockingFreshAddressAdmission {
+    async fn assert_fresh(
+        &self,
+        _bitcoin_address: Option<&str>,
+        _liquid_address: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
     }
 }
 
@@ -1567,6 +1614,10 @@ async fn cleanup_db(pool: &PgPool) {
         .await
         .ok();
     sqlx::query("DELETE FROM invoices").execute(pool).await.ok();
+    sqlx::query("TRUNCATE checkout_liquid_address_reservations")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM donation_pages")
         .execute(pool)
         .await
@@ -6527,7 +6578,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "082_mixed_valuation_exception_scope"
+        "083_checkout_descriptor_generations"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -6863,7 +6914,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "082_mixed_valuation_exception_scope"
+        "083_checkout_descriptor_generations"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
@@ -10243,7 +10294,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 7 \
+        "UPDATE donation_pages SET ct_descriptor = $2 \
           WHERE nym = $1 AND kind = 'payment_page'",
     )
     .bind(nym)
@@ -10252,11 +10303,27 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
     .await
     .unwrap();
     sqlx::query(
-        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 13 \
+        "UPDATE donation_pages SET next_addr_idx = 7 \
+          WHERE nym = $1 AND kind = 'payment_page'",
+    )
+    .bind(nym)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET ct_descriptor = $2 \
           WHERE nym = $1 AND kind = 'pos'",
     )
     .bind(nym)
     .bind(&pos_descriptor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET next_addr_idx = 13 \
+          WHERE nym = $1 AND kind = 'pos'",
+    )
+    .bind(nym)
     .execute(&pool)
     .await
     .unwrap();
@@ -10565,7 +10632,7 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
         .await
         .unwrap();
 
-    let (address, index, descriptor) = pay_service::db::allocate_next_liquid_for_donation_page(
+    let reservation = pay_service::db::reserve_next_liquid_for_donation_page(
         &pool,
         nym,
         pay_service::db::KIND_POS,
@@ -10579,10 +10646,10 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
     .expect("pos allocation");
 
     // Allocated from the POS cursor (7), settling to the POS descriptor.
-    assert_eq!(index, 7);
-    assert_eq!(descriptor, TEST_DESCRIPTOR);
+    assert_eq!(reservation.address_index, 7);
+    assert_eq!(reservation.ct_descriptor, TEST_DESCRIPTOR);
     assert_eq!(
-        address,
+        reservation.address,
         pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 7).unwrap()
     );
 
@@ -10601,6 +10668,478 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
     .await
     .unwrap();
     assert_eq!(pos_idx, 8);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn candidate_gate_same_descriptor_cross_surface_checkouts_allocate_distinct_addresses() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "checkoutcrosssurface";
+    create_test_user(&pool, nym).await;
+    let descriptor = test_descriptor_with_blinding_key(0x30);
+
+    for kind in [
+        pay_service::db::KIND_PAYMENT_PAGE,
+        pay_service::db::KIND_POS,
+    ] {
+        pay_service::db::upsert_donation_page(
+            &pool,
+            &pay_service::db::UpsertDonationPage {
+                nym,
+                kind,
+                ct_descriptor: &descriptor,
+                header: "Shared descriptor",
+                description: "Cross-surface allocation",
+                display_currency: "USD",
+                website: None,
+                twitter: None,
+                instagram: None,
+                enabled: true,
+                generated_og_template_version: None,
+                alias: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = test_app(test_state(pool.clone()));
+    let request = json!({"fiat_amount_minor": 100, "fiat_currency": "USD"});
+    let page_path = format!("/{nym}/invoice");
+    let pos_path = format!("/{nym}/pos/invoice");
+    let page_checkout = post_json(&app, &page_path, request.clone());
+    let pos_checkout = post_json(&app, &pos_path, request);
+    let ((page_status, page_body), (pos_status, pos_body)) =
+        tokio::join!(page_checkout, pos_checkout);
+    assert_eq!(page_status, StatusCode::OK, "{page_body:?}");
+    assert_eq!(pos_status, StatusCode::OK, "{pos_body:?}");
+
+    let page_id = Uuid::parse_str(page_body["invoice_id"].as_str().unwrap()).unwrap();
+    let pos_id = Uuid::parse_str(pos_body["invoice_id"].as_str().unwrap()).unwrap();
+    let allocations: Vec<(String, i32, String, String, Uuid)> = sqlx::query_as(
+        "SELECT kind, address_index, address, status, invoice_id \
+           FROM checkout_liquid_address_reservations \
+          WHERE nym = $1 ORDER BY address_index",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(allocations.len(), 2);
+    assert!(allocations
+        .iter()
+        .all(|allocation| allocation.3 == "allocated"));
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation.0.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            pay_service::db::KIND_PAYMENT_PAGE,
+            pay_service::db::KIND_POS,
+        ])
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation.1)
+            .collect::<HashSet<_>>(),
+        HashSet::from([0, 1])
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation.2.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            pay_service::descriptor::derive_address(&descriptor, 0)
+                .unwrap()
+                .as_str(),
+            pay_service::descriptor::derive_address(&descriptor, 1)
+                .unwrap()
+                .as_str(),
+        ])
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation.4)
+            .collect::<HashSet<_>>(),
+        HashSet::from([page_id, pos_id])
+    );
+
+    let invoice_surfaces: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, checkout_surface_kind FROM invoices \
+          WHERE id = ANY($1) ORDER BY checkout_surface_kind",
+    )
+    .bind([page_id, pos_id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(invoice_surfaces.len(), 2);
+    assert!(invoice_surfaces
+        .iter()
+        .any(|(id, kind)| *id == page_id && kind == pay_service::db::KIND_PAYMENT_PAGE));
+    assert!(invoice_surfaces
+        .iter()
+        .any(|(id, kind)| *id == pos_id && kind == pay_service::db::KIND_POS));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn candidate_gate_descriptor_rotation_between_reservation_and_certification_fails_closed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "checkoutdescriptorrace";
+    create_test_user(&pool, nym).await;
+    let descriptor_a = test_descriptor_with_blinding_key(0x33);
+    let descriptor_b = test_descriptor_with_blinding_key(0x34);
+
+    fn page<'a>(nym: &'a str, descriptor: &'a str) -> pay_service::db::UpsertDonationPage<'a> {
+        pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: descriptor,
+            header: "Descriptor race",
+            description: "Reservation must match the current generation",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        }
+    }
+    pay_service::db::upsert_donation_page(&pool, &page(nym, &descriptor_a))
+        .await
+        .unwrap();
+
+    let admission = BlockingFreshAddressAdmission::default();
+    let mut state = test_state(pool.clone());
+    state.invoice_address_admission = Arc::new(admission.clone());
+    let app = test_app(state);
+    let request_app = app.clone();
+    let request_path = format!("/{nym}/invoice");
+    let checkout = tokio::spawn(async move {
+        post_json(
+            &request_app,
+            &request_path,
+            json!({"fiat_amount_minor": 100, "fiat_currency": "USD"}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), admission.entered.notified())
+        .await
+        .expect("checkout must reach authoritative history admission");
+    let rotated = pay_service::db::upsert_donation_page(&pool, &page(nym, &descriptor_b))
+        .await
+        .unwrap();
+    assert_eq!(rotated.descriptor_generation, 2);
+    assert_eq!(rotated.next_addr_idx, 0);
+    admission.release.notify_one();
+
+    let (status, body) = checkout.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    let invoice_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE nym_owner = $1")
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        invoice_count, 0,
+        "a stale generation must not publish an invoice"
+    );
+    let stale: (i64, i32, String, Option<Uuid>) = sqlx::query_as(
+        "SELECT descriptor_generation, address_index, status, invoice_id \
+           FROM checkout_liquid_address_reservations WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, (1, 0, "pending".into(), None));
+
+    drop(app);
+    let restarted_app = test_app(test_state(pool.clone()));
+    let (status, body) = post_json(
+        &restarted_app,
+        &format!("/{nym}/invoice"),
+        json!({"fiat_amount_minor": 100, "fiat_currency": "USD"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let invoice_id = Uuid::parse_str(body["invoice_id"].as_str().unwrap()).unwrap();
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        invoice.liquid_address.as_deref(),
+        Some(
+            pay_service::descriptor::derive_address(&descriptor_b, 0)
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(invoice.status, "unpaid");
+    let stale_after: (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, invoice_id FROM checkout_liquid_address_reservations \
+          WHERE nym = $1 AND descriptor_generation = 1 AND address_index = 0",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_after, ("pending".into(), None));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn candidate_gate_checkout_descriptor_generations_skip_history_reuse_and_survive_restart() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "checkoutgeneration";
+    create_test_user(&pool, nym).await;
+    let descriptor_a = test_descriptor_with_blinding_key(0x31);
+    let descriptor_b = test_descriptor_with_blinding_key(0x32);
+
+    fn page<'a>(nym: &'a str, descriptor: &'a str) -> pay_service::db::UpsertDonationPage<'a> {
+        pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: descriptor,
+            header: "Generation test",
+            description: "Clean Liquid allocation",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        }
+    }
+    let first_page = pay_service::db::upsert_donation_page(&pool, &page(nym, &descriptor_a))
+        .await
+        .unwrap();
+    assert_eq!(first_page.descriptor_generation, 1);
+
+    let fiat_request = json!({"fiat_amount_minor": 100, "fiat_currency": "USD"});
+    let app = test_app(test_state(pool.clone()));
+    let (status, first_body) =
+        post_json(&app, &format!("/{nym}/invoice"), fiat_request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first_body:?}");
+    let first_id = Uuid::parse_str(first_body["invoice_id"].as_str().unwrap()).unwrap();
+    let first = pay_service::db::get_invoice_by_id(&pool, first_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.liquid_address.as_deref(),
+        Some(
+            pay_service::descriptor::derive_address(&descriptor_a, 0)
+                .unwrap()
+                .as_str()
+        )
+    );
+
+    // Reproduce the vulnerable shape: a non-zero cursor from descriptor A is
+    // present when descriptor B replaces it. The upsert must create a new
+    // generation and reset B's cursor instead of carrying index 7 across.
+    sqlx::query(
+        "UPDATE donation_pages SET next_addr_idx = 7 \
+         WHERE nym = $1 AND kind = 'payment_page'",
+    )
+    .bind(nym)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second_page = pay_service::db::upsert_donation_page(&pool, &page(nym, &descriptor_b))
+        .await
+        .unwrap();
+    assert_eq!(second_page.descriptor_generation, 2);
+    assert_eq!(second_page.next_addr_idx, 0);
+
+    let historical_b0 = pay_service::descriptor::derive_address(&descriptor_b, 0).unwrap();
+    let expected_b1 = pay_service::descriptor::derive_address(&descriptor_b, 1).unwrap();
+    let mut state = test_state(pool.clone());
+    state.invoice_address_admission =
+        Arc::new(RejectSpecificLiquidAddresses::new([historical_b0.clone()]));
+    let app = test_app(state);
+    let (status, second_body) =
+        post_json(&app, &format!("/{nym}/invoice"), fiat_request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{second_body:?}");
+    let second_id = Uuid::parse_str(second_body["invoice_id"].as_str().unwrap()).unwrap();
+    let second = pay_service::db::get_invoice_by_id(&pool, second_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.liquid_address.as_deref(), Some(expected_b1.as_str()));
+    assert_eq!(second.status, "unpaid");
+    assert_eq!(second.paid_amount_sat, None);
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1")
+            .bind(second_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(event_count, 0);
+    let generation_two: Vec<(i32, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT address_index, status, invoice_id \
+         FROM checkout_liquid_address_reservations \
+         WHERE nym = $1 AND kind = 'payment_page' AND descriptor_generation = 2 \
+         ORDER BY address_index",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generation_two,
+        vec![
+            (0, "history_present".into(), None),
+            (1, "allocated".into(), Some(second_id)),
+        ]
+    );
+    let immutable_error = sqlx::query(
+        "UPDATE checkout_liquid_address_reservations SET address = 'lq1rewritten' \
+         WHERE nym = $1 AND descriptor_generation = 2 AND address_index = 0",
+    )
+    .bind(nym)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        immutable_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    let reversal_error = sqlx::query(
+        "UPDATE checkout_liquid_address_reservations \
+         SET status = 'pending', rejected_at = NULL \
+         WHERE nym = $1 AND descriptor_generation = 2 AND address_index = 0",
+    )
+    .bind(nym)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        reversal_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    // Simulate process loss after a clean certification but before invoice
+    // insert. The durable reservation survives, and a restarted request must
+    // move to the following index rather than lease the certified address.
+    let stranded = pay_service::db::reserve_next_liquid_for_donation_page(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE,
+        |descriptor, index| {
+            pay_service::descriptor::derive_address(descriptor, index)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(stranded.address_index, 2);
+    assert_eq!(
+        pay_service::db::certify_checkout_liquid_reservation(&pool, stranded.id)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(app);
+    pool.close().await;
+    let pool = test_pool().await;
+    let restarted_app = test_app(test_state(pool.clone()));
+    let stranded_after_restart: (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, invoice_id FROM checkout_liquid_address_reservations WHERE id = $1",
+    )
+    .bind(stranded.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stranded_after_restart, ("certified".into(), None));
+    let (status, restarted_body) = post_json(
+        &restarted_app,
+        &format!("/{nym}/invoice"),
+        fiat_request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restarted_body:?}");
+    let restarted_id = Uuid::parse_str(restarted_body["invoice_id"].as_str().unwrap()).unwrap();
+    let restarted = pay_service::db::get_invoice_by_id(&pool, restarted_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted.liquid_address.as_deref(),
+        Some(
+            pay_service::descriptor::derive_address(&descriptor_b, 3)
+                .unwrap()
+                .as_str()
+        )
+    );
+
+    // Re-adding descriptor A starts generation 3 at zero, but the global
+    // reservation/address ledgers retain A:0, so allocation advances to A:1.
+    let third_page = pay_service::db::upsert_donation_page(&pool, &page(nym, &descriptor_a))
+        .await
+        .unwrap();
+    assert_eq!(third_page.descriptor_generation, 3);
+    assert_eq!(third_page.next_addr_idx, 0);
+    let app = test_app(test_state(pool.clone()));
+    let (status, third_body) =
+        post_json(&app, &format!("/{nym}/invoice"), fiat_request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{third_body:?}");
+    let third_id = Uuid::parse_str(third_body["invoice_id"].as_str().unwrap()).unwrap();
+    let third = pay_service::db::get_invoice_by_id(&pool, third_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        third.liquid_address.as_deref(),
+        Some(
+            pay_service::descriptor::derive_address(&descriptor_a, 1)
+                .unwrap()
+                .as_str()
+        )
+    );
+
+    // Concurrent checkout requests remain serialized by the surface lock and
+    // atomically attach two distinct reservations.
+    let checkout_path = format!("/{nym}/invoice");
+    let first_concurrent = post_json(&app, &checkout_path, fiat_request.clone());
+    let second_concurrent = post_json(&app, &checkout_path, fiat_request);
+    let ((first_status, first_body), (second_status, second_body)) =
+        tokio::join!(first_concurrent, second_concurrent);
+    assert_eq!(first_status, StatusCode::OK, "{first_body:?}");
+    assert_eq!(second_status, StatusCode::OK, "{second_body:?}");
+    let concurrent_ids = [first_body, second_body]
+        .map(|body| Uuid::parse_str(body["invoice_id"].as_str().unwrap()).unwrap());
+    let concurrent_addresses: Vec<String> = sqlx::query_scalar(
+        "SELECT liquid_address FROM invoices WHERE id = ANY($1) ORDER BY liquid_address",
+    )
+    .bind(concurrent_ids.as_slice())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(concurrent_addresses.len(), 2);
+    assert_ne!(concurrent_addresses[0], concurrent_addresses[1]);
 
     cleanup_db(&pool).await;
 }
@@ -12168,8 +12707,8 @@ async fn concurrent_same_reverse_swap_has_one_locked_preparation() {
     cleanup_db(&admin).await;
 }
 
-#[tokio::test]
-async fn active_reverse_broadcast_lease_coalesces_duplicate_webhook_claims() {
+#[tokio::test(flavor = "current_thread")]
+async fn settled_webhook_coalesces_persisted_active_claim_without_error_log() {
     let admin = test_pool().await;
     cleanup_db(&admin).await;
     create_test_user(&admin, "reverseleaseactive").await;
@@ -12181,34 +12720,565 @@ async fn active_reverse_broadcast_lease_coalesces_duplicate_webhook_claims() {
         None,
     )
     .await;
+    let mut legacy_claim = admin.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *legacy_claim)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE swap_records SET status = 'claiming', \
+             claim_tx_hex = '00', claim_txid = $2, \
              next_claim_attempt_at = NOW() + INTERVAL '2 minutes' \
          WHERE id = $1",
     )
     .bind(swap_id)
-    .execute(&admin)
+    .bind("11".repeat(32))
+    .execute(&mut *legacy_claim)
     .await
     .unwrap();
+    legacy_claim.commit().await.unwrap();
 
-    let outcome = claimer::exercise_reverse_claim_with_malformed_response(
-        &admin,
-        swap_id,
-        &accepted_live_liquid_fee_decision(),
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let app = test_app(test_state(admin.clone()));
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "REVERSE_LEASE_ACTIVE",
+                "status": "invoice.settled"
+            }
+        }),
     )
-    .await
-    .unwrap();
-    assert!(matches!(outcome, claimer::ClaimOutcome::SkippedLockHeld));
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
     let swap = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_LEASE_ACTIVE")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(swap.status, "claiming");
     assert_eq!(swap.claim_attempts, 0);
-    assert!(swap.claim_tx_hex.is_none());
+    assert_eq!(swap.claim_tx_hex.as_deref(), Some("00"));
     assert!(swap.address.is_none());
+    let lease_active: bool =
+        sqlx::query_scalar("SELECT next_claim_attempt_at > NOW() FROM swap_records WHERE id = $1")
+            .bind(swap_id)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert!(lease_active);
+
+    let logs = log_writer.contents();
+    assert!(logs.contains("reverse_claim_webhook_coalesced"), "{logs}");
+    assert!(logs.contains("INFO"), "{logs}");
+    assert!(
+        !logs.contains("reverse_swap_settled_without_local_claim"),
+        "{logs}"
+    );
 
     cleanup_db(&admin).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn settled_webhook_coalesces_active_claim_preparation_without_error_log() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reversepreparation").await;
+    let swap_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reversepreparation",
+        "REVERSE_PREPARATION_ACTIVE",
+        "{",
+        None,
+    )
+    .await;
+    let mut preparation = admin.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("claim:{swap_id}"))
+        .execute(&mut *preparation)
+        .await
+        .unwrap();
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let app = test_app(test_state(admin.clone()));
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "REVERSE_PREPARATION_ACTIVE",
+                "status": "invoice.settled"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let swap = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_PREPARATION_ACTIVE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "lockup_confirmed");
+    assert_eq!(swap.claim_attempts, 0);
+    assert!(swap.claim_tx_hex.is_none());
+    let retry_was_not_rescheduled: bool =
+        sqlx::query_scalar("SELECT next_claim_attempt_at IS NULL FROM swap_records WHERE id = $1")
+            .bind(swap_id)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert!(retry_was_not_rescheduled);
+    let logs = log_writer.contents();
+    assert!(logs.contains("reverse_claim_webhook_coalesced"), "{logs}");
+    assert!(logs.contains("INFO"), "{logs}");
+    assert!(
+        !logs.contains("reverse_swap_settled_without_local_claim"),
+        "{logs}"
+    );
+
+    preparation.rollback().await.unwrap();
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_gate_lockup_visibility_coalesces_before_construction_and_restart_broadcasts_once(
+) {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "reverselockupboundary";
+    create_test_user(&pool, nym).await;
+    let claim_key_index = 707_u64;
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(claim_key_index).unwrap();
+    let preimage = Preimage::from_swap_key(&claim_keypair);
+    let preimage_hex = hex::encode(preimage.bytes.unwrap());
+    let claim_key_hex = hex::encode(claim_keypair.secret_key().secret_bytes());
+    let response = valid_reverse_response_for_index(
+        "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+        claim_key_index,
+        5_000,
+    );
+    let response_json = serde_json::to_string(&response).unwrap();
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some(nym),
+            boltz_swap_id: "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+            address: None,
+            address_index: None,
+            amount_sat: 5_000,
+            invoice: response.invoice.as_deref().unwrap(),
+            preimage_hex: &preimage_hex,
+            claim_key_hex: &claim_key_hex,
+            boltz_response_json: &response_json,
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+        .await
+        .unwrap()
+        .unwrap();
+    pay_service::db::update_swap_status(
+        &pool,
+        swap.id,
+        pay_service::db::SwapStatus::LockupMempool,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE swap_records SET cooperative_refused = TRUE WHERE id = $1")
+        .bind(swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (parent_txid, parent_raw_hex) = reverse_lockup_parent_fixture(&response);
+    let (
+        electrum_url,
+        _parent_queries,
+        _parent_seen,
+        parent_visible,
+        history_queries,
+        history_seen,
+        broadcast_calls,
+        broadcast_seen,
+        release_broadcasts,
+        server_task,
+    ) = spawn_parent_gated_liquid_broadcast_server(parent_txid, parent_raw_hex).await;
+
+    let first_pool = pool.clone();
+    let first_url = electrum_url.clone();
+    let mut first_claim = tokio::spawn(async move {
+        let clients = claimer::LiquidClaimClientFactory::try_new(vec![first_url]).unwrap();
+        claimer::exercise_unjournaled_reverse_claim_retry(
+            &first_pool,
+            swap.id,
+            &clients,
+            &accepted_live_liquid_fee_decision(),
+        )
+        .await
+    });
+    tokio::select! {
+        _ = history_seen.notified() => {}
+        result = &mut first_claim => {
+            panic!("fresh claim finished before its lockup visibility probe: {result:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(3)) => {
+            panic!("fresh claim must probe lockup visibility before construction");
+        }
+    }
+    assert!(history_queries.load(Ordering::SeqCst) >= 1);
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_json(
+            &app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("settled webhook must join active lockup-visibility preparation");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
+
+    first_claim.abort();
+    assert!(first_claim.await.unwrap_err().is_cancelled());
+    let interrupted =
+        pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(interrupted.claim_attempts, 0);
+    assert!(interrupted.claim_tx_hex.is_none());
+    assert!(interrupted.last_claim_error.is_none());
+
+    parent_visible.store(true, Ordering::SeqCst);
+    let recovery_pool = pool.clone();
+    let recovery_url = electrum_url.clone();
+    let recovery = tokio::spawn(async move {
+        let clients = claimer::LiquidClaimClientFactory::try_new(vec![recovery_url]).unwrap();
+        claimer::exercise_unjournaled_reverse_claim_retry(
+            &recovery_pool,
+            swap.id,
+            &clients,
+            &accepted_live_liquid_fee_decision(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), broadcast_seen.notified())
+        .await
+        .expect("restart must reach one actual broadcast after lockup visibility");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 1);
+    let journaled: (String, String, String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, claim_tx_hex, claim_txid, claim_attempts, last_claim_error \
+         FROM swap_records WHERE id = $1",
+    )
+    .bind(swap.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(journaled.0, "claiming");
+    assert!(!journaled.1.is_empty());
+    assert_eq!(journaled.2.len(), 64);
+    assert_eq!(journaled.3, 0);
+    assert!(journaled.4.is_none());
+
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+                "status": "invoice.settled"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 1);
+
+    release_broadcasts.add_permits(1);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), recovery)
+            .await
+            .expect("restart broadcast did not finish")
+            .expect("restart claim task failed")
+            .expect("restart claim returned an error"),
+        claimer::ClaimOutcome::Broadcast
+    ));
+    let finalized =
+        pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(finalized.status, "claimed");
+    assert_eq!(finalized.claim_attempts, 0);
+    assert!(finalized.last_claim_error.is_none());
+    assert_eq!(
+        finalized.claim_tx_hex.as_deref(),
+        Some(journaled.1.as_str())
+    );
+    assert_eq!(finalized.claim_txid.as_deref(), Some(journaled.2.as_str()));
+
+    server_task.abort();
+    let _ = server_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_recovers_exact_tx() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "reversebroadcastboundary";
+    create_test_user(&pool, nym).await;
+    let swap_id =
+        seed_claimable_reverse_pool_swap(&pool, nym, "REVERSE_BROADCAST_BOUNDARY", "{}", None)
+            .await;
+
+    let merchant_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let merchant_blinding_key =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &merchant_address)
+            .unwrap();
+    let (_, _, response) = issue84_chain_creation_response(501, 502, "REVERSE_BROADCAST_FIXTURE");
+    let (claim_tx_hex, claim_txid, actual_fee_sat, actual_fee_rate_sat_vb, backend) =
+        persisted_liquid_claim_fixture(&response, &merchant_address, &merchant_blinding_key);
+    let claim_transaction: boltz_client::elements::Transaction =
+        boltz_client::elements::encode::deserialize(&hex::decode(&claim_tx_hex).unwrap()).unwrap();
+    let parent_txid = claim_transaction.input[0].previous_output.txid.to_string();
+    let parent_raw_hex = hex::encode(backend.get_raw_tx(&parent_txid).await.unwrap());
+    sqlx::query(
+        "UPDATE swap_records \
+         SET claim_tx_hex = $2, claim_txid = $3, claim_path = 'script', \
+             claim_actual_fee_sat = $4, claim_actual_fee_rate_sat_vb = $5, \
+             claim_fee_decision_purpose = 'reverse_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = $5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1' \
+         WHERE id = $1",
+    )
+    .bind(swap_id)
+    .bind(&claim_tx_hex)
+    .bind(&claim_txid)
+    .bind(actual_fee_sat)
+    .bind(actual_fee_rate_sat_vb)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (
+        electrum_url,
+        parent_queries,
+        parent_seen,
+        parent_visible,
+        _history_queries,
+        _history_seen,
+        broadcast_calls,
+        broadcast_seen,
+        release_broadcasts,
+        server_task,
+    ) = spawn_parent_gated_liquid_broadcast_server(parent_txid, parent_raw_hex).await;
+    let first_pool = pool.clone();
+    let first_electrum_url = electrum_url.clone();
+    let first_claim = tokio::spawn(async move {
+        let clients = claimer::LiquidClaimClientFactory::try_new(vec![first_electrum_url]).unwrap();
+        claimer::exercise_journaled_reverse_claim_retry(&first_pool, swap_id, &clients).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), parent_seen.notified())
+        .await
+        .expect("fresh claim must probe parent visibility before broadcasting");
+    assert!(parent_queries.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        0,
+        "an invisible parent must prevent the child broadcast RPC"
+    );
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_json(
+            &app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_BROADCAST_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("settled webhook must join the active parent-readiness lease");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        0,
+        "settled webhook bypassed the parent-readiness gate"
+    );
+    let active: (String, bool, String) = sqlx::query_as(
+        "SELECT status, next_claim_attempt_at > NOW(), claim_tx_hex \
+           FROM swap_records WHERE id = $1",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, ("claiming".into(), true, claim_tx_hex.clone()));
+
+    // Simulate process loss after the journal/lease commit while the exact
+    // broadcaster still cannot see the parent. No child RPC has crossed the
+    // boundary, so restart must retain both the exact bytes and zero attempts.
+    first_claim.abort();
+    assert!(first_claim.await.unwrap_err().is_cancelled());
+
+    // A new process must retain the lease and exact journal, coalesce
+    // callbacks during the lease, and rebroadcast only once after expiry.
+    drop(app);
+    tokio::time::timeout(Duration::from_secs(3), pool.close())
+        .await
+        .expect("simulated process pool must close after the RPC caller is killed");
+
+    let restarted = test_pool().await;
+    let restarted_app = test_app(test_state(restarted.clone()));
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_json(
+            &restarted_app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_BROADCAST_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("restart webhook must coalesce while the durable lease is active");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        0,
+        "restart webhook ignored the persisted active broadcast lease"
+    );
+
+    sqlx::query(
+        "UPDATE swap_records SET next_claim_attempt_at = NOW() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(swap_id)
+    .execute(&restarted)
+    .await
+    .unwrap();
+    parent_visible.store(true, Ordering::SeqCst);
+    let recovery_pool = restarted.clone();
+    let recovery_electrum_url = electrum_url.clone();
+    let recovery = tokio::spawn(async move {
+        let clients =
+            claimer::LiquidClaimClientFactory::try_new(vec![recovery_electrum_url]).unwrap();
+        claimer::exercise_journaled_reverse_claim_retry(&recovery_pool, swap_id, &clients).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), broadcast_seen.notified())
+        .await
+        .expect("expired lease must redrive the exact journal to the broadcast RPC");
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        1,
+        "recovery must issue exactly one parent-ready broadcast"
+    );
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_json(
+            &restarted_app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_BROADCAST_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("settled webhook must join the active broadcast RPC");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        1,
+        "settled webhook crossed the actual broadcast boundary twice"
+    );
+    release_broadcasts.add_permits(1);
+    let recovered = tokio::time::timeout(Duration::from_secs(3), recovery)
+        .await
+        .expect("recovery broadcast must finish")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(recovered, claimer::ClaimOutcome::Broadcast));
+    let final_swap =
+        pay_service::db::get_swap_by_boltz_id(&restarted, "REVERSE_BROADCAST_BOUNDARY")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(final_swap.status, "claimed");
+    assert_eq!(final_swap.claim_attempts, 0);
+    assert!(final_swap.last_claim_error.is_none());
+    assert_eq!(
+        final_swap.claim_tx_hex.as_deref(),
+        Some(claim_tx_hex.as_str())
+    );
+    assert_eq!(final_swap.claim_txid.as_deref(), Some(claim_txid.as_str()));
+
+    server_task.abort();
+    let _ = server_task.await;
+    cleanup_db(&restarted).await;
 }
 
 #[tokio::test]
@@ -16889,7 +17959,7 @@ async fn insert_history_checkout_invoice(
     liquid_address: &str,
     memo: &str,
 ) -> pay_service::db::Invoice {
-    pay_service::db::insert_invoice(
+    insert_reserved_test_checkout_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
@@ -17500,7 +18570,7 @@ async fn insert_test_invoice(
     liquid_address: &str,
     expires_in_secs: i64,
 ) -> pay_service::db::Invoice {
-    pay_service::db::insert_invoice(
+    insert_reserved_test_checkout_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
@@ -17525,6 +18595,101 @@ async fn insert_test_invoice(
     )
     .await
     .unwrap()
+}
+
+async fn insert_reserved_test_checkout_invoice(
+    pool: &PgPool,
+    invoice: &pay_service::db::NewInvoice<'_>,
+) -> Result<pay_service::db::Invoice, sqlx::Error> {
+    let nym = invoice.nym_owner.ok_or_else(|| {
+        sqlx::Error::Protocol("test checkout invoice requires a nym owner".to_string())
+    })?;
+    let kind = invoice.checkout_surface_kind.ok_or_else(|| {
+        sqlx::Error::Protocol("test checkout invoice requires a surface kind".to_string())
+    })?;
+    let address = invoice.liquid_address.ok_or_else(|| {
+        sqlx::Error::Protocol("test checkout invoice requires a Liquid address".to_string())
+    })?;
+
+    // These fixtures exercise downstream invoice behavior with deliberately
+    // synthetic addresses. Give them the same durable ownership contract as
+    // production without invoking an external chain-history authority.
+    sqlx::query(
+        "INSERT INTO donation_pages \
+            (nym, kind, ct_descriptor, header, description, display_currency, enabled) \
+         VALUES ($1, $2, $3, 'Test checkout', '', 'USD', TRUE) \
+         ON CONFLICT (nym, kind) DO NOTHING",
+    )
+    .bind(nym)
+    .bind(kind)
+    .bind(TEST_DESCRIPTOR)
+    .execute(pool)
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation-page:{nym}:{kind}"))
+        .execute(&mut *tx)
+        .await?;
+    let (descriptor_generation, ct_descriptor): (i64, String) = sqlx::query_as(
+        "SELECT descriptor_generation, ct_descriptor \
+           FROM donation_pages \
+          WHERE nym = $1 AND kind = $2 \
+            AND enabled AND archived_at IS NULL",
+    )
+    .bind(nym)
+    .bind(kind)
+    .fetch_one(&mut *tx)
+    .await?;
+    let fixture_offset: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM checkout_liquid_address_reservations \
+          WHERE nym = $1 AND kind = $2 AND descriptor_generation = $3 \
+            AND address_index >= 2000000000",
+    )
+    .bind(nym)
+    .bind(kind)
+    .bind(descriptor_generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    let address_index = i32::try_from(2_000_000_000_i64 + fixture_offset)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    let reservation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO checkout_liquid_address_reservations \
+            (nym, kind, descriptor_generation, address_index, address) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id",
+    )
+    .bind(nym)
+    .bind(kind)
+    .bind(descriptor_generation)
+    .bind(address_index)
+    .bind(address)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE checkout_liquid_address_reservations \
+         SET status = 'certified', certified_at = clock_timestamp() \
+         WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    pay_service::db::insert_checkout_invoice(
+        pool,
+        invoice,
+        &pay_service::db::CheckoutLiquidReservation {
+            id: reservation_id,
+            nym: nym.to_string(),
+            kind: kind.to_string(),
+            descriptor_generation,
+            address_index,
+            address: address.to_string(),
+            ct_descriptor,
+        },
+    )
+    .await
 }
 
 async fn insert_test_wallet_invoice(
@@ -18807,7 +19972,7 @@ async fn bitcoin_quote_availability_tracks_exact_chain_minimum_boundaries() {
     ] {
         let liquid_address = format!("lq1chainminimum{suffix}");
         let blinding_key = "11".repeat(32);
-        let invoice = pay_service::db::insert_invoice(
+        let invoice = insert_reserved_test_checkout_invoice(
             &pool,
             &pay_service::db::NewInvoice {
                 nym_owner: Some(nym),
@@ -25695,7 +26860,7 @@ async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "m5tolerance").await;
     let liquid_blinding_key_hex = "11".repeat(32);
-    let invoice = pay_service::db::insert_invoice(
+    let invoice = insert_reserved_test_checkout_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("m5tolerance"),
@@ -25761,7 +26926,7 @@ async fn issue14_m5_direct_watcher_enforces_the_invoice_wide_tolerance() {
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "m5directtolerance").await;
     let liquid_blinding_key_hex = "22".repeat(32);
-    let invoice = pay_service::db::insert_invoice(
+    let invoice = insert_reserved_test_checkout_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("m5directtolerance"),
@@ -31833,6 +32998,46 @@ fn persisted_liquid_claim_fixture(
     )
 }
 
+fn reverse_lockup_parent_fixture(response: &CreateReverseResponse) -> (String, String) {
+    use boltz_client::elements;
+
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = elements::secp256k1_zkp::rand::thread_rng();
+    let asset = elements::AssetId::LIQUID_BTC;
+    let address = elements::Address::from_str(&response.lockup_address).unwrap();
+    let blinding_key =
+        elements::secp256k1_zkp::SecretKey::from_str(response.blinding_key.as_deref().unwrap())
+            .unwrap();
+    let blinding_pubkey = elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+    let input_secrets = elements::TxOutSecrets::new(
+        asset,
+        elements::confidential::AssetBlindingFactor::new(&mut rng),
+        response.onchain_amount,
+        elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+    let (output, _, _, _) = elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        response.onchain_amount,
+        asset,
+        address.script_pubkey(),
+        blinding_pubkey,
+        &[input_secrets],
+        &[],
+    )
+    .unwrap();
+    let transaction = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![output],
+    };
+    (
+        transaction.txid().to_string(),
+        hex::encode(elements::encode::serialize(&transaction)),
+    )
+}
+
 async fn spawn_counting_liquid_broadcast_server(
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -31867,6 +33072,159 @@ async fn spawn_counting_liquid_broadcast_server(
         }
     });
     (format!("tcp://{address}"), broadcast_calls, task)
+}
+
+async fn spawn_parent_gated_liquid_broadcast_server(
+    expected_parent_txid: String,
+    parent_raw_hex: String,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<Semaphore>,
+    tokio::task::JoinHandle<()>,
+) {
+    use boltz_client::elements;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let genesis_header = hex::encode(elements::encode::serialize(&elements::BlockHeader {
+        version: 0x2000_0000,
+        prev_blockhash: elements::BlockHash::all_zeros(),
+        merkle_root: elements::TxMerkleNode::all_zeros(),
+        time: 0,
+        height: 0,
+        ext: elements::BlockExtData::default(),
+    }));
+    let parent_queries = Arc::new(AtomicUsize::new(0));
+    let parent_seen = Arc::new(Notify::new());
+    let parent_visible = Arc::new(AtomicBool::new(false));
+    let history_queries = Arc::new(AtomicUsize::new(0));
+    let history_seen = Arc::new(Notify::new());
+    let broadcast_calls = Arc::new(AtomicUsize::new(0));
+    let broadcast_seen = Arc::new(Notify::new());
+    let release_broadcasts = Arc::new(Semaphore::new(0));
+    let task_parent_queries = parent_queries.clone();
+    let task_parent_seen = parent_seen.clone();
+    let task_parent_visible = parent_visible.clone();
+    let task_history_queries = history_queries.clone();
+    let task_history_seen = history_seen.clone();
+    let task_calls = broadcast_calls.clone();
+    let task_seen = broadcast_seen.clone();
+    let task_release = release_broadcasts.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let calls = task_calls.clone();
+            let seen = task_seen.clone();
+            let release = task_release.clone();
+            let parent_queries = task_parent_queries.clone();
+            let parent_seen = task_parent_seen.clone();
+            let parent_visible = task_parent_visible.clone();
+            let history_queries = task_history_queries.clone();
+            let history_seen = task_history_seen.clone();
+            let expected_parent_txid = expected_parent_txid.clone();
+            let parent_raw_hex = parent_raw_hex.clone();
+            let genesis_header = genesis_header.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                        break;
+                    };
+                    let method = request["method"].as_str().unwrap_or_default();
+                    if method == "blockchain.scripthash.get_history" {
+                        history_queries.fetch_add(1, Ordering::SeqCst);
+                        history_seen.notify_one();
+                        let result = if parent_visible.load(Ordering::SeqCst) {
+                            json!([{"tx_hash": expected_parent_txid, "height": 0}])
+                        } else {
+                            json!([])
+                        };
+                        let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        if writer
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if method == "blockchain.transaction.get" {
+                        parent_queries.fetch_add(1, Ordering::SeqCst);
+                        parent_seen.notify_one();
+                        let requested = request["params"][0].as_str().unwrap_or_default();
+                        let response = if requested == expected_parent_txid
+                            && parent_visible.load(Ordering::SeqCst)
+                        {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": parent_raw_hex
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {
+                                    "code": -5,
+                                    "message": "No such mempool or blockchain transaction"
+                                }
+                            })
+                        };
+                        if writer
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if method == "blockchain.transaction.broadcast" {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        seen.notify_one();
+                        let Ok(permit) = release.acquire().await else {
+                            break;
+                        };
+                        permit.forget();
+                    }
+                    let result = match method {
+                        "server.version" => json!(["bullnym-test", "1.4"]),
+                        "blockchain.block.header" => json!(genesis_header),
+                        "blockchain.transaction.broadcast" => json!("00".repeat(32)),
+                        _ => Value::Null,
+                    };
+                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                    if writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (
+        format!("tcp://{address}"),
+        parent_queries,
+        parent_seen,
+        parent_visible,
+        history_queries,
+        history_seen,
+        broadcast_calls,
+        broadcast_seen,
+        release_broadcasts,
+        task,
+    )
 }
 
 #[tokio::test]
@@ -38485,7 +39843,7 @@ async fn issue84_chain_invoice(
         pay_service::descriptor::derive_address(TEST_DESCRIPTOR, liquid_address_index).unwrap();
     let liquid_blinding_key_hex =
         pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
-    pay_service::db::insert_invoice(
+    insert_reserved_test_checkout_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),

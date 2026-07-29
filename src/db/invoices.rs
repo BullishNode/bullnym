@@ -482,45 +482,62 @@ pub async fn invoice_presentation_received_sat<'e, E: sqlx::PgExecutor<'e>>(
 }
 
 /// Insert a new invoice row. The caller is responsible for populating
-/// `liquid_address` when `accept_ln` or `accept_liquid` is TRUE — the
-/// `invoices_ln_or_liquid_addr_chk` constraint requires it at INSERT
-/// time. This generic entry point is checkout-only: the caller invokes a
-/// Page/POS descriptor allocator or `allocate_next_liquid_for_permanent_nym`,
-/// then passes the result through `NewInvoice.liquid_address`. Wallet-origin
-/// callers must use [`insert_or_reuse_wallet_invoice`] so an invoice cannot be
-/// published without its encrypted presentation and idempotency identity.
+/// Checkout rows carry `liquid_address` when Liquid settlement is accepted.
+/// Page/POS callers must reserve and certify that address before this insert;
+/// wallet-origin callers use [`insert_or_reuse_wallet_invoice`] so an invoice
+/// cannot be published without its encrypted presentation and idempotency
+/// identity.
 ///
 /// Lightning offers attach via a separate `record_swap` call that sets
 /// `swap_records.invoice_id`; the claimer routes the LN claim to the
 /// invoice's `liquid_address` via `resolve_claim_address` branch (B).
-pub async fn insert_invoice(
+/// Insert a Page/POS invoice and atomically attach the pre-certified Liquid
+/// address reservation. The reservation must still belong to the surface's
+/// current descriptor generation at commit time.
+pub async fn insert_checkout_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
+    reservation: &super::CheckoutLiquidReservation,
 ) -> Result<Invoice, sqlx::Error> {
-    insert_invoice_inner(pool, invoice, None).await
+    insert_checkout_invoice_inner(pool, invoice, None, reservation).await
 }
 
-/// Insert an invoice and, when the owner currently has an admitted setting
-/// for `product`, snapshot that policy in the same transaction. The owner
-/// advisory lock serializes this capture with setting changes and credential
-/// deletion; absence remains the ordinary Bitcoin-only behavior.
-pub async fn insert_invoice_with_fiat_policy(
+/// Insert a Page/POS invoice and, when the owner currently has an admitted
+/// setting for `product`, snapshot that policy in the same transaction. The
+/// owner advisory lock serializes this capture with setting changes and
+/// credential deletion; absence remains the ordinary Bitcoin-only behavior.
+pub async fn insert_checkout_invoice_with_fiat_policy(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
     product: Product,
     allowed_rail_mask: i16,
+    reservation: &super::CheckoutLiquidReservation,
 ) -> Result<Invoice, sqlx::Error> {
-    insert_invoice_inner(pool, invoice, Some((product, allowed_rail_mask))).await
+    insert_checkout_invoice_inner(
+        pool,
+        invoice,
+        Some((product, allowed_rail_mask)),
+        reservation,
+    )
+    .await
 }
 
-async fn insert_invoice_inner(
+async fn insert_checkout_invoice_inner(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
     fiat_policy: Option<(Product, i16)>,
+    reservation: &super::CheckoutLiquidReservation,
 ) -> Result<Invoice, sqlx::Error> {
     if invoice.origin != "checkout" {
         return Err(sqlx::Error::Protocol(
             "wallet invoices require insert_or_reuse_wallet_invoice".to_string(),
+        ));
+    }
+    if invoice.nym_owner != Some(reservation.nym.as_str())
+        || invoice.checkout_surface_kind != Some(reservation.kind.as_str())
+    {
+        return Err(sqlx::Error::Protocol(
+            "Page/POS checkout invoice does not match its Liquid reservation".to_string(),
         ));
     }
     let mut tx = pool.begin().await?;
@@ -534,6 +551,37 @@ async fn insert_invoice_inner(
             .await?;
     }
     insert_invoice_payment_addresses(&mut tx, &inserted, invoice).await?;
+    let liquid_address = invoice.liquid_address.ok_or_else(|| {
+        sqlx::Error::Protocol(
+            "checkout Liquid reservation requires an invoice Liquid address".to_string(),
+        )
+    })?;
+    let attached = sqlx::query(
+        "UPDATE checkout_liquid_address_reservations reservation \
+             SET status = 'allocated', invoice_id = $2, allocated_at = clock_timestamp() \
+             FROM donation_pages page \
+             WHERE reservation.id = $1 \
+               AND reservation.status = 'certified' \
+               AND reservation.invoice_id IS NULL \
+               AND reservation.address = $3 \
+               AND reservation.nym = page.nym \
+               AND reservation.kind = page.kind \
+               AND reservation.descriptor_generation = page.descriptor_generation \
+               AND page.nym = $4 AND page.kind = $5 \
+               AND page.enabled = TRUE AND page.archived_at IS NULL",
+    )
+    .bind(reservation.id)
+    .bind(inserted.id)
+    .bind(liquid_address)
+    .bind(reservation.nym.as_str())
+    .bind(reservation.kind.as_str())
+    .execute(&mut *tx)
+    .await?;
+    if attached.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "checkout Liquid reservation is stale, uncertified, or already allocated".to_string(),
+        ));
+    }
     tx.commit().await?;
     Ok(inserted)
 }

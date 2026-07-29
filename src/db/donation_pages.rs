@@ -1,4 +1,5 @@
 use sqlx::{Executor, PgPool, Postgres};
+use uuid::Uuid;
 
 /// Surface discriminator for a donation_pages row. `payment_page` and `pos`
 /// are separate surfaces with independent descriptors and cursors.
@@ -22,6 +23,9 @@ pub struct DonationPage {
     pub kind: String,
     pub ct_descriptor: String,
     pub next_addr_idx: i32,
+    /// Monotonic derivation domain. Descriptor replacement increments this
+    /// value and restarts that generation's cursor at zero.
+    pub descriptor_generation: i64,
     pub header: String,
     pub description: String,
     /// Server-generated, content-addressed social card.
@@ -63,6 +67,17 @@ pub struct UpsertDonationPage<'a> {
     pub alias: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutLiquidReservation {
+    pub id: Uuid,
+    pub nym: String,
+    pub kind: String,
+    pub descriptor_generation: i64,
+    pub address_index: i32,
+    pub address: String,
+    pub ct_descriptor: String,
+}
+
 #[derive(Debug)]
 pub enum UpsertDonationPageError {
     Database(sqlx::Error),
@@ -84,6 +99,11 @@ pub async fn upsert_donation_page(
     page: &UpsertDonationPage<'_>,
 ) -> Result<DonationPage, UpsertDonationPageError> {
     let mut tx = pool.begin().await?;
+    // Serialize descriptor generation changes with address reservations.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation-page:{}:{}", page.nym, page.kind))
+        .execute(&mut *tx)
+        .await?;
     let owner_npub: String = sqlx::query_scalar(
         "SELECT users.npub \
            FROM users \
@@ -137,6 +157,16 @@ pub async fn upsert_donation_page(
                  NULL, $11) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = EXCLUDED.ct_descriptor, \
+             descriptor_generation = CASE \
+                 WHEN donation_pages.ct_descriptor IS DISTINCT FROM EXCLUDED.ct_descriptor \
+                     THEN donation_pages.descriptor_generation + 1 \
+                 ELSE donation_pages.descriptor_generation \
+             END, \
+             next_addr_idx = CASE \
+                 WHEN donation_pages.ct_descriptor IS DISTINCT FROM EXCLUDED.ct_descriptor \
+                     THEN 0 \
+                 ELSE donation_pages.next_addr_idx \
+             END, \
              header = EXCLUDED.header, \
              description = EXCLUDED.description, \
              display_currency = EXCLUDED.display_currency, \
@@ -257,6 +287,7 @@ where
                 donation_pages.description, \
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
+                donation_pages.descriptor_generation, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \
                 donation_pages.instagram, donation_pages.enabled, \
                 (donation_pages.archived_at IS NOT NULL) AS is_archived \
@@ -290,6 +321,7 @@ pub async fn get_donation_page_by_alias(
                 donation_pages.description, \
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
+                donation_pages.descriptor_generation, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \
                 donation_pages.instagram, donation_pages.enabled, \
                 (donation_pages.archived_at IS NOT NULL) AS is_archived \
@@ -311,14 +343,16 @@ pub async fn get_donation_page_by_alias(
     .await
 }
 
-/// Bump `donation_pages.next_addr_idx` for an enabled, non-archived page and
-/// derive the next Liquid address from the page-specific descriptor.
-pub async fn allocate_next_liquid_for_donation_page<F>(
+/// Durably reserve the next globally unused Page/POS Liquid address before
+/// any chain query. The surface advisory lock serializes cursor movement with
+/// descriptor changes and concurrent invoice creation. Address uniqueness is
+/// global across all descriptor generations and surfaces.
+pub async fn reserve_next_liquid_for_donation_page<F>(
     pool: &PgPool,
     nym: &str,
     kind: &str,
     derive_address: F,
-) -> Result<Option<(String, i32, String)>, sqlx::Error>
+) -> Result<Option<CheckoutLiquidReservation>, sqlx::Error>
 where
     F: Fn(&str, u32) -> Result<String, sqlx::Error>,
 {
@@ -331,8 +365,8 @@ where
         .execute(&mut *tx)
         .await?;
 
-    let row: Option<(String, i32)> = sqlx::query_as(
-        "SELECT ct_descriptor, next_addr_idx \
+    let row: Option<(String, i32, i64)> = sqlx::query_as(
+        "SELECT ct_descriptor, next_addr_idx, descriptor_generation \
          FROM donation_pages \
          WHERE nym = $1 \
            AND kind = $2 \
@@ -344,7 +378,7 @@ where
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some((ct_descriptor, mut address_index)) = row else {
+    let Some((ct_descriptor, mut address_index, descriptor_generation)) = row else {
         return Ok(None);
     };
 
@@ -353,7 +387,7 @@ where
             sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
         })?;
         let address = derive_address(&ct_descriptor, idx_u32)?;
-        let in_use: bool = sqlx::query_scalar(
+        let invoice_owns_address: bool = sqlx::query_scalar(
             "SELECT EXISTS( \
                 SELECT 1 FROM invoice_payment_addresses \
                 WHERE rail = 'liquid' AND address = $1 \
@@ -363,17 +397,43 @@ where
         .fetch_one(&mut *tx)
         .await?;
 
-        if !in_use {
-            sqlx::query(
-                "UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2",
+        if !invoice_owns_address {
+            let reservation_id: Option<Uuid> = sqlx::query_scalar(
+                "INSERT INTO checkout_liquid_address_reservations \
+                    (nym, kind, descriptor_generation, address_index, address) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING id",
             )
             .bind(nym)
             .bind(kind)
-            .bind(address_index + 1)
-            .execute(&mut *tx)
+            .bind(descriptor_generation)
+            .bind(address_index)
+            .bind(&address)
+            .fetch_optional(&mut *tx)
             .await?;
-            tx.commit().await?;
-            return Ok(Some((address, address_index, ct_descriptor)));
+            if let Some(id) = reservation_id {
+                sqlx::query(
+                    "UPDATE donation_pages SET next_addr_idx = $3 \
+                     WHERE nym = $1 AND kind = $2 AND descriptor_generation = $4",
+                )
+                .bind(nym)
+                .bind(kind)
+                .bind(address_index + 1)
+                .bind(descriptor_generation)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(Some(CheckoutLiquidReservation {
+                    id,
+                    nym: nym.to_string(),
+                    kind: kind.to_string(),
+                    descriptor_generation,
+                    address_index,
+                    address,
+                    ct_descriptor,
+                }));
+            }
         }
 
         address_index += 1;
@@ -390,4 +450,40 @@ where
     Err(sqlx::Error::Protocol(format!(
         "could not allocate unused Payment Page Liquid address for {nym} after 100 attempts"
     )))
+}
+
+pub async fn certify_checkout_liquid_reservation(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE checkout_liquid_address_reservations reservation \
+         SET status = 'certified', certified_at = clock_timestamp() \
+         FROM donation_pages page \
+         WHERE reservation.id = $1 \
+           AND reservation.status = 'pending' \
+           AND reservation.invoice_id IS NULL \
+           AND reservation.nym = page.nym \
+           AND reservation.kind = page.kind \
+           AND reservation.descriptor_generation = page.descriptor_generation",
+    )
+    .bind(reservation_id)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+}
+
+pub async fn reject_checkout_liquid_reservation_history(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE checkout_liquid_address_reservations \
+         SET status = 'history_present', rejected_at = clock_timestamp() \
+         WHERE id = $1 AND status = 'pending' AND invoice_id IS NULL",
+    )
+    .bind(reservation_id)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
 }

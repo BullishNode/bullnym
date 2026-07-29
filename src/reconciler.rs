@@ -2064,7 +2064,7 @@ async fn apply_action(
                 candidate.as_ref(),
             )
             .await?;
-            db::schedule_immediate_claim(pool, swap.id).await?;
+            let _ = db::schedule_immediate_claim(pool, swap.id).await?;
             // Mempool sighting advances the checkout invoice to
             // `in_progress`. The matching webhook arm uses the same helper.
             invoice::flip_invoice_on_lightning_in_progress(
@@ -2091,7 +2091,7 @@ async fn apply_action(
                 candidate.as_ref(),
             )
             .await?;
-            db::schedule_immediate_claim(pool, swap.id).await?;
+            let _ = db::schedule_immediate_claim(pool, swap.id).await?;
             // Confirmed lockup is still settlement-pending. The claimer
             // records accounting only after our claim succeeds.
             invoice::flip_invoice_on_lightning_in_progress(
@@ -2125,7 +2125,7 @@ async fn apply_action(
                 swap_id = %swap.boltz_swap_id,
                 "reconciler scheduling immediate claim retry"
             );
-            db::schedule_immediate_claim(pool, swap.id).await?;
+            let _ = db::schedule_immediate_claim(pool, swap.id).await?;
             Ok(())
         }
         ScheduleScriptPathRetry => {
@@ -2188,9 +2188,8 @@ async fn apply_action(
                 )
                 .await?;
             }
-            let scheduled = db::schedule_immediate_claim(pool, swap.id).await?;
-            if scheduled == 1 {
-                tracing::error!(
+            match db::schedule_immediate_claim(pool, swap.id).await? {
+                db::ClaimRecoverySchedule::Scheduled => tracing::error!(
                     event = "reverse_swap_settled_without_local_claim",
                     source = "reconciler",
                     swap_id = %swap.boltz_swap_id,
@@ -2199,12 +2198,21 @@ async fn apply_action(
                     claim_txid = ?swap.claim_txid,
                     amount_sat = swap.amount_sat,
                     "provider reports a settled Lightning invoice without a local claimed state; scheduling automatic claim recovery"
-                );
-            } else {
-                tracing::debug!(
+                ),
+                db::ClaimRecoverySchedule::Coalesced => tracing::info!(
+                    event = "reverse_claim_webhook_coalesced",
+                    source = "reconciler",
+                    swap_id = %swap.boltz_swap_id,
+                    nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                    our_status = %swap.status,
+                    claim_txid = ?swap.claim_txid,
+                    amount_sat = swap.amount_sat,
+                    "settled reconciliation joined the active local claim broadcast"
+                ),
+                db::ClaimRecoverySchedule::Terminal => tracing::debug!(
                     swap_id = %swap.boltz_swap_id,
                     "settled reverse swap reached a terminal state before reconciler recovery scheduling"
-                );
+                ),
             }
             Ok(())
         }

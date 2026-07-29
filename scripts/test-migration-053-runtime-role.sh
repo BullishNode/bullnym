@@ -320,7 +320,8 @@ for later_migration in \
   migrations/079_lightning_address_provider_only.sql \
   migrations/080_persistent_provider_order_not_found.sql \
   migrations/081_provider_payment_first_observed_at.sql \
-  migrations/082_mixed_valuation_exception_scope.sql; do
+  migrations/082_mixed_valuation_exception_scope.sql \
+  migrations/083_checkout_descriptor_generations.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \

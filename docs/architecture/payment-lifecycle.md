@@ -50,8 +50,11 @@ Public checkout surfaces have independent Get Paid CT descriptors in
 `donation_pages.ct_descriptor`: Payment Page uses the reserved child at
 `39'/0'/12'/102'` and POS uses `39'/0'/12'/103'` (see ADR 002). Each
 `(nym, kind)` row has its own
-`donation_pages.next_addr_idx` cursor. Both surfaces require their own
-descriptor; neither falls back to the Lightning Address wallet or cursor.
+`donation_pages.next_addr_idx` cursor and monotonic descriptor generation.
+Descriptor replacement starts a fresh generation, and checkout publishes only
+an address with a durable reservation and certified empty Liquid history. Both
+surfaces require their own descriptor; neither falls back to the Lightning
+Address wallet or cursor.
 
 Permanent name and Lightning Address availability invariants:
 

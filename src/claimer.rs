@@ -73,6 +73,13 @@ use crate::validators;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+/// A Boltz `transaction.mempool` webhook can reach Bullnym before the exact
+/// Electrum node selected for claim broadcast has indexed the lockup. Probe
+/// that same node before sending the child transaction so provider propagation
+/// lag cannot consume a claim attempt or create a doomed broadcast.
+const REVERSE_PARENT_VISIBILITY_ATTEMPTS: usize = 40;
+const REVERSE_PARENT_VISIBILITY_INTERVAL: Duration = Duration::from_millis(250);
+const REVERSE_PARENT_VISIBILITY_RETRY: &str = "10 seconds";
 /// Discounted vbytes for the pinned boltz-client two-confidential-output
 /// Liquid claim shape. Both reverse and chain claims have the same measured
 /// size; the script path is the larger safe budget used before payer exposure.
@@ -96,6 +103,9 @@ const RENEGOTIATION_ACCEPT_REQUEST_STALE_AFTER_SECS: i64 = 30;
 #[doc(hidden)]
 pub const LIQUID_FEE_DECISION_PENDING_REASON: &str =
     "Liquid fee decision unavailable; retry after accepted live or recent same-rail evidence";
+#[doc(hidden)]
+pub const LIQUID_PARENT_VISIBILITY_PENDING_REASON: &str =
+    "Liquid lockup is not visible to the claim broadcaster yet; retry without consuming an attempt";
 
 fn liquid_claim_fee(decision: &LiquidBuilderFeeDecision, _cooperative_or_script_path: bool) -> Fee {
     // Both paths use the same sat/vByte decision. `boltz-client` applies it
@@ -626,7 +636,7 @@ async fn dispatch_webhook(
             )
             .await;
 
-            try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
+            let _ = try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
         }
         "invoice.settled" => {
             // Usually this arrives downstream of our successful cooperative
@@ -658,26 +668,51 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             }
-            let scheduled = db::schedule_immediate_claim(&state.db, swap.id)
+            let schedule = db::schedule_immediate_claim(&state.db, swap.id)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
-            if scheduled == 1 {
-                tracing::error!(
-                    event = "reverse_swap_settled_without_local_claim",
+            match schedule {
+                db::ClaimRecoverySchedule::Coalesced => tracing::info!(
+                    event = "reverse_claim_webhook_coalesced",
                     source = "webhook",
                     swap_id = %data.id,
                     nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                     our_status = %swap.status,
                     claim_txid = ?swap.claim_txid,
                     amount_sat = swap.amount_sat,
-                    "provider reports a settled Lightning invoice without a local claimed state; scheduling automatic claim recovery"
-                );
-                try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
-            } else {
-                tracing::debug!(
+                    "settled webhook joined the active local claim broadcast"
+                ),
+                db::ClaimRecoverySchedule::Scheduled => {
+                    let outcome =
+                        try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
+                    if matches!(outcome, Ok(ClaimOutcome::SkippedLockHeld)) {
+                        tracing::info!(
+                            event = "reverse_claim_webhook_coalesced",
+                            source = "webhook",
+                            swap_id = %data.id,
+                            nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                            our_status = %swap.status,
+                            claim_txid = ?swap.claim_txid,
+                            amount_sat = swap.amount_sat,
+                            "settled webhook joined active local claim preparation"
+                        );
+                    } else {
+                        tracing::info!(
+                            event = "reverse_swap_settled_claim_recovery_dispatched",
+                            source = "webhook",
+                            swap_id = %data.id,
+                            nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                            our_status = %swap.status,
+                            claim_txid = ?swap.claim_txid,
+                            amount_sat = swap.amount_sat,
+                            "settled webhook dispatched bounded local claim recovery"
+                        );
+                    }
+                }
+                db::ClaimRecoverySchedule::Terminal => tracing::debug!(
                     swap_id = %data.id,
                     "settled reverse swap reached a terminal state before webhook recovery scheduling"
-                );
+                ),
             }
         }
         "swap.expired" => {
@@ -2465,6 +2500,13 @@ async fn try_claim_chain_swap_with_retry(
                 "webhook chain-swap claim remains pending"
             );
         }
+        Ok(ClaimOutcome::PendingBroadcastReadiness { reason }) => {
+            tracing::info!(
+                swap_id = %swap.boltz_swap_id,
+                reason,
+                "webhook chain-swap claim is waiting for broadcast readiness"
+            );
+        }
         Ok(ClaimOutcome::EvidenceBlocked { action }) => {
             tracing::info!(
                 event = "chain_swap_claim_evidence_deferred",
@@ -2498,6 +2540,10 @@ pub enum ClaimOutcome {
     /// No accepted live or recent same-rail Liquid fee decision exists. No
     /// bytes or retry-failure state were written; a later sweep may retry.
     PendingFeeUnavailable { reason: &'static str },
+    /// The exact broadcast backend has not indexed every lockup parent yet.
+    /// No broadcast RPC ran and no ordinary claim attempt was consumed; the
+    /// durable journal remains due on a short readiness retry.
+    PendingBroadcastReadiness { reason: &'static str },
     /// Fresh under-lock chain/journal facts no longer authorize ClaimLiquid.
     /// This is an observation/dispatcher outcome, not a failed claim attempt;
     /// no construction, journal, broadcast-start, or network mutation ran.
@@ -2587,12 +2633,15 @@ fn is_local_claim_error(message: &str) -> bool {
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
 /// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
-async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContext<'_>) {
+async fn try_claim_with_retry(
+    swap: &db::SwapRecord,
+    context: ClaimAttemptContext<'_>,
+) -> Result<ClaimOutcome, AppError> {
     let fee_decision = context
         .fee_runtime
         .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
         .ok();
-    match claim_swap(
+    let result = claim_swap(
         context.pool,
         swap.id,
         Some(context.state),
@@ -2604,8 +2653,8 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
         fee_decision.as_ref().map(|(decision, _)| decision),
         fee_decision.as_ref().map(|(_, record)| record),
     )
-    .await
-    {
+    .await;
+    match &result {
         Ok(ClaimOutcome::Broadcast) => {}
         Ok(ClaimOutcome::AlreadyTerminal) => {}
         Ok(ClaimOutcome::SkippedLockHeld) => {
@@ -2621,6 +2670,14 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
                 "webhook reverse-swap claim remains pending"
             );
         }
+        Ok(ClaimOutcome::PendingBroadcastReadiness { reason }) => {
+            tracing::info!(
+                event = "reverse_claim_parent_visibility_deferred",
+                swap_id = %swap.boltz_swap_id,
+                reason,
+                "webhook reverse-swap claim is waiting for its lockup parent"
+            );
+        }
         Ok(ClaimOutcome::EvidenceBlocked { action }) => {
             tracing::warn!(
                 ?action,
@@ -2634,6 +2691,7 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
             );
         }
     }
+    result
 }
 
 /// Returns the claim destination for this swap. Three branches in order:
@@ -2923,6 +2981,26 @@ impl ClaimPreparationSessionLock {
         })
     }
 
+    async fn try_acquire(pool: &sqlx::PgPool, lock_key: String) -> Result<Option<Self>, AppError> {
+        let mut connection = pool
+            .acquire()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        if !locked {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            connection,
+            lock_key,
+            locked: true,
+        }))
+    }
+
     async fn unlock(&mut self) -> Result<(), AppError> {
         let lock_key = self.lock_key.clone();
         let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
@@ -2962,6 +3040,12 @@ impl Drop for ClaimPreparationSessionLock {
     }
 }
 
+enum ReverseMixedClaimPreparation {
+    Ready(Option<MixedSettlementPreparation>),
+    PendingLockupVisibility,
+    Busy,
+}
+
 async fn prepare_reverse_mixed_claim(
     state: &AppState,
     reverse_swap_id: Uuid,
@@ -2969,9 +3053,13 @@ async fn prepare_reverse_mixed_claim(
     claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     fee_decision: Option<&LiquidFeeDecision>,
-) -> Result<Option<MixedSettlementPreparation>, AppError> {
-    let mut guard =
-        ClaimPreparationSessionLock::acquire(&state.db, format!("claim:{reverse_swap_id}")).await?;
+) -> Result<ReverseMixedClaimPreparation, AppError> {
+    let Some(mut guard) =
+        ClaimPreparationSessionLock::try_acquire(&state.db, format!("claim:{reverse_swap_id}"))
+            .await?
+    else {
+        return Ok(ReverseMixedClaimPreparation::Busy);
+    };
     let result = async {
         if had_persisted_claim {
             return bull_bitcoin_settlement::prepare_reverse_mixed_settlement_on_locked_connection(
@@ -2983,7 +3071,8 @@ async fn prepare_reverse_mixed_claim(
             .await
             .map_err(|error| {
                 AppError::ClaimError(format!("load journaled mixed reverse settlement: {error}"))
-            });
+            })
+            .map(ReverseMixedClaimPreparation::Ready);
         }
         let claim_clients = claim_clients.ok_or_else(|| {
             AppError::ClaimError(
@@ -3022,7 +3111,8 @@ async fn prepare_reverse_mixed_claim(
             .await
             .map_err(|error| {
                 AppError::ClaimError(format!("load raced mixed reverse journal: {error}"))
-            });
+            })
+            .map(ReverseMixedClaimPreparation::Ready);
         }
         if !status.is_claimable() {
             return Err(AppError::ClaimError(
@@ -3041,7 +3131,7 @@ async fn prepare_reverse_mixed_claim(
             .map_err(|error| AppError::DbError(error.to_string()))?;
 
         let builder_fee = LiquidBuilderFeeDecision::from(fee_decision);
-        let claim_fee_sat = estimate_reverse_mixed_claim_fee_sat(
+        let Some(claim_fee_sat) = estimate_reverse_mixed_claim_fee_sat(
             &swap,
             &output_address,
             claim_clients,
@@ -3049,7 +3139,20 @@ async fn prepare_reverse_mixed_claim(
             &builder_fee,
             provider_only,
         )
-        .await?;
+        .await?
+        else {
+            let mut retry = guard
+                .begin()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            defer_unjournaled_reverse_claim_for_lockup_visibility(&mut retry, reverse_swap_id)
+                .await?;
+            retry
+                .commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return Ok(ReverseMixedClaimPreparation::PendingLockupVisibility);
+        };
         validate_funded_mixed_claim_fee(
             "mixed reverse claim",
             swap.mixed_claim_path.as_deref(),
@@ -3095,6 +3198,7 @@ async fn prepare_reverse_mixed_claim(
         )
         .await
         .map_err(|error| AppError::ClaimError(format!("prepare mixed reverse settlement: {error}")))
+        .map(ReverseMixedClaimPreparation::Ready)
     }
     .await;
     guard.unlock().await?;
@@ -3239,46 +3343,235 @@ async fn prepare_chain_mixed_claim(
     result
 }
 
-/// Single-flight, idempotent claim.
-///
-/// `construct_claim` is non-deterministic on Liquid — random MuSig2
-/// session nonces (`liquid.rs:703-714`) plus random asset/value
-/// blinding factors (`liquid.rs:833`) yield a different valid-but-
-/// conflicting tx every call. The previous implementation called
-/// `construct_claim` from scratch on every retry; if a previous
-/// broadcast had landed but our response was lost, the next attempt
-/// produced a different tx that Electrum rejected as a double-spend
-/// and we marked the row `claim_failed` even though the swap had
-/// actually succeeded.
-///
-/// This version persists the constructed tx hex into `swap_records`
-/// BEFORE the first broadcast, so subsequent attempts re-broadcast
-/// the SAME tx instead of constructing a new one. Re-broadcasting
-/// is idempotent at the Electrum boundary: `try_broadcast_tx`
-/// (boltz-rust `wrappers.rs:199-212`) treats `"already in block
-/// chain"` and `"already in utxo set"` as success.
-///
-/// The shape:
-///
-///   1. Open a transaction; try to acquire `pg_try_advisory_xact_lock`
-///      keyed on `claim:<swap_id>`. Concurrent attempts return
-///      `SkippedLockHeld` and try on the next tick.
-///   2. Reload the row inside the lock. If terminal, return
-///      `AlreadyTerminal`.
-///   3. If no transaction is journaled and no accepted fee decision is
-///      available, return `PendingFeeUnavailable` without allocating a
-///      destination or consuming an attempt.
-///   4. Resolve the claim destination address (allocates a fresh
-///      descriptor index if none was set at swap creation).
-///   5. If `claim_tx_hex` is set, deserialize it. Otherwise
-///      `construct_claim` and persist `(claim_tx_hex, claim_txid,
-///      claim_path)` in the same transaction. Mark status `claiming`.
-///      Set a short in-flight lease in `next_claim_attempt_at`.
-///   6. Commit (releases the advisory lock).
-///   7. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
-///      I/O-bound step and we don't want to hold a DB connection.
-///      Idempotent on Electrum.
-///   8. Mark status `claimed` with the on-chain txid.
+fn liquid_parent_not_visible_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no such mempool or blockchain transaction")
+        || message.contains("transaction not found")
+        || message.contains("unknown transaction")
+        || message.contains("missing transaction")
+        || message.contains("\"code\":-5")
+        || message.contains("\"code\": -5")
+        || message.contains("code: -5")
+}
+
+fn liquid_lockup_not_visible_error(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("no transaction history")
+        || liquid_parent_not_visible_error(message)
+}
+
+async fn wait_for_reverse_lockup_utxo(
+    client: ElectrumLiquidClient,
+    lockup_address: &str,
+) -> Result<Option<ElectrumLiquidClient>, AppError> {
+    let address = boltz_elements::Address::from_str(lockup_address).map_err(|error| {
+        AppError::ClaimError(format!(
+            "parse reverse lockup address for visibility: {error}"
+        ))
+    })?;
+    if address.params != &boltz_elements::AddressParams::LIQUID {
+        return Err(AppError::ClaimError(
+            "reverse lockup visibility address is not Liquid mainnet".into(),
+        ));
+    }
+    let mut client = Some(client);
+    for attempt in 1..=REVERSE_PARENT_VISIBILITY_ATTEMPTS {
+        let probe_client = client.take().ok_or_else(|| {
+            AppError::ElectrumError("reverse lockup visibility client was lost".into())
+        })?;
+        let probe_address = address.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (returned_client, probe) = tokio::task::spawn_blocking(move || {
+            let result = runtime
+                .block_on(probe_client.get_address_utxo(&probe_address))
+                .map(|utxo| utxo.is_some())
+                .map_err(|error| error.to_string());
+            (probe_client, result)
+        })
+        .await
+        .map_err(|error| {
+            AppError::ElectrumError(format!(
+                "reverse claim lockup visibility probe join: {error}"
+            ))
+        })?;
+        client = Some(returned_client);
+        match probe {
+            Ok(true) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        event = "reverse_claim_lockup_visible",
+                        attempts = attempt,
+                        "Liquid lockup UTXO became visible to claim construction"
+                    );
+                }
+                return Ok(client);
+            }
+            Ok(false) => {}
+            Err(error) if liquid_lockup_not_visible_error(&error) => {}
+            Err(error) => {
+                return Err(AppError::ElectrumError(format!(
+                    "reverse claim lockup visibility probe: {error}"
+                )))
+            }
+        }
+        if attempt < REVERSE_PARENT_VISIBILITY_ATTEMPTS {
+            tokio::time::sleep(REVERSE_PARENT_VISIBILITY_INTERVAL).await;
+        }
+    }
+    Ok(None)
+}
+
+async fn defer_unjournaled_reverse_claim_for_lockup_visibility(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap_id: Uuid,
+) -> Result<(), AppError> {
+    let deferred = sqlx::query(
+        "UPDATE swap_records \
+         SET next_claim_attempt_at = NOW() + $2::interval, updated_at = NOW() \
+         WHERE id = $1 AND claim_tx_hex IS NULL \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
+    )
+    .bind(swap_id)
+    .bind(REVERSE_PARENT_VISIBILITY_RETRY)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    if deferred.rows_affected() != 1 {
+        return Err(AppError::DbError(format!(
+            "reverse claim lockup readiness lost its active row: {swap_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn reverse_claim_parent_txids(
+    claim_tx: &BtcLikeTransaction,
+) -> Result<Vec<boltz_elements::Txid>, AppError> {
+    let BtcLikeTransaction::Liquid(transaction) = claim_tx else {
+        return Err(AppError::ClaimError(
+            "reverse Liquid claim journal decoded as a non-Liquid transaction".into(),
+        ));
+    };
+    if transaction.input.is_empty() {
+        return Err(AppError::ClaimError(
+            "reverse Liquid claim transaction has no lockup input".into(),
+        ));
+    }
+    let mut parents = Vec::with_capacity(transaction.input.len());
+    for input in &transaction.input {
+        let txid = input.previous_output.txid;
+        if !parents.contains(&txid) {
+            parents.push(txid);
+        }
+    }
+    Ok(parents)
+}
+
+async fn wait_for_reverse_claim_parents(
+    endpoint: &str,
+    claim_tx: &BtcLikeTransaction,
+) -> Result<bool, AppError> {
+    let parents = reverse_claim_parent_txids(claim_tx)?;
+    let endpoint = endpoint.to_owned();
+    let parent_count = parents.len();
+    let result = tokio::task::spawn_blocking(move || {
+        use electrum_client::ElectrumApi;
+
+        let client = electrum_client::Client::from_config(
+            &endpoint,
+            electrum_client::Config::builder().timeout(Some(12)).build(),
+        )
+        .map_err(|error| {
+            AppError::ElectrumError(format!(
+                "connect claim parent visibility probe {endpoint}: {error}"
+            ))
+        })?;
+        for attempt in 1..=REVERSE_PARENT_VISIBILITY_ATTEMPTS {
+            let mut pending = false;
+            for parent_txid in &parents {
+                let electrum_txid = electrum_client::bitcoin::Txid::from_str(
+                    &parent_txid.to_string(),
+                )
+                .map_err(|error| {
+                    AppError::ClaimError(format!(
+                        "parse reverse claim parent txid {parent_txid}: {error}"
+                    ))
+                })?;
+                match client.transaction_get_raw(&electrum_txid) {
+                    Ok(raw) => {
+                        let parent: boltz_elements::Transaction =
+                            boltz_elements::encode::deserialize(&raw).map_err(|error| {
+                                AppError::ElectrumError(format!(
+                                    "decode claim parent {parent_txid} from {endpoint}: {error}"
+                                ))
+                            })?;
+                        if parent.txid() != *parent_txid {
+                            return Err(AppError::ElectrumError(format!(
+                                "claim parent probe returned {} for requested {}",
+                                parent.txid(),
+                                parent_txid
+                            )));
+                        }
+                    }
+                    Err(error) if liquid_parent_not_visible_error(&error.to_string()) => {
+                        pending = true;
+                    }
+                    Err(error) => {
+                        return Err(AppError::ElectrumError(format!(
+                            "claim parent visibility probe for {parent_txid}: {error}"
+                        )))
+                    }
+                }
+            }
+            if !pending {
+                return Ok(Some(attempt));
+            }
+            if attempt < REVERSE_PARENT_VISIBILITY_ATTEMPTS {
+                std::thread::sleep(REVERSE_PARENT_VISIBILITY_INTERVAL);
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(|error| AppError::ElectrumError(format!("claim parent probe join: {error}")))??;
+    if let Some(attempts) = result {
+        if attempts > 1 {
+            tracing::info!(
+                event = "reverse_claim_parent_visible",
+                attempts,
+                parents = parent_count,
+                "Liquid lockup became visible to the exact claim broadcaster"
+            );
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn defer_reverse_claim_for_parent_visibility(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    claim_txid: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE swap_records \
+         SET next_claim_attempt_at = NOW() + $3::interval, updated_at = NOW() \
+         WHERE id = $1 AND status = 'claiming' AND claim_txid = $2",
+    )
+    .bind(swap_id)
+    .bind(claim_txid)
+    .bind(REVERSE_PARENT_VISIBILITY_RETRY)
+    .execute(pool)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    Ok(())
+}
+
+/// Single-flight, idempotent reverse claim. Claim bytes and a durable lease
+/// are committed before network I/O; the exact broadcaster must then observe
+/// every lockup parent before the sole child-broadcast RPC is attempted.
 #[allow(clippy::too_many_arguments)]
 async fn claim_swap(
     pool: &sqlx::PgPool,
@@ -3359,6 +3652,61 @@ pub async fn exercise_reverse_claim_without_fee(
         db::InvoiceAccountingTolerances::default(),
         None,
         None,
+        false,
+    )
+    .await
+}
+
+/// Integration seam for an already-journaled reverse claim. It executes the
+/// production lease, journal reload, Electrum connection, and broadcast path
+/// without the outer failure counter so tests can stop at the actual RPC
+/// boundary and model process loss while a broadcast is in flight.
+#[doc(hidden)]
+pub async fn exercise_journaled_reverse_claim_retry(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    claim_clients: &LiquidClaimClientFactory,
+) -> Result<ClaimOutcome, AppError> {
+    claim_swap_inner(
+        pool,
+        swap_id,
+        None,
+        Some(claim_clients),
+        "http://127.0.0.1:1",
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Integration seam for an unjournaled reverse claim with a controlled
+/// Electrum endpoint. It crosses the production lockup-visibility,
+/// construction, journal, lease, and broadcast boundaries without the outer
+/// failure counter so tests can model process loss at either network edge.
+#[doc(hidden)]
+pub async fn exercise_unjournaled_reverse_claim_retry(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    claim_clients: &LiquidClaimClientFactory,
+    fee_decision: &LiquidFeeDecision,
+) -> Result<ClaimOutcome, AppError> {
+    let fee_record = liquid_fee_record_for_compatibility_seam(
+        FeeConstructionPurpose::ReverseLiquidClaim,
+        fee_decision,
+    )?;
+    claim_swap_inner(
+        pool,
+        swap_id,
+        None,
+        Some(claim_clients),
+        "http://127.0.0.1:1",
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        Some(fee_decision),
+        Some(&fee_record),
         false,
     )
     .await
@@ -3541,18 +3889,19 @@ async fn claim_swap_inner(
     // is bounded provider I/O. Preflight the durable swap first, then let the
     // settlement service serialize the one allowed create call on the exact
     // same advisory-lock key used below.
-    let preflight: Option<(String, bool, bool)> = sqlx::query_as(
+    let preflight: Option<(String, bool, bool, bool)> = sqlx::query_as(
         "SELECT swap.status, swap.claim_tx_hex IS NOT NULL, EXISTS ( \
              SELECT 1 FROM swap_fiat_settlement_policies policy \
               WHERE policy.reverse_swap_id = swap.id \
-         ) \
+         ), swap.status = 'claiming' AND swap.next_claim_attempt_at > NOW() \
          FROM swap_records swap WHERE swap.id = $1",
     )
     .bind(swap_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| AppError::DbError(error.to_string()))?;
-    let Some((preflight_status, had_preflight_claim, has_mixed_policy)) = preflight else {
+    let Some((preflight_status, had_preflight_claim, has_mixed_policy, active_lease)) = preflight
+    else {
         return Err(AppError::ClaimError(format!("swap not found: {swap_id}")));
     };
     let preflight_status = preflight_status
@@ -3560,6 +3909,17 @@ async fn claim_swap_inner(
         .map_err(|error| AppError::ClaimError(format!("invalid persisted swap status: {error}")))?;
     if !preflight_status.is_claimable() {
         return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+    // This is an early, read-only fast path before mixed-settlement
+    // preparation can perform provider I/O. The authoritative check remains
+    // below under the per-swap advisory lock and row lock.
+    if active_lease {
+        tracing::debug!(
+            event = "reverse_claim_webhook_coalesced",
+            swap_id = %swap_id,
+            "claim broadcast lease is active at claim entry; coalescing invocation"
+        );
+        return Ok(ClaimOutcome::SkippedLockHeld);
     }
     if has_mixed_policy
         && !had_preflight_claim
@@ -3575,20 +3935,38 @@ async fn claim_swap_inner(
                 "mixed reverse claim requires Bull Bitcoin settlement state".into(),
             )
         })?;
-        Some(
-            prepare_reverse_mixed_claim(
-                state,
-                swap_id,
-                had_preflight_claim,
-                claim_clients,
-                boltz_url,
-                fee_decision,
-            )
-            .await?
-            .ok_or_else(|| {
-                AppError::ClaimError("mixed reverse policy disappeared during preparation".into())
-            })?,
+        match prepare_reverse_mixed_claim(
+            state,
+            swap_id,
+            had_preflight_claim,
+            claim_clients,
+            boltz_url,
+            fee_decision,
         )
+        .await?
+        {
+            ReverseMixedClaimPreparation::Ready(preparation) => {
+                Some(preparation.ok_or_else(|| {
+                    AppError::ClaimError(
+                        "mixed reverse policy disappeared during preparation".into(),
+                    )
+                })?)
+            }
+            ReverseMixedClaimPreparation::PendingLockupVisibility => {
+                tracing::info!(
+                    event = "reverse_claim_lockup_visibility_deferred",
+                    swap_id = %swap_id,
+                    retry_after = REVERSE_PARENT_VISIBILITY_RETRY,
+                    "Liquid lockup UTXO is not visible to mixed claim preparation; no attempt was consumed"
+                );
+                return Ok(ClaimOutcome::PendingBroadcastReadiness {
+                    reason: LIQUID_PARENT_VISIBILITY_PENDING_REASON,
+                });
+            }
+            ReverseMixedClaimPreparation::Busy => {
+                return Ok(ClaimOutcome::SkippedLockHeld);
+            }
+        }
     } else {
         None
     };
@@ -3949,7 +4327,22 @@ async fn claim_swap_inner(
             result => result,
         };
         let constructed = match construction {
-            Ok(tx) => tx,
+            Ok(Some(tx)) => tx,
+            Ok(None) => {
+                defer_unjournaled_reverse_claim_for_lockup_visibility(&mut tx, swap.id).await?;
+                tx.commit()
+                    .await
+                    .map_err(|error| AppError::DbError(error.to_string()))?;
+                tracing::info!(
+                    event = "reverse_claim_lockup_visibility_deferred",
+                    swap_id = %swap.boltz_swap_id,
+                    retry_after = REVERSE_PARENT_VISIBILITY_RETRY,
+                    "Liquid lockup UTXO is not visible to claim construction; no attempt was consumed"
+                );
+                return Ok(ClaimOutcome::PendingBroadcastReadiness {
+                    reason: LIQUID_PARENT_VISIBILITY_PENDING_REASON,
+                });
+            }
             Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
                 // Boltz refused cooperative MuSig2 (status mismatch,
                 // bad preimage, or operator-disabled). Flip the flag
@@ -4202,17 +4595,33 @@ async fn claim_swap_inner(
     let expected_hex = serialize_claim_tx_hex(&claim_tx)?;
     let claim_tx = reload_reverse_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
 
-    // Broadcast outside the lock.
+    // Broadcast outside the lock. Before submitting the child transaction,
+    // require the exact selected Electrum broadcaster to return every parent
+    // transaction. Boltz's authoritative mempool event can precede this
+    // node-local visibility by several seconds; broadcasting during that gap
+    // produces the misleading missing/spent error from #263.
     //
     // Broadcast is pure I/O against Electrum and may take seconds. We
     // hold no DB connection or lock during the call. If the process
     // dies between here and the final update, the next sweep tick re-acquires
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
-    let liquid_client = claim_clients.connect().await?;
-    let chain_client = ChainClient::new().with_liquid(liquid_client);
-
     let mut txid = btc_like_txid(&claim_tx);
+    let (liquid_client, claim_endpoint) = claim_clients.connect_with_endpoint().await?;
+    if !wait_for_reverse_claim_parents(&claim_endpoint, &claim_tx).await? {
+        defer_reverse_claim_for_parent_visibility(pool, swap.id, &txid).await?;
+        tracing::info!(
+            event = "reverse_claim_parent_visibility_deferred",
+            swap_id = %swap.boltz_swap_id,
+            claim_txid = %txid,
+            retry_after = REVERSE_PARENT_VISIBILITY_RETRY,
+            "Liquid lockup is not visible to the exact claim broadcaster; no broadcast was attempted"
+        );
+        return Ok(ClaimOutcome::PendingBroadcastReadiness {
+            reason: LIQUID_PARENT_VISIBILITY_PENDING_REASON,
+        });
+    }
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
 
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
         // `try_broadcast_tx` only swallows `"already in block chain"` /
@@ -6140,7 +6549,7 @@ async fn estimate_reverse_mixed_claim_fee_sat(
     boltz_url: &str,
     fee_decision: &LiquidBuilderFeeDecision,
     provider_only: bool,
-) -> Result<u64, AppError> {
+) -> Result<Option<u64>, AppError> {
     let claim_key_hex = swap
         .claim_key_hex
         .as_deref()
@@ -6165,6 +6574,11 @@ async fn estimate_reverse_mixed_claim_fee_sat(
     )
     .map_err(|error| AppError::ClaimError(format!("swap script build failed: {error}")))?;
     let liquid_client = claim_clients.connect().await?;
+    let Some(liquid_client) =
+        wait_for_reverse_lockup_utxo(liquid_client, &response.lockup_address).await?
+    else {
+        return Ok(None);
+    };
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
     let use_cooperative = mixed_claim_uses_cooperative(
@@ -6191,7 +6605,7 @@ async fn estimate_reverse_mixed_claim_fee_sat(
         .map_err(|error| {
             AppError::ClaimError(format!("estimate mixed reverse claim size: {error}"))
         })?;
-    exact_relative_fee_sat(vsize, fee_decision)
+    exact_relative_fee_sat(vsize, fee_decision).map(Some)
 }
 
 async fn construct_claim_tx(
@@ -6202,7 +6616,7 @@ async fn construct_claim_tx(
     fee_decision: &LiquidBuilderFeeDecision,
     cooperative: bool,
     additional_output: Option<(&str, u64)>,
-) -> Result<BtcLikeTransaction, AppError> {
+) -> Result<Option<BtcLikeTransaction>, AppError> {
     let preimage_hex = swap
         .preimage_hex
         .as_deref()
@@ -6239,6 +6653,11 @@ async fn construct_claim_tx(
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
     let liquid_client = claim_clients.connect().await?;
+    let Some(liquid_client) =
+        wait_for_reverse_lockup_utxo(liquid_client, &boltz_response.lockup_address).await?
+    else {
+        return Ok(None);
+    };
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -6264,6 +6683,7 @@ async fn construct_claim_tx(
     swap_script
         .construct_claim(&preimage, params)
         .await
+        .map(Some)
         .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))
 }
 
@@ -6513,45 +6933,61 @@ impl LiquidClaimClientFactory {
     /// each validated URL until one connects and answers a cheap probe — the
     /// same provider failover the UtxoBackend pool already has (#47).
     async fn connect(&self) -> Result<ElectrumLiquidClient, AppError> {
+        connect_liquid_electrum(&self.urls)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    /// Return the selected endpoint with the broadcast client. Reverse claims
+    /// use it for an exact-authority parent visibility probe before moving the
+    /// child transaction across the broadcast RPC boundary.
+    async fn connect_with_endpoint(&self) -> Result<(ElectrumLiquidClient, String), AppError> {
         connect_liquid_electrum(&self.urls).await
     }
 }
 
-async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
+async fn connect_liquid_electrum(
+    urls: &[String],
+) -> Result<(ElectrumLiquidClient, String), AppError> {
     let mut errors: Vec<String> = Vec::new();
     for (i, url) in urls.iter().enumerate() {
+        let endpoint = url.clone();
         let tls = url.starts_with("ssl://");
-        let client = match ElectrumLiquidClient::new(
-            LiquidChain::Liquid,
-            electrum_host_port(url),
-            tls,
-            tls,
-            30,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
+        let host_port = electrum_host_port(url).to_owned();
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = ElectrumLiquidClient::new(LiquidChain::Liquid, &host_port, tls, tls, 30)
+                .map_err(|error| ("connect", error.to_string()))?;
+            runtime
+                .block_on(client.get_genesis_hash())
+                .map_err(|error| ("probe", error.to_string()))?;
+            Ok::<_, (&'static str, String)>(client)
+        })
+        .await;
+        let client = match result {
+            Ok(Ok(client)) => client,
+            Ok(Err((stage, error))) => {
                 tracing::warn!(
                     event = "liquid_electrum_failover",
                     endpoint = %url,
-                    err = %e,
-                    "Liquid electrum connect failed; trying next endpoint"
+                    err = %error,
+                    stage,
+                    "Liquid electrum connection validation failed; trying next endpoint"
                 );
-                errors.push(format!("{url}: connect: {e}"));
+                errors.push(format!("{url}: {stage}: {error}"));
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "liquid_electrum_failover",
+                    endpoint = %url,
+                    err = %error,
+                    "Liquid electrum connection task failed; trying next endpoint"
+                );
+                errors.push(format!("{url}: task: {error}"));
                 continue;
             }
         };
-        // Post-connect validation: a genesis-header fetch is cheap and
-        // deterministic; an up-but-broken node errors here and we rotate.
-        if let Err(e) = client.get_genesis_hash().await {
-            tracing::warn!(
-                event = "liquid_electrum_failover",
-                endpoint = %url,
-                err = %e,
-                "Liquid electrum connected but failed validation probe; trying next endpoint"
-            );
-            errors.push(format!("{url}: probe: {e}"));
-            continue;
-        }
         if i > 0 {
             tracing::warn!(
                 event = "liquid_electrum_failover",
@@ -6559,7 +6995,7 @@ async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient
                 "connected to failover Liquid electrum after earlier endpoint(s) failed"
             );
         }
-        return Ok(client);
+        return Ok((client, endpoint));
     }
     tracing::error!(
         event = "liquid_electrum_all_endpoints_failed",
@@ -7082,6 +7518,14 @@ pub fn spawn_background_claimer(
                                         "background claimer: reverse swap remains pending"
                                     );
                                 }
+                                Ok(ClaimOutcome::PendingBroadcastReadiness { reason }) => {
+                                    tracing::info!(
+                                        event = "reverse_claim_parent_visibility_deferred",
+                                        swap_id = %swap.boltz_swap_id,
+                                        reason,
+                                        "background claimer: reverse swap is waiting for its lockup parent"
+                                    );
+                                }
                                 Ok(ClaimOutcome::EvidenceBlocked { action }) => {
                                     tracing::warn!(
                                         ?action,
@@ -7157,6 +7601,13 @@ pub fn spawn_background_claimer(
                                         swap_id = %swap.boltz_swap_id,
                                         reason,
                                         "background claimer: chain swap remains pending"
+                                    );
+                                }
+                                Ok(ClaimOutcome::PendingBroadcastReadiness { reason }) => {
+                                    tracing::info!(
+                                        swap_id = %swap.boltz_swap_id,
+                                        reason,
+                                        "background claimer: chain swap is waiting for broadcast readiness"
                                     );
                                 }
                                 Ok(ClaimOutcome::EvidenceBlocked { action }) => {

@@ -212,6 +212,7 @@ const LIST_LIMIT_MAX: i64 = 100;
 /// BOLT11s may expire sooner and are refreshed while the invoice is live;
 /// this cap prevents abandoned checkout invoices from refreshing forever.
 const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
+const CHECKOUT_CLEAN_ADDRESS_SCAN_LIMIT: usize = 100;
 
 const FIAT_QUOTE_WINDOW_SECS: i64 = 5 * 60;
 
@@ -1060,24 +1061,9 @@ async fn create_anonymous_for_kind(
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
-    let (liquid_address, _liquid_index, payment_descriptor) =
-        match db::allocate_next_liquid_for_donation_page(
-            &state.db,
-            &nym,
-            kind,
-            |ct_descriptor, idx| {
-                descriptor::derive_address(ct_descriptor, idx)
-                    .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
-            },
-        )
-        .await?
-        {
-            Some((address, index, descriptor)) => (address, index, descriptor),
-            // Every Page/POS surface owns its descriptor and cursor. Missing or
-            // unavailable surface allocation is never redirected through the
-            // owner's independently configured Lightning Address wallet.
-            None => return Err(AppError::DonationPageNotFound(nym.clone())),
-        };
+    let liquid_reservation = reserve_fresh_checkout_liquid_address(&state, &nym, kind).await?;
+    let liquid_address = liquid_reservation.address.clone();
+    let payment_descriptor = liquid_reservation.ct_descriptor.clone();
     let liquid_blinding_key_hex =
         descriptor::derive_blinding_key_hex(&payment_descriptor, &liquid_address)?;
 
@@ -1115,17 +1101,18 @@ async fn create_anonymous_for_kind(
         }
     };
     let invoice = if state.config.features.bull_bitcoin_fiat_settlement {
-        db::insert_invoice_with_fiat_policy(
+        db::insert_checkout_invoice_with_fiat_policy(
             &state.db,
             &new_invoice,
             settlement_product,
             FIAT_SETTLEMENT_RAIL_BITCOIN
                 | FIAT_SETTLEMENT_RAIL_LIGHTNING
                 | FIAT_SETTLEMENT_RAIL_LIQUID,
+            &liquid_reservation,
         )
         .await?
     } else {
-        db::insert_invoice(&state.db, &new_invoice).await?
+        db::insert_checkout_invoice(&state.db, &new_invoice, &liquid_reservation).await?
     };
     let fiat_settlement_policy = db::invoice_fiat_settlement_policy(&state.db, invoice.id).await?;
 
@@ -1206,6 +1193,56 @@ async fn create_anonymous_for_kind(
         }
     };
     Ok(Json(response))
+}
+
+/// Reserve first, then certify against complete authoritative Liquid history.
+/// History-bearing candidates are durably burned and scanning remains bounded.
+/// A transport or authority failure leaves the candidate reserved and fails
+/// closed, so it cannot become evidence for a later invoice after restart.
+async fn reserve_fresh_checkout_liquid_address(
+    state: &AppState,
+    nym: &str,
+    kind: &str,
+) -> Result<db::CheckoutLiquidReservation, AppError> {
+    for _ in 0..CHECKOUT_CLEAN_ADDRESS_SCAN_LIMIT {
+        let reservation = db::reserve_next_liquid_for_donation_page(
+            &state.db,
+            nym,
+            kind,
+            |ct_descriptor, idx| {
+                descriptor::derive_address(ct_descriptor, idx)
+                    .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
+            },
+        )
+        .await?
+        .ok_or_else(|| AppError::DonationPageNotFound(nym.to_string()))?;
+
+        match state
+            .invoice_address_admission
+            .assert_fresh(None, Some(&reservation.address))
+            .await
+        {
+            Ok(()) => {
+                let certified =
+                    db::certify_checkout_liquid_reservation(&state.db, reservation.id).await?;
+                if certified != 1 {
+                    return Err(AppError::MoneyAdmissionUnavailable);
+                }
+                return Ok(reservation);
+            }
+            Err(AppError::LiquidAddressAlreadyUsed) => {
+                let rejected =
+                    db::reject_checkout_liquid_reservation_history(&state.db, reservation.id)
+                        .await?;
+                if rejected != 1 {
+                    return Err(AppError::MoneyAdmissionUnavailable);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(AppError::LiquidAddressAlreadyUsed)
 }
 
 /// Validate the create-anonymous body and preserve the requested denomination.
