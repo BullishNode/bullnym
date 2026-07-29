@@ -1098,6 +1098,8 @@ fn parent_visibility_classifier_is_narrow() {
     ] {
         assert!(!liquid_parent_not_visible_error(message), "{message}");
     }
+    assert!(liquid_lockup_not_visible_error("No Transaction History"));
+    assert!(!liquid_lockup_not_visible_error("connection reset by peer"));
 }
 
 #[test]

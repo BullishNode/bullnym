@@ -12858,6 +12858,210 @@ async fn settled_webhook_coalesces_active_claim_preparation_without_error_log() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_gate_lockup_visibility_coalesces_before_construction_and_restart_broadcasts_once(
+) {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "reverselockupboundary";
+    create_test_user(&pool, nym).await;
+    let claim_key_index = 707_u64;
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(claim_key_index).unwrap();
+    let preimage = Preimage::from_swap_key(&claim_keypair);
+    let preimage_hex = hex::encode(preimage.bytes.unwrap());
+    let claim_key_hex = hex::encode(claim_keypair.secret_key().secret_bytes());
+    let response = valid_reverse_response_for_index(
+        "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+        claim_key_index,
+        5_000,
+    );
+    let response_json = serde_json::to_string(&response).unwrap();
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some(nym),
+            boltz_swap_id: "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+            address: None,
+            address_index: None,
+            amount_sat: 5_000,
+            invoice: response.invoice.as_deref().unwrap(),
+            preimage_hex: &preimage_hex,
+            claim_key_hex: &claim_key_hex,
+            boltz_response_json: &response_json,
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+        .await
+        .unwrap()
+        .unwrap();
+    pay_service::db::update_swap_status(
+        &pool,
+        swap.id,
+        pay_service::db::SwapStatus::LockupMempool,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE swap_records SET cooperative_refused = TRUE WHERE id = $1")
+        .bind(swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (parent_txid, parent_raw_hex) = reverse_lockup_parent_fixture(&response);
+    let (
+        electrum_url,
+        _parent_queries,
+        _parent_seen,
+        parent_visible,
+        history_queries,
+        history_seen,
+        broadcast_calls,
+        broadcast_seen,
+        release_broadcasts,
+        server_task,
+    ) = spawn_parent_gated_liquid_broadcast_server(parent_txid, parent_raw_hex).await;
+
+    let first_pool = pool.clone();
+    let first_url = electrum_url.clone();
+    let mut first_claim = tokio::spawn(async move {
+        let clients = claimer::LiquidClaimClientFactory::try_new(vec![first_url]).unwrap();
+        claimer::exercise_unjournaled_reverse_claim_retry(
+            &first_pool,
+            swap.id,
+            &clients,
+            &accepted_live_liquid_fee_decision(),
+        )
+        .await
+    });
+    tokio::select! {
+        _ = history_seen.notified() => {}
+        result = &mut first_claim => {
+            panic!("fresh claim finished before its lockup visibility probe: {result:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(3)) => {
+            panic!("fresh claim must probe lockup visibility before construction");
+        }
+    }
+    assert!(history_queries.load(Ordering::SeqCst) >= 1);
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_json(
+            &app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("settled webhook must join active lockup-visibility preparation");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
+
+    first_claim.abort();
+    assert!(first_claim.await.unwrap_err().is_cancelled());
+    let interrupted =
+        pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(interrupted.claim_attempts, 0);
+    assert!(interrupted.claim_tx_hex.is_none());
+    assert!(interrupted.last_claim_error.is_none());
+
+    parent_visible.store(true, Ordering::SeqCst);
+    let recovery_pool = pool.clone();
+    let recovery_url = electrum_url.clone();
+    let recovery = tokio::spawn(async move {
+        let clients = claimer::LiquidClaimClientFactory::try_new(vec![recovery_url]).unwrap();
+        claimer::exercise_unjournaled_reverse_claim_retry(
+            &recovery_pool,
+            swap.id,
+            &clients,
+            &accepted_live_liquid_fee_decision(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), broadcast_seen.notified())
+        .await
+        .expect("restart must reach one actual broadcast after lockup visibility");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 1);
+    let journaled: (String, String, String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, claim_tx_hex, claim_txid, claim_attempts, last_claim_error \
+         FROM swap_records WHERE id = $1",
+    )
+    .bind(swap.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(journaled.0, "claiming");
+    assert!(!journaled.1.is_empty());
+    assert_eq!(journaled.2.len(), 64);
+    assert_eq!(journaled.3, 0);
+    assert!(journaled.4.is_none());
+
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "REVERSE_LOCKUP_VISIBILITY_BOUNDARY",
+                "status": "invoice.settled"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 1);
+
+    release_broadcasts.add_permits(1);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), recovery)
+            .await
+            .expect("restart broadcast did not finish")
+            .expect("restart claim task failed")
+            .expect("restart claim returned an error"),
+        claimer::ClaimOutcome::Broadcast
+    ));
+    let finalized =
+        pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_LOCKUP_VISIBILITY_BOUNDARY")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(finalized.status, "claimed");
+    assert_eq!(finalized.claim_attempts, 0);
+    assert!(finalized.last_claim_error.is_none());
+    assert_eq!(
+        finalized.claim_tx_hex.as_deref(),
+        Some(journaled.1.as_str())
+    );
+    assert_eq!(finalized.claim_txid.as_deref(), Some(journaled.2.as_str()));
+
+    server_task.abort();
+    let _ = server_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_recovers_exact_tx() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -12910,6 +13114,8 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
         parent_queries,
         parent_seen,
         parent_visible,
+        _history_queries,
+        _history_seen,
         broadcast_calls,
         broadcast_seen,
         release_broadcasts,
@@ -32792,6 +32998,46 @@ fn persisted_liquid_claim_fixture(
     )
 }
 
+fn reverse_lockup_parent_fixture(response: &CreateReverseResponse) -> (String, String) {
+    use boltz_client::elements;
+
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = elements::secp256k1_zkp::rand::thread_rng();
+    let asset = elements::AssetId::LIQUID_BTC;
+    let address = elements::Address::from_str(&response.lockup_address).unwrap();
+    let blinding_key =
+        elements::secp256k1_zkp::SecretKey::from_str(response.blinding_key.as_deref().unwrap())
+            .unwrap();
+    let blinding_pubkey = elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+    let input_secrets = elements::TxOutSecrets::new(
+        asset,
+        elements::confidential::AssetBlindingFactor::new(&mut rng),
+        response.onchain_amount,
+        elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+    let (output, _, _, _) = elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        response.onchain_amount,
+        asset,
+        address.script_pubkey(),
+        blinding_pubkey,
+        &[input_secrets],
+        &[],
+    )
+    .unwrap();
+    let transaction = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![output],
+    };
+    (
+        transaction.txid().to_string(),
+        hex::encode(elements::encode::serialize(&transaction)),
+    )
+}
+
 async fn spawn_counting_liquid_broadcast_server(
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -32838,6 +33084,8 @@ async fn spawn_parent_gated_liquid_broadcast_server(
     Arc<AtomicBool>,
     Arc<AtomicUsize>,
     Arc<Notify>,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
     Arc<Semaphore>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -32856,12 +33104,16 @@ async fn spawn_parent_gated_liquid_broadcast_server(
     let parent_queries = Arc::new(AtomicUsize::new(0));
     let parent_seen = Arc::new(Notify::new());
     let parent_visible = Arc::new(AtomicBool::new(false));
+    let history_queries = Arc::new(AtomicUsize::new(0));
+    let history_seen = Arc::new(Notify::new());
     let broadcast_calls = Arc::new(AtomicUsize::new(0));
     let broadcast_seen = Arc::new(Notify::new());
     let release_broadcasts = Arc::new(Semaphore::new(0));
     let task_parent_queries = parent_queries.clone();
     let task_parent_seen = parent_seen.clone();
     let task_parent_visible = parent_visible.clone();
+    let task_history_queries = history_queries.clone();
+    let task_history_seen = history_seen.clone();
     let task_calls = broadcast_calls.clone();
     let task_seen = broadcast_seen.clone();
     let task_release = release_broadcasts.clone();
@@ -32873,6 +33125,8 @@ async fn spawn_parent_gated_liquid_broadcast_server(
             let parent_queries = task_parent_queries.clone();
             let parent_seen = task_parent_seen.clone();
             let parent_visible = task_parent_visible.clone();
+            let history_queries = task_history_queries.clone();
+            let history_seen = task_history_seen.clone();
             let expected_parent_txid = expected_parent_txid.clone();
             let parent_raw_hex = parent_raw_hex.clone();
             let genesis_header = genesis_header.clone();
@@ -32884,6 +33138,24 @@ async fn spawn_parent_gated_liquid_broadcast_server(
                         break;
                     };
                     let method = request["method"].as_str().unwrap_or_default();
+                    if method == "blockchain.scripthash.get_history" {
+                        history_queries.fetch_add(1, Ordering::SeqCst);
+                        history_seen.notify_one();
+                        let result = if parent_visible.load(Ordering::SeqCst) {
+                            json!([{"tx_hash": expected_parent_txid, "height": 0}])
+                        } else {
+                            json!([])
+                        };
+                        let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        if writer
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     if method == "blockchain.transaction.get" {
                         parent_queries.fetch_add(1, Ordering::SeqCst);
                         parent_seen.notify_one();
@@ -32946,6 +33218,8 @@ async fn spawn_parent_gated_liquid_broadcast_server(
         parent_queries,
         parent_seen,
         parent_visible,
+        history_queries,
+        history_seen,
         broadcast_calls,
         broadcast_seen,
         release_broadcasts,
