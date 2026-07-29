@@ -1,6 +1,7 @@
 # Chain-Swap Recovery
 
-Checkout invoices (Payment Page/POS) settle Bitcoin through BTC-to-LBTC chain
+Checkout invoices (Payment Page/POS) — and linked wallet invoices under a
+mixed fiat settlement policy — settle Bitcoin through BTC-to-LBTC chain
 swaps. When a funded swap fails, the server parks it in `refund_due`: the
 payer's BTC sits in the lockup until Bullnym's internal automatic executor can
 recover it to the immutable merchant policy bound before payer exposure.

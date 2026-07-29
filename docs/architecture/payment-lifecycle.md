@@ -24,7 +24,13 @@ settlement state.
 | Lightning Address | Lightning via Boltz reverse swap; Liquid via LUD-22 | Derived from the online Lightning Address CT descriptor | Mostly unchanged. No invoice partial/under/over semantics. |
 | Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived only from the Payment Page CT descriptor | Payer enters amount at `/:nym`. |
 | POS | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived only from the POS CT descriptor | Cashier enters amount at `/:nym/pos`. |
-| Invoices | Lightning via Boltz reverse swap; Liquid direct; Bitcoin direct | Merchant supplied Liquid/BTC addresses | Merchant receivable. No BTC-to-LBTC Boltz chain swap in v1 invoices. |
+| Invoices | Lightning via Boltz reverse swap; Liquid direct; Bitcoin direct, or Bitcoin via Boltz chain swap under a mixed fiat policy | Merchant supplied Liquid/BTC addresses | Merchant receivable. Linked invoices with a mixed (1–99%) fiat settlement policy replace direct Bitcoin with a provider-backed chain swap. |
+
+Settlement destinations describe merchants without a Bull Bitcoin fiat
+settlement policy. A captured policy redirects the allocated share to Bull
+Bitcoin settlement outputs: a 100% allocation claims to one confidential Bull
+Bitcoin output with no merchant output, and a mixed split adds Bull Bitcoin
+legs beside the merchant output.
 
 ## Identity Model
 
@@ -38,10 +44,12 @@ the server never falls back to the auth `npub`.
 
 `nym` is a public alias and route namespace owned by one `npub`.
 
-An online Lightning Address has one CT descriptor in `users.ct_descriptor`
-(mobile path 75). Public checkout surfaces have independent Get Paid CT
-descriptors in `donation_pages.ct_descriptor`: Payment Page uses mobile path
-102 and POS uses mobile path 103. Each `(nym, kind)` row has its own
+An online Lightning Address has one CT descriptor in `users.ct_descriptor`,
+from the mobile client's reserved BIP85 child wallet at `39'/0'/12'/101'`.
+Public checkout surfaces have independent Get Paid CT descriptors in
+`donation_pages.ct_descriptor`: Payment Page uses the reserved child at
+`39'/0'/12'/102'` and POS uses `39'/0'/12'/103'` (see ADR 002). Each
+`(nym, kind)` row has its own
 `donation_pages.next_addr_idx` cursor. Both surfaces require their own
 descriptor; neither falls back to the Lightning Address wallet or cursor.
 
@@ -103,7 +111,9 @@ Each payment session must have explicit settlement destinations.
 Lightning Address:
 
 - Lightning claims and Liquid receive addresses are derived from the nym CT
-  descriptor.
+  descriptor for merchants without a fiat settlement policy; a captured
+  policy claims the allocated share to Bull Bitcoin settlement outputs
+  instead.
 
 Public checkout surfaces:
 
@@ -118,7 +128,9 @@ Invoices:
 - Direct BTC pays a merchant-supplied Bitcoin address.
 - Direct Liquid pays a merchant-supplied Liquid address.
 - Lightning reverse swaps claim to the merchant-supplied Liquid address.
-- Invoices do not expose BTC-to-LBTC Boltz chain swaps in this phase.
+- Linked invoices under a mixed (1–99%) fiat settlement policy expose Bitcoin
+  through a BTC-to-LBTC Boltz chain swap settling to the invoice's Liquid
+  address; sat-fixed and Bitcoin-only invoices keep direct BTC.
 
 ## Payment Instructions
 
@@ -132,10 +144,13 @@ Instruction kinds:
 - `bitcoin_direct`: payer pays a merchant Bitcoin address directly. Invoices
   only.
 - `bitcoin_boltz_chain`: payer pays a Boltz Bitcoin lockup address, merchant
-  receives LBTC through a Boltz chain swap. Payment Page and POS only.
+  receives LBTC through a Boltz chain swap. Payment Page, POS, and linked
+  mixed-fiat wallet invoices.
 
-Do not expose two ambiguous "Bitcoin" options on invoices. For invoices,
-Bitcoin means merchant-supplied direct BTC settlement.
+Do not expose two ambiguous "Bitcoin" options on invoices. For an invoice,
+Bitcoin means merchant-supplied direct BTC settlement unless a mixed fiat
+settlement policy replaces it with the provider-backed chain swap; the two
+never appear together.
 
 ## Amount Model
 
@@ -349,9 +364,11 @@ latest-swap lookup and swap creation.
 
 ## Boltz Chain Swaps
 
-BTC-to-LBTC chain swaps are for Payment Page and POS checkout only.
+BTC-to-LBTC chain swaps serve Payment Page and POS checkout, plus linked
+wallet invoices under a mixed (1–99%) fiat settlement policy.
 
-They are not part of Lightning Address and not part of merchant invoices.
+They are not part of Lightning Address, and a merchant invoice without a
+mixed fiat policy keeps direct Bitcoin instead.
 
 Public checkout behavior:
 
@@ -508,4 +525,5 @@ Minimum scenario coverage:
 - reverse swap duplicate webhook
 - reverse swap missed webhook reconciled
 - claim stuck does not mark merchant settled
-- chain swap only exposed for Payment Page/POS and within Boltz limits
+- chain swap only exposed for Payment Page/POS checkout and linked
+  mixed-fiat invoices, and only within Boltz limits
