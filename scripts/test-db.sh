@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=81
+EXPECTED_MIGRATION_COUNT=82
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "081_provider_payment_first_observed_at.sql" ]] \
-  || die "unexpected migration-081 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "082_mixed_valuation_exception_scope.sql" ]] \
+  || die "unexpected migration-082 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -379,6 +379,38 @@ assert_provider_not_found_migration_owner_boundary() {
   echo "test-db: migration 080 refused runtime-role execution transactionally"
 }
 
+assert_mixed_valuation_scope_migration_owner_boundary() {
+  local database="$1"
+  local migration="$2"
+  local runtime_scratch="${database}_migration_082_runtime_role"
+  local refusal_output rollback_state
+
+  docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$runtime_scratch"
+  docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$runtime_scratch"
+  if refusal_output="$(
+    {
+      printf 'SET ROLE %s;\n' "$RUNTIME_ROLE"
+      cat "$migration"
+    } | docker exec --interactive "$CONTAINER" \
+          psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" \
+            --dbname "$runtime_scratch" --set "runtime_role=$RUNTIME_ROLE" 2>&1
+  )"; then
+    die "migration 082 unexpectedly ran as the runtime role"
+  fi
+  [[ "$refusal_output" == *"must run as the schema owner, not the runtime role"* ]] \
+    || die "migration 082 returned the wrong runtime-role failure: $refusal_output"
+  rollback_state="$(
+    docker exec "$CONTAINER" \
+      psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --username "$PG_USER" --dbname "$runtime_scratch" \
+        --command "SELECT (POSITION('parent_invoice.pricing_mode = ''fiat_fixed''::text' IN pg_get_viewdef('invoice_mixed_valuation_exceptions'::REGCLASS, TRUE)) = 0)::TEXT;"
+  )"
+  [[ "$rollback_state" == "true" ]] \
+    || die "migration 082 runtime-role refusal changed the exception scope ($rollback_state)"
+  docker exec "$CONTAINER" dropdb --username "$PG_USER" "$runtime_scratch"
+  echo "test-db: migration 082 refused runtime-role execution transactionally"
+}
+
 apply_migrations() {
   local database="$1"
   local with_hooks="$2"
@@ -412,6 +444,9 @@ apply_migrations() {
     if [[ "$with_hooks" == "true" && "$base" == "080_persistent_provider_order_not_found" ]]; then
       assert_provider_not_found_migration_owner_boundary "$database" "$migration"
     fi
+    if [[ "$with_hooks" == "true" && "$base" == "082_mixed_valuation_exception_scope" ]]; then
+      assert_mixed_valuation_scope_migration_owner_boundary "$database" "$migration"
+    fi
     if [[ "$base" == "053_recovery_address_commitments" \
        || "$base" == "054_fee_policy_authority" \
        || "$base" == "055_merchant_settlement_lifecycle" \
@@ -440,7 +475,8 @@ apply_migrations() {
        || "$base" == "078_mixed_claim_fee_authority" \
        || "$base" == "079_lightning_address_provider_only" \
        || "$base" == "080_persistent_provider_order_not_found" \
-       || "$base" == "081_provider_payment_first_observed_at" ]]; then
+       || "$base" == "081_provider_payment_first_observed_at" \
+       || "$base" == "082_mixed_valuation_exception_scope" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

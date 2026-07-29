@@ -1437,6 +1437,22 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                  WHERE to_regclass('public.' || required.table_name) IS NULL \
             ) \
             AND EXISTS ( \
+                SELECT 1 \
+                  FROM pg_class view_info \
+                 WHERE view_info.oid = \
+                           to_regclass('public.invoice_mixed_valuation_exceptions') \
+                   AND view_info.relkind = 'v' \
+                   AND 'security_invoker=true' = ANY(view_info.reloptions) \
+                   AND POSITION( \
+                       'parent_invoice.pricing_mode = ''fiat_fixed''::text' \
+                       IN pg_get_viewdef(view_info.oid, TRUE) \
+                   ) > 0 \
+                   AND POSITION( \
+                       'event.accounting_state = ''active''::text' \
+                       IN pg_get_viewdef(view_info.oid, TRUE) \
+                   ) > 0 \
+            ) \
+            AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                  WHERE table_schema = 'public' \
                    AND table_name = 'invoices' \

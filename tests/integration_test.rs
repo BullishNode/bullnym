@@ -6527,7 +6527,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "081_provider_payment_first_observed_at"
+        "082_mixed_valuation_exception_scope"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -6753,6 +6753,101 @@ async fn readiness_rejects_schema_before_latest_migration() {
 }
 
 #[tokio::test]
+async fn readiness_requires_fiat_pricing_scope_on_mixed_valuation_exceptions() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    let legacy_view = r#"
+        CREATE OR REPLACE VIEW invoice_mixed_valuation_exceptions
+        WITH (security_invoker = TRUE)
+        AS
+        SELECT event.id AS payment_event_id,
+               event.invoice_id,
+               event.bull_bitcoin_settlement_id,
+               event.amount_sat,
+               event.accounting_sequence,
+               event.created_at,
+               CASE
+                   WHEN COALESCE(reverse_swap.invoice_quote_version_id,
+                                 chain_swap.invoice_quote_version_id) IS NULL
+                     OR COALESCE(reverse_swap.invoice_quote_offer_id,
+                                 chain_swap.invoice_quote_offer_id) IS NULL
+                       THEN 'missing_parent_quote_attribution'
+                   WHEN COALESCE(reverse_swap.quote_payment_first_observed_at,
+                                 chain_swap.quote_payment_first_observed_at) IS NULL
+                       THEN 'missing_parent_first_observed_at'
+                   ELSE 'valuation_unavailable_for_observation_time'
+               END AS reason
+          FROM invoice_payment_events event
+          JOIN bull_bitcoin_settlements settlement
+            ON settlement.id = event.bull_bitcoin_settlement_id
+           AND settlement.purpose = 'mixed'
+          LEFT JOIN swap_records reverse_swap
+            ON reverse_swap.id = settlement.reverse_swap_id
+          LEFT JOIN chain_swap_records chain_swap
+            ON chain_swap.id = settlement.chain_swap_id
+         WHERE event.source = 'bull_bitcoin_mixed_output'
+           AND event.accounting_state = 'active'
+           AND event.fiat_credited_minor IS NULL
+    "#;
+    sqlx::query(legacy_view).execute(&admin).await.unwrap();
+
+    let app = test_app(test_state(runtime.clone()));
+    let (legacy_status, legacy_body) = get_path(&app, "/ready").await;
+
+    let current_view = r#"
+        CREATE OR REPLACE VIEW invoice_mixed_valuation_exceptions
+        WITH (security_invoker = TRUE)
+        AS
+        SELECT event.id AS payment_event_id,
+               event.invoice_id,
+               event.bull_bitcoin_settlement_id,
+               event.amount_sat,
+               event.accounting_sequence,
+               event.created_at,
+               CASE
+                   WHEN COALESCE(reverse_swap.invoice_quote_version_id,
+                                 chain_swap.invoice_quote_version_id) IS NULL
+                     OR COALESCE(reverse_swap.invoice_quote_offer_id,
+                                 chain_swap.invoice_quote_offer_id) IS NULL
+                       THEN 'missing_parent_quote_attribution'
+                   WHEN COALESCE(reverse_swap.quote_payment_first_observed_at,
+                                 chain_swap.quote_payment_first_observed_at) IS NULL
+                       THEN 'missing_parent_first_observed_at'
+                   ELSE 'valuation_unavailable_for_observation_time'
+               END AS reason
+          FROM invoice_payment_events event
+          JOIN invoices parent_invoice
+            ON parent_invoice.id = event.invoice_id
+           AND parent_invoice.pricing_mode = 'fiat_fixed'
+          JOIN bull_bitcoin_settlements settlement
+            ON settlement.id = event.bull_bitcoin_settlement_id
+           AND settlement.purpose = 'mixed'
+          LEFT JOIN swap_records reverse_swap
+            ON reverse_swap.id = settlement.reverse_swap_id
+          LEFT JOIN chain_swap_records chain_swap
+            ON chain_swap.id = settlement.chain_swap_id
+         WHERE event.source = 'bull_bitcoin_mixed_output'
+           AND event.accounting_state = 'active'
+           AND event.fiat_credited_minor IS NULL
+    "#;
+    sqlx::query(current_view).execute(&admin).await.unwrap();
+
+    assert_eq!(legacy_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(legacy_body["ready"], false);
+
+    let app = test_app(test_state(runtime.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
+    assert_eq!(restored_body["ready"], true);
+
+    drop(app);
+    runtime.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
 async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let admin = test_pool().await;
     cleanup_db(&admin).await;
@@ -6768,7 +6863,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["expected_schema_marker"],
-        "081_provider_payment_first_observed_at"
+        "082_mixed_valuation_exception_scope"
     );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
