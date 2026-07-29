@@ -12872,8 +12872,12 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
         pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &merchant_address)
             .unwrap();
     let (_, _, response) = issue84_chain_creation_response(501, 502, "REVERSE_BROADCAST_FIXTURE");
-    let (claim_tx_hex, claim_txid, actual_fee_sat, actual_fee_rate_sat_vb, _backend) =
+    let (claim_tx_hex, claim_txid, actual_fee_sat, actual_fee_rate_sat_vb, backend) =
         persisted_liquid_claim_fixture(&response, &merchant_address, &merchant_blinding_key);
+    let claim_transaction: boltz_client::elements::Transaction =
+        boltz_client::elements::encode::deserialize(&hex::decode(&claim_tx_hex).unwrap()).unwrap();
+    let parent_txid = claim_transaction.input[0].previous_output.txid.to_string();
+    let parent_raw_hex = hex::encode(backend.get_raw_tx(&parent_txid).await.unwrap());
     sqlx::query(
         "UPDATE swap_records \
          SET claim_tx_hex = $2, claim_txid = $3, claim_path = 'script', \
@@ -12901,27 +12905,31 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     .await
     .unwrap();
 
-    let (electrum_url, broadcast_calls, broadcast_seen, release_broadcasts, server_task) =
-        spawn_blocking_liquid_broadcast_server().await;
+    let (
+        electrum_url,
+        parent_queries,
+        parent_seen,
+        parent_visible,
+        broadcast_calls,
+        broadcast_seen,
+        release_broadcasts,
+        server_task,
+    ) = spawn_parent_gated_liquid_broadcast_server(parent_txid, parent_raw_hex).await;
     let first_pool = pool.clone();
     let first_electrum_url = electrum_url.clone();
     let first_claim = tokio::spawn(async move {
         let clients = claimer::LiquidClaimClientFactory::try_new(vec![first_electrum_url]).unwrap();
         claimer::exercise_journaled_reverse_claim_retry(&first_pool, swap_id, &clients).await
     });
-    if tokio::time::timeout(Duration::from_secs(3), broadcast_seen.notified())
+    tokio::time::timeout(Duration::from_secs(3), parent_seen.notified())
         .await
-        .is_err()
-    {
-        if first_claim.is_finished() {
-            panic!(
-                "first claim exited before the Liquid broadcast RPC: {:?}",
-                first_claim.await
-            );
-        }
-        panic!("first claim did not reach the Liquid broadcast RPC");
-    }
-    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 1);
+        .expect("fresh claim must probe parent visibility before broadcasting");
+    assert!(parent_queries.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        0,
+        "an invisible parent must prevent the child broadcast RPC"
+    );
 
     let app = test_app(test_state(pool.clone()));
     let (status, body) = tokio::time::timeout(
@@ -12939,12 +12947,12 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
         ),
     )
     .await
-    .expect("settled webhook must join, not wait on or duplicate, the active RPC");
+    .expect("settled webhook must join the active parent-readiness lease");
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(
         broadcast_calls.load(Ordering::SeqCst),
-        1,
-        "settled webhook crossed the actual broadcast boundary twice"
+        0,
+        "settled webhook bypassed the parent-readiness gate"
     );
     let active: (String, bool, String) = sqlx::query_as(
         "SELECT status, next_claim_attempt_at > NOW(), claim_tx_hex \
@@ -12956,16 +12964,11 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     .unwrap();
     assert_eq!(active, ("claiming".into(), true, claim_tx_hex.clone()));
 
-    // Return the real missing/spent RPC class after the server has received
-    // the request, then stop before outer retry bookkeeping. The durable row
-    // remains exactly as it would after process loss at this boundary.
-    release_broadcasts.add_permits(1);
-    let first_error = tokio::time::timeout(Duration::from_secs(3), first_claim)
-        .await
-        .expect("first broadcast must return its missing/spent RPC error")
-        .unwrap()
-        .unwrap_err();
-    assert!(first_error.to_string().contains("broadcast failed"));
+    // Simulate process loss after the journal/lease commit while the exact
+    // broadcaster still cannot see the parent. No child RPC has crossed the
+    // boundary, so restart must retain both the exact bytes and zero attempts.
+    first_claim.abort();
+    assert!(first_claim.await.unwrap_err().is_cancelled());
 
     // A new process must retain the lease and exact journal, coalesce
     // callbacks during the lease, and rebroadcast only once after expiry.
@@ -12995,7 +12998,7 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(
         broadcast_calls.load(Ordering::SeqCst),
-        1,
+        0,
         "restart webhook ignored the persisted active broadcast lease"
     );
 
@@ -13007,6 +13010,7 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     .execute(&restarted)
     .await
     .unwrap();
+    parent_visible.store(true, Ordering::SeqCst);
     let recovery_pool = restarted.clone();
     let recovery_electrum_url = electrum_url.clone();
     let recovery = tokio::spawn(async move {
@@ -13019,8 +13023,31 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
         .expect("expired lease must redrive the exact journal to the broadcast RPC");
     assert_eq!(
         broadcast_calls.load(Ordering::SeqCst),
-        2,
-        "recovery must issue exactly one post-expiry rebroadcast"
+        1,
+        "recovery must issue exactly one parent-ready broadcast"
+    );
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_json(
+            &restarted_app,
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_BROADCAST_BOUNDARY",
+                    "status": "invoice.settled"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("settled webhook must join the active broadcast RPC");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        1,
+        "settled webhook crossed the actual broadcast boundary twice"
     );
     release_broadcasts.add_permits(1);
     let recovered = tokio::time::timeout(Duration::from_secs(3), recovery)
@@ -13035,6 +13062,8 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
             .unwrap()
             .unwrap();
     assert_eq!(final_swap.status, "claimed");
+    assert_eq!(final_swap.claim_attempts, 0);
+    assert!(final_swap.last_claim_error.is_none());
     assert_eq!(
         final_swap.claim_tx_hex.as_deref(),
         Some(claim_tx_hex.as_str())
@@ -32799,8 +32828,14 @@ async fn spawn_counting_liquid_broadcast_server(
     (format!("tcp://{address}"), broadcast_calls, task)
 }
 
-async fn spawn_blocking_liquid_broadcast_server() -> (
+async fn spawn_parent_gated_liquid_broadcast_server(
+    expected_parent_txid: String,
+    parent_raw_hex: String,
+) -> (
     String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<AtomicBool>,
     Arc<AtomicUsize>,
     Arc<Notify>,
     Arc<Semaphore>,
@@ -32818,9 +32853,15 @@ async fn spawn_blocking_liquid_broadcast_server() -> (
         height: 0,
         ext: elements::BlockExtData::default(),
     }));
+    let parent_queries = Arc::new(AtomicUsize::new(0));
+    let parent_seen = Arc::new(Notify::new());
+    let parent_visible = Arc::new(AtomicBool::new(false));
     let broadcast_calls = Arc::new(AtomicUsize::new(0));
     let broadcast_seen = Arc::new(Notify::new());
     let release_broadcasts = Arc::new(Semaphore::new(0));
+    let task_parent_queries = parent_queries.clone();
+    let task_parent_seen = parent_seen.clone();
+    let task_parent_visible = parent_visible.clone();
     let task_calls = broadcast_calls.clone();
     let task_seen = broadcast_seen.clone();
     let task_release = release_broadcasts.clone();
@@ -32829,6 +32870,11 @@ async fn spawn_blocking_liquid_broadcast_server() -> (
             let calls = task_calls.clone();
             let seen = task_seen.clone();
             let release = task_release.clone();
+            let parent_queries = task_parent_queries.clone();
+            let parent_seen = task_parent_seen.clone();
+            let parent_visible = task_parent_visible.clone();
+            let expected_parent_txid = expected_parent_txid.clone();
+            let parent_raw_hex = parent_raw_hex.clone();
             let genesis_header = genesis_header.clone();
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.into_split();
@@ -32838,36 +32884,44 @@ async fn spawn_blocking_liquid_broadcast_server() -> (
                         break;
                     };
                     let method = request["method"].as_str().unwrap_or_default();
+                    if method == "blockchain.transaction.get" {
+                        parent_queries.fetch_add(1, Ordering::SeqCst);
+                        parent_seen.notify_one();
+                        let requested = request["params"][0].as_str().unwrap_or_default();
+                        let response = if requested == expected_parent_txid
+                            && parent_visible.load(Ordering::SeqCst)
+                        {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": parent_raw_hex
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {
+                                    "code": -5,
+                                    "message": "No such mempool or blockchain transaction"
+                                }
+                            })
+                        };
+                        if writer
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     if method == "blockchain.transaction.broadcast" {
-                        let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        calls.fetch_add(1, Ordering::SeqCst);
                         seen.notify_one();
                         let Ok(permit) = release.acquire().await else {
                             break;
                         };
                         permit.forget();
-                        // The first RPC reproduces the provider-adjacent
-                        // missing/spent response from #263 after the server has
-                        // received the transaction. The caller seam stops
-                        // before outer retry bookkeeping, modeling process
-                        // loss at that exact error boundary.
-                        if attempt == 1 {
-                            let response = json!({
-                                "jsonrpc": "2.0",
-                                "id": request["id"],
-                                "error": {
-                                    "code": -26,
-                                    "message": "bad-txns-inputs-missingorspent"
-                                }
-                            });
-                            if writer
-                                .write_all(format!("{response}\n").as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
                     }
                     let result = match method {
                         "server.version" => json!(["bullnym-test", "1.4"]),
@@ -32889,6 +32943,9 @@ async fn spawn_blocking_liquid_broadcast_server() -> (
     });
     (
         format!("tcp://{address}"),
+        parent_queries,
+        parent_seen,
+        parent_visible,
         broadcast_calls,
         broadcast_seen,
         release_broadcasts,

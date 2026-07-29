@@ -1082,6 +1082,25 @@ fn electrum_host_port_strips_scheme_for_boltz_client() {
 }
 
 #[test]
+fn parent_visibility_classifier_is_narrow() {
+    for message in [
+        r#"Electrum server error: {"code":-5,"message":"No such mempool or blockchain transaction"}"#,
+        "transaction not found",
+        "unknown transaction",
+    ] {
+        assert!(liquid_parent_not_visible_error(message), "{message}");
+    }
+    for message in [
+        "bad-txns-inputs-missingorspent",
+        "connection reset by peer",
+        "TLS certificate validation failed",
+        "already in block chain",
+    ] {
+        assert!(!liquid_parent_not_visible_error(message), "{message}");
+    }
+}
+
+#[test]
 fn liquid_claim_factory_requires_a_structurally_valid_endpoint() {
     assert!(LiquidClaimClientFactory::try_new(Vec::new()).is_err());
     assert!(LiquidClaimClientFactory::try_new(vec![
