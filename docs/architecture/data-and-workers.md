@@ -8,7 +8,8 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | Table | Ownership | Purpose |
 |---|---|---|
 | `users` | Permanent nym / Lightning Address availability | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, availability status, and Lightning Address cursor. |
-| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, descriptor, address cursor, alias, and archive state. |
+| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, descriptor generation, address cursor, and archive state. |
+| `checkout_liquid_address_reservations` | Checkout address ownership | Durable pending, history-rejected, certified, and invoice-allocated Page/POS addresses. Global address uniqueness survives descriptor reuse and invoice retention. |
 | `invoices` | Payment sessions | Stores checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
 | `invoice_payment_events` | Accounting | Idempotent payment evidence keyed by rail-specific event keys, with explicit countable/inactive/superseded state and stable accounting order. |
 | `invoice_payment_observations` | Non-accounting evidence | Durable exact Bitcoin and Liquid direct-output identity, confirmation, block, verification, and lifecycle evidence written by both live watchers. |
@@ -33,7 +34,10 @@ reports a positive confirmation height; mempool-only history may be evicted.
 `donation_pages.next_addr_idx` belongs to public checkout surfaces. It is
 advanced when `POST /:nym/invoice` or `POST /:nym/pos/invoice` creates a
 checkout invoice. The selected `(nym, kind)` row always supplies its own
-`ct_descriptor`. Plain page render does not advance the cursor.
+`ct_descriptor` and descriptor generation. Candidates are reserved before an
+authoritative Liquid-history check; history advances the bounded scan, while a
+clean certification is atomically attached to the invoice. Plain page render
+does not advance the cursor.
 
 Wallet-origin invoices store concrete addresses and do not advance either
 descriptor cursor.

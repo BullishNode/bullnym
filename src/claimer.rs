@@ -626,7 +626,7 @@ async fn dispatch_webhook(
             )
             .await;
 
-            try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
+            let _ = try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
         }
         "invoice.settled" => {
             // Usually this arrives downstream of our successful cooperative
@@ -658,26 +658,51 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             }
-            let scheduled = db::schedule_immediate_claim(&state.db, swap.id)
+            let schedule = db::schedule_immediate_claim(&state.db, swap.id)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
-            if scheduled == 1 {
-                tracing::error!(
-                    event = "reverse_swap_settled_without_local_claim",
+            match schedule {
+                db::ClaimRecoverySchedule::Coalesced => tracing::info!(
+                    event = "reverse_claim_webhook_coalesced",
                     source = "webhook",
                     swap_id = %data.id,
                     nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                     our_status = %swap.status,
                     claim_txid = ?swap.claim_txid,
                     amount_sat = swap.amount_sat,
-                    "provider reports a settled Lightning invoice without a local claimed state; scheduling automatic claim recovery"
-                );
-                try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
-            } else {
-                tracing::debug!(
+                    "settled webhook joined the active local claim broadcast"
+                ),
+                db::ClaimRecoverySchedule::Scheduled => {
+                    let outcome =
+                        try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
+                    if matches!(outcome, Ok(ClaimOutcome::SkippedLockHeld)) {
+                        tracing::info!(
+                            event = "reverse_claim_webhook_coalesced",
+                            source = "webhook",
+                            swap_id = %data.id,
+                            nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                            our_status = %swap.status,
+                            claim_txid = ?swap.claim_txid,
+                            amount_sat = swap.amount_sat,
+                            "settled webhook joined active local claim preparation"
+                        );
+                    } else {
+                        tracing::info!(
+                            event = "reverse_swap_settled_claim_recovery_dispatched",
+                            source = "webhook",
+                            swap_id = %data.id,
+                            nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                            our_status = %swap.status,
+                            claim_txid = ?swap.claim_txid,
+                            amount_sat = swap.amount_sat,
+                            "settled webhook dispatched bounded local claim recovery"
+                        );
+                    }
+                }
+                db::ClaimRecoverySchedule::Terminal => tracing::debug!(
                     swap_id = %data.id,
                     "settled reverse swap reached a terminal state before webhook recovery scheduling"
-                );
+                ),
             }
         }
         "swap.expired" => {
@@ -2587,12 +2612,15 @@ fn is_local_claim_error(message: &str) -> bool {
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
 /// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
-async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContext<'_>) {
+async fn try_claim_with_retry(
+    swap: &db::SwapRecord,
+    context: ClaimAttemptContext<'_>,
+) -> Result<ClaimOutcome, AppError> {
     let fee_decision = context
         .fee_runtime
         .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
         .ok();
-    match claim_swap(
+    let result = claim_swap(
         context.pool,
         swap.id,
         Some(context.state),
@@ -2604,8 +2632,8 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
         fee_decision.as_ref().map(|(decision, _)| decision),
         fee_decision.as_ref().map(|(_, record)| record),
     )
-    .await
-    {
+    .await;
+    match &result {
         Ok(ClaimOutcome::Broadcast) => {}
         Ok(ClaimOutcome::AlreadyTerminal) => {}
         Ok(ClaimOutcome::SkippedLockHeld) => {
@@ -2634,6 +2662,7 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
             );
         }
     }
+    result
 }
 
 /// Returns the claim destination for this swap. Three branches in order:
@@ -3364,6 +3393,31 @@ pub async fn exercise_reverse_claim_without_fee(
     .await
 }
 
+/// Integration seam for an already-journaled reverse claim. It executes the
+/// production lease, journal reload, Electrum connection, and broadcast path
+/// without the outer failure counter so tests can stop at the actual RPC
+/// boundary and model process loss while a broadcast is in flight.
+#[doc(hidden)]
+pub async fn exercise_journaled_reverse_claim_retry(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    claim_clients: &LiquidClaimClientFactory,
+) -> Result<ClaimOutcome, AppError> {
+    claim_swap_inner(
+        pool,
+        swap_id,
+        None,
+        Some(claim_clients),
+        "http://127.0.0.1:1",
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_swap_with_guard(
     pool: &sqlx::PgPool,
@@ -3541,18 +3595,19 @@ async fn claim_swap_inner(
     // is bounded provider I/O. Preflight the durable swap first, then let the
     // settlement service serialize the one allowed create call on the exact
     // same advisory-lock key used below.
-    let preflight: Option<(String, bool, bool)> = sqlx::query_as(
+    let preflight: Option<(String, bool, bool, bool)> = sqlx::query_as(
         "SELECT swap.status, swap.claim_tx_hex IS NOT NULL, EXISTS ( \
              SELECT 1 FROM swap_fiat_settlement_policies policy \
               WHERE policy.reverse_swap_id = swap.id \
-         ) \
+         ), swap.status = 'claiming' AND swap.next_claim_attempt_at > NOW() \
          FROM swap_records swap WHERE swap.id = $1",
     )
     .bind(swap_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| AppError::DbError(error.to_string()))?;
-    let Some((preflight_status, had_preflight_claim, has_mixed_policy)) = preflight else {
+    let Some((preflight_status, had_preflight_claim, has_mixed_policy, active_lease)) = preflight
+    else {
         return Err(AppError::ClaimError(format!("swap not found: {swap_id}")));
     };
     let preflight_status = preflight_status
@@ -3560,6 +3615,17 @@ async fn claim_swap_inner(
         .map_err(|error| AppError::ClaimError(format!("invalid persisted swap status: {error}")))?;
     if !preflight_status.is_claimable() {
         return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+    // This is an early, read-only fast path before mixed-settlement
+    // preparation can perform provider I/O. The authoritative check remains
+    // below under the per-swap advisory lock and row lock.
+    if active_lease {
+        tracing::debug!(
+            event = "reverse_claim_webhook_coalesced",
+            swap_id = %swap_id,
+            "claim broadcast lease is active at claim entry; coalescing invocation"
+        );
+        return Ok(ClaimOutcome::SkippedLockHeld);
     }
     if has_mixed_policy
         && !had_preflight_claim

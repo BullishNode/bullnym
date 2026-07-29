@@ -45,7 +45,9 @@ LNURL Lightning claims and LUD-22 Liquid address allocation.
 
 `donation_pages.ct_descriptor` is required and scoped by `(nym, kind)`.
 Payment Page checkout uses `kind = 'payment_page'`; POS checkout uses
-`kind = 'pos'`. Each row has its own `donation_pages.next_addr_idx` cursor.
+`kind = 'pos'`. Each row has its own descriptor generation and
+`donation_pages.next_addr_idx` cursor. Replacing the descriptor increments the
+generation and resets its cursor without releasing prior address ownership.
 
 Wallet-origin invoices do not require server-stored descriptors. The mobile
 client supplies concrete Bitcoin and/or Liquid settlement addresses at invoice

@@ -2966,6 +2966,58 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 SELECT 1 FROM information_schema.columns \
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
+                  AND column_name = 'descriptor_generation' \
+                  AND is_nullable = 'NO' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'checkout_liquid_address_reservations' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM (VALUES \
+                      ('checkout_liquid_reservation_derivation_key', 'u'), \
+                      ('checkout_liquid_reservation_address_key', 'u'), \
+                      ('checkout_liquid_reservation_invoice_key', 'u'), \
+                      ('checkout_liquid_reservation_state_check', 'c') \
+                  ) required(constraint_name, constraint_type) \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint constraint_info \
+                      WHERE constraint_info.conrelid = \
+                            to_regclass('public.checkout_liquid_address_reservations') \
+                        AND constraint_info.conname = required.constraint_name \
+                        AND constraint_info.contype = required.constraint_type::\"char\" \
+                        AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                  FROM pg_trigger trigger_info \
+                  JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                 WHERE trigger_info.tgrelid = to_regclass('public.donation_pages') \
+                   AND trigger_info.tgname = 'donation_pages_enforce_descriptor_generation' \
+                   AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled = 'O' \
+                   AND function_info.proname = 'enforce_checkout_descriptor_generation' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                  FROM pg_trigger trigger_info \
+                  JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                 WHERE trigger_info.tgrelid = \
+                       to_regclass('public.checkout_liquid_address_reservations') \
+                   AND trigger_info.tgname = \
+                       'checkout_liquid_reservations_enforce_transition' \
+                   AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled = 'O' \
+                   AND function_info.proname = \
+                       'enforce_checkout_liquid_reservation_transition' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
                   AND column_name = 'kind' \
             ) \
             AND EXISTS ( \

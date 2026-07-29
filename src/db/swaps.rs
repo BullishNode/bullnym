@@ -12,6 +12,17 @@ use super::{
 
 pub const CLAIM_IN_FLIGHT_LEASE: &str = "2 minutes";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRecoverySchedule {
+    /// No current broadcaster owns the row; the claim is due now.
+    Scheduled,
+    /// An in-process preparation lock or persisted `claiming` broadcast lease
+    /// is active, so a later trigger must join the existing attempt.
+    Coalesced,
+    /// The row disappeared or reached a terminal state before scheduling.
+    Terminal,
+}
+
 // --- Swap status enum ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,8 +996,21 @@ pub async fn list_claimed_swaps_missing_lightning_event(
 /// Boltz still considers the swap claimable but our row hasn't been
 /// retried recently (e.g., a permanent-looking error that was actually
 /// transient).
-pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
+pub async fn schedule_immediate_claim(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<ClaimRecoverySchedule, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let preparation_available: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(format!("claim:{id}"))
+            .fetch_one(&mut *tx)
+            .await?;
+    if !preparation_available {
+        tx.rollback().await?;
+        return Ok(ClaimRecoverySchedule::Coalesced);
+    }
+    let coalesced: Option<bool> = sqlx::query_scalar(
         "UPDATE swap_records \
          SET next_claim_attempt_at = CASE \
                  WHEN status = 'claiming' AND next_claim_attempt_at > NOW() \
@@ -995,13 +1019,19 @@ pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sq
              END, \
              updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded') \
+         RETURNING status = 'claiming' AND next_claim_attempt_at > NOW()",
     )
     .bind(id)
     .bind(CLAIM_IN_FLIGHT_LEASE)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected())
+    tx.commit().await?;
+    Ok(match coalesced {
+        Some(true) => ClaimRecoverySchedule::Coalesced,
+        Some(false) => ClaimRecoverySchedule::Scheduled,
+        None => ClaimRecoverySchedule::Terminal,
+    })
 }
 
 /// Combined reconciler action for the `swap.expired` (Boltz wall-clock

@@ -38,7 +38,7 @@ async fn cleanup(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE chain_swap_manifest_deliveries, chain_swap_records, \
          recovery_address_commitments, invoices, users, public_names, \
-         swap_key_allocations CASCADE",
+         swap_key_allocations, checkout_liquid_address_reservations CASCADE",
     )
     .execute(pool)
     .await
@@ -98,7 +98,39 @@ async fn insert_invoice_fixture(pool: &PgPool, label: &str) -> (String, db::Invo
 
     let liquid_address = format!("lq1{nym}");
     let blinding_key = "12".repeat(32);
-    let invoice = db::insert_invoice(
+    sqlx::query(
+        "INSERT INTO donation_pages \
+            (nym, kind, ct_descriptor, header, description, display_currency, enabled) \
+         VALUES ($1, 'payment_page', 'ct-permit-test', 'Permit test', '', 'USD', TRUE)",
+    )
+    .bind(&nym)
+    .execute(pool)
+    .await
+    .expect("insert permit test checkout surface");
+    let reservation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO checkout_liquid_address_reservations \
+            (nym, kind, descriptor_generation, address_index, address) \
+         VALUES ($1, 'payment_page', 1, 0, $2) \
+         RETURNING id",
+    )
+    .bind(&nym)
+    .bind(&liquid_address)
+    .fetch_one(pool)
+    .await
+    .expect("reserve permit test checkout address");
+    db::certify_checkout_liquid_reservation(pool, reservation_id)
+        .await
+        .expect("certify permit test checkout address");
+    let reservation = db::CheckoutLiquidReservation {
+        id: reservation_id,
+        nym: nym.clone(),
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
+        descriptor_generation: 1,
+        address_index: 0,
+        address: liquid_address.clone(),
+        ct_descriptor: "ct-permit-test".to_string(),
+    };
+    let invoice = db::insert_checkout_invoice(
         pool,
         &NewInvoice {
             nym_owner: Some(&nym),
@@ -120,6 +152,7 @@ async fn insert_invoice_fixture(pool: &PgPool, label: &str) -> (String, db::Invo
             liquid_blinding_key_hex: Some(&blinding_key),
             expires_in_secs: 3_600,
         },
+        &reservation,
     )
     .await
     .expect("insert permit test invoice");

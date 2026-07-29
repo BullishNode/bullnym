@@ -49,6 +49,16 @@ Liquid address from this descriptor and advances
 `donation_pages.next_addr_idx`. Payment Page and POS never borrow the
 Lightning Address descriptor or cursor.
 
+Changing a surface descriptor increments its durable
+`descriptor_generation` and resets that generation's cursor. Before a checkout
+can publish an address, Bullnym reserves the `(surface, generation, index)` and
+address globally, then requires a complete authoritative Liquid-history read.
+History-bearing candidates are retained as unusable reservations and the
+bounded scan advances; an unavailable or incomplete authority fails closed.
+The clean reservation is attached to the invoice atomically, so concurrent
+requests, process restarts, and re-adding an older descriptor cannot reassign a
+previously exposed address.
+
 Rendering `GET /:nym` does not allocate a Liquid address. Allocation happens
 when the payer creates a checkout invoice with `POST /:nym/invoice`.
 
