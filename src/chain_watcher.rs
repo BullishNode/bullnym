@@ -9,6 +9,7 @@
 //! Polling-based by design: simple, no subscription state to manage. ~30s
 //! cadence is fine for our LUD-22 "last unused address" semantics.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -670,7 +671,7 @@ pub async fn run(
         (WatchTier::Recent, &mut active_epoch),
         (WatchTier::Historical, &mut idle_epoch),
     ] {
-        let startup_outcome = poll_cycle(
+        let startup_outcome = poll_cycle_with_targeted_wakeups(
             ChainWatcherPollCtx {
                 pool: &pool,
                 backend: backend.as_ref(),
@@ -684,6 +685,7 @@ pub async fn run(
             &reporter,
             epoch,
             false,
+            wakeup.as_ref(),
         )
         .await;
         if cancel.is_cancelled() {
@@ -713,8 +715,14 @@ pub async fn run(
                 reporter.intentional_shutdown();
                 return;
             }
-            _ = active_tick.tick() => {
-                let turn = poll_cycle(
+            // A fresh cadence epoch must not preempt an unfinished bounded
+            // traversal. A recent turn can itself run longer than the active
+            // cadence; without this guard, the biased select sees another
+            // recent tick immediately ready forever and the historical
+            // startup wrap never completes, leaving direct-Liquid admission
+            // closed on an otherwise healthy backend.
+            _ = active_tick.tick(), if !resume_schedule.has_pending() => {
+                let turn = poll_cycle_with_targeted_wakeups(
                     ChainWatcherPollCtx {
                         pool: &pool,
                         backend: backend.as_ref(),
@@ -723,6 +731,7 @@ pub async fn run(
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch, false,
+                    wakeup.as_ref(),
                 ).await;
                 if cancel.is_cancelled() {
                     reporter.intentional_shutdown();
@@ -743,7 +752,7 @@ pub async fn run(
                         .expect("enabled Liquid resume wait has pending lane"),
                 );
                 let turn = match tier {
-                    WatchTier::Recent => poll_cycle(
+                    WatchTier::Recent => poll_cycle_with_targeted_wakeups(
                         ChainWatcherPollCtx {
                             pool: &pool,
                             backend: backend.as_ref(),
@@ -757,8 +766,9 @@ pub async fn run(
                         &reporter,
                         &mut active_epoch,
                         true,
+                        wakeup.as_ref(),
                     ).await,
-                    WatchTier::Historical => poll_cycle(
+                    WatchTier::Historical => poll_cycle_with_targeted_wakeups(
                         ChainWatcherPollCtx {
                             pool: &pool,
                             backend: backend.as_ref(),
@@ -772,6 +782,7 @@ pub async fn run(
                         &reporter,
                         &mut idle_epoch,
                         true,
+                        wakeup.as_ref(),
                     ).await,
                 };
                 if cancel.is_cancelled() {
@@ -781,8 +792,8 @@ pub async fn run(
                 report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
                 resume_schedule.observe(tier.lane(), turn.resume);
             }
-            _ = idle_tick.tick() => {
-                let turn = poll_cycle(
+            _ = idle_tick.tick(), if !resume_schedule.has_pending() => {
+                let turn = poll_cycle_with_targeted_wakeups(
                     ChainWatcherPollCtx {
                         pool: &pool,
                         backend: backend.as_ref(),
@@ -791,6 +802,7 @@ pub async fn run(
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Historical, &reporter, &mut idle_epoch, false,
+                    wakeup.as_ref(),
                 ).await;
                 if cancel.is_cancelled() {
                     reporter.intentional_shutdown();
@@ -805,11 +817,7 @@ pub async fn run(
                 resume_schedule.observe(db::WatcherLane::Historical, turn.resume);
             }
             request = wakeup.wait_for_request() => {
-                let started = std::time::Instant::now();
-                let invoice_id = request.invoice_id;
-                let generation = request.generation;
-                let queue_depth_after_dequeue = request.queue_depth_after_dequeue;
-                let outcome = poll_targeted_liquid_invoice(
+                service_targeted_liquid_request(
                     ChainWatcherPollCtx {
                         pool: &pool,
                         backend: backend.as_ref(),
@@ -822,30 +830,112 @@ pub async fn run(
                         finality_confirmations: cfg.liquid_finality_confirmations,
                         active_window_secs: cfg.active_window_secs,
                     },
-                    invoice_id,
                     &reporter,
+                    wakeup.as_ref(),
+                    request,
                 ).await;
                 if cancel.is_cancelled() {
                     reporter.intentional_shutdown();
                     return;
                 }
-                let completion = wakeup.complete(request);
-                tracing::info!(
-                    event = "liquid_watcher_targeted_wakeup_completed",
-                    invoice_id = %invoice_id,
-                    generation,
-                    latency_ms = started.elapsed().as_millis() as u64,
-                    outcome = outcome.label(),
-                    request_count = completion.request_count,
-                    coalesced_requests = completion.request_count.saturating_sub(1),
-                    queue_depth_after_dequeue,
-                    queue_depth = completion.queue_depth,
-                    outstanding = completion.outstanding,
-                    "payer-triggered targeted Liquid watcher scan completed"
-                );
             }
         }
     }
+}
+
+/// Keep one background lane turn pinned while serving payer-triggered work at
+/// every await boundary. In particular, a long history/reused-address scan no
+/// longer prevents the watcher from dequeuing an unrelated invoice for the
+/// full duration of the background page.
+#[allow(clippy::too_many_arguments)]
+async fn poll_cycle_with_targeted_wakeups(
+    ctx: ChainWatcherPollCtx<'_>,
+    cfg: &ChainWatcherConfig,
+    tolerances: db::InvoiceAccountingTolerances,
+    tier: WatchTier,
+    reporter: &WorkerReporter,
+    epoch: &mut LiquidTierScanEpoch,
+    resume_only: bool,
+    wakeup: &crate::watcher_wakeup::TargetedWatcherWakeup,
+) -> WatcherTurn<CycleOutcome> {
+    await_background_with_targeted_wakeups(
+        poll_cycle(ctx, cfg, tolerances, tier, reporter, epoch, resume_only),
+        wakeup,
+        ctx.cancel,
+        |request| {
+            service_targeted_liquid_request(
+                ctx,
+                LiquidInvoicePollConfig {
+                    tolerances,
+                    finality_confirmations: cfg.liquid_finality_confirmations,
+                    active_window_secs: cfg.active_window_secs,
+                },
+                reporter,
+                wakeup,
+                request,
+            )
+        },
+    )
+    .await
+    .unwrap_or_else(|| WatcherTurn::defer_to_cadence(CycleOutcome::Incomplete))
+}
+
+async fn await_background_with_targeted_wakeups<T, Background, Service, ServiceFuture>(
+    background: Background,
+    wakeup: &crate::watcher_wakeup::TargetedWatcherWakeup,
+    cancel: &CancellationToken,
+    mut service: Service,
+) -> Option<T>
+where
+    Background: Future<Output = T>,
+    Service: FnMut(crate::watcher_wakeup::TargetedWakeRequest) -> ServiceFuture,
+    ServiceFuture: Future<Output = ()>,
+{
+    tokio::pin!(background);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return None,
+            output = &mut background => return Some(output),
+            request = wakeup.wait_for_request() => {
+                service(request).await;
+                if cancel.is_cancelled() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn service_targeted_liquid_request(
+    ctx: ChainWatcherPollCtx<'_>,
+    config: LiquidInvoicePollConfig,
+    reporter: &WorkerReporter,
+    wakeup: &crate::watcher_wakeup::TargetedWatcherWakeup,
+    request: crate::watcher_wakeup::TargetedWakeRequest,
+) {
+    let started = std::time::Instant::now();
+    let invoice_id = request.invoice_id;
+    let generation = request.generation;
+    let queue_depth_after_dequeue = request.queue_depth_after_dequeue;
+    let outcome = poll_targeted_liquid_invoice(ctx, config, invoice_id, reporter).await;
+    if ctx.cancel.is_cancelled() {
+        return;
+    }
+    let completion = wakeup.complete(request);
+    tracing::info!(
+        event = "liquid_watcher_targeted_wakeup_completed",
+        invoice_id = %invoice_id,
+        generation,
+        latency_ms = started.elapsed().as_millis() as u64,
+        outcome = outcome.label(),
+        request_count = completion.request_count,
+        coalesced_requests = completion.request_count.saturating_sub(1),
+        queue_depth_after_dequeue,
+        queue_depth = completion.queue_depth,
+        outstanding = completion.outstanding,
+        "payer-triggered targeted Liquid watcher scan completed"
+    );
 }
 
 async fn poll_cycle(
@@ -1100,6 +1190,10 @@ async fn poll_invoice_addresses(
     let mut hits = 0usize;
     let mut useful_progress = 0usize;
     for invoice in invoices {
+        // Cached/reused destinations can make the backend futures immediately
+        // ready for many consecutive rows. Yield explicitly so HTTP work and
+        // the pinned-cycle targeted-wakeup branch remain schedulable.
+        tokio::task::yield_now().await;
         reporter.progress();
         if ctx.cancel.is_cancelled() {
             return WatcherTurn::defer_to_cadence(CycleOutcome::Incomplete);
@@ -1437,6 +1531,10 @@ async fn record_liquid_events_for_script(
     let mut outputs = Vec::new();
     let mut current_inputs = std::collections::HashMap::new();
     for entry in &snapshot.entries {
+        // A reused address can carry hundreds of cached history hits. Do not
+        // let an immediate-ready raw-tx cache turn this atomic verification
+        // loop into one long, non-cooperative Tokio poll.
+        tokio::task::yield_now().await;
         if boltz_settlement_txids.contains(&entry.txid.to_ascii_lowercase()) {
             tracing::debug!(
                 event = "liquid_watcher_boltz_settlement_excluded",
@@ -1512,6 +1610,7 @@ async fn record_liquid_events_for_script(
     }
     let mut prior_inputs = std::collections::HashMap::new();
     for txid in prior_txids {
+        tokio::task::yield_now().await;
         if ctx.cancel.is_cancelled() {
             return Err(AppError::ElectrumError(
                 "Liquid observation cancelled during replacement verification".into(),
@@ -2339,6 +2438,88 @@ mod tests {
                 .iter()
                 .map(|(height, hash)| (*height, (*hash).to_string()))
                 .collect(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_reused_address_scan_yields_to_coalesced_targeted_wakeup() {
+        let wakeup = Arc::new(crate::watcher_wakeup::TargetedWatcherWakeup::default());
+        let _registration = wakeup.register();
+        let invoice_id = uuid::Uuid::new_v4();
+
+        let first_waiter = {
+            let wakeup = Arc::clone(&wakeup);
+            tokio::spawn(async move {
+                wakeup
+                    .request_and_wait(invoice_id, Duration::from_secs(1))
+                    .await
+            })
+        };
+        let second_waiter = {
+            let wakeup = Arc::clone(&wakeup);
+            tokio::spawn(async move {
+                wakeup
+                    .request_and_wait(invoice_id, Duration::from_secs(1))
+                    .await
+            })
+        };
+        // Both requests enter the invoice-keyed queue before the background
+        // future starts; they must share one targeted scan generation.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let background_progress = Arc::new(AtomicUsize::new(0));
+        let serviced_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let background = {
+            let background_progress = Arc::clone(&background_progress);
+            async move {
+                // Model the maximum bounded history fanout of a reused Liquid
+                // address with immediately-ready cached work.
+                for completed in 1..=db::MAX_DIRECT_OBSERVATIONS_PER_BATCH {
+                    background_progress.store(completed, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+                "background_complete"
+            }
+        };
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_background_with_targeted_wakeups(background, wakeup.as_ref(), &cancel, {
+                let wakeup = Arc::clone(&wakeup);
+                let background_progress = Arc::clone(&background_progress);
+                let serviced_at = Arc::clone(&serviced_at);
+                let request_count = Arc::clone(&request_count);
+                move |request| {
+                    let wakeup = Arc::clone(&wakeup);
+                    let background_progress = Arc::clone(&background_progress);
+                    let serviced_at = Arc::clone(&serviced_at);
+                    let request_count = Arc::clone(&request_count);
+                    async move {
+                        serviced_at
+                            .store(background_progress.load(Ordering::SeqCst), Ordering::SeqCst);
+                        let completion = wakeup.complete(request);
+                        request_count.store(completion.request_count as usize, Ordering::SeqCst);
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("cooperative scan scheduler should not stall")
+        .expect("background scan should not be cancelled");
+
+        assert_eq!(output, "background_complete");
+        assert!(
+            serviced_at.load(Ordering::SeqCst) < db::MAX_DIRECT_OBSERVATIONS_PER_BATCH,
+            "targeted work must run before the large background scan completes"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        for waiter in [first_waiter, second_waiter] {
+            assert_eq!(
+                waiter.await.expect("targeted waiter task").outcome,
+                crate::watcher_wakeup::WakeWaitOutcome::Completed
+            );
         }
     }
 
