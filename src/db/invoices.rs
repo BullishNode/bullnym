@@ -2111,7 +2111,7 @@ pub(crate) const LIQUID_WATCHER_RECENT_PREDICATE_SQL: &str = "( \
              OR direct_settlement_status IN ('pending', 'resolution_pending') \
              OR EXISTS ( \
                   SELECT 1 FROM invoice_payment_events recent_direct_event \
-                  WHERE recent_direct_event.invoice_id = invoices.id \
+                  WHERE recent_direct_event.invoice_id = targets.id \
                     AND recent_direct_event.source = 'liquid_direct' \
                     AND recent_direct_event.accounting_state <> 'superseded' \
                     AND recent_direct_event.superseded_by_event_id IS NULL \
@@ -4497,6 +4497,10 @@ mod status_tests {
             .contains("recent_direct_event.accounting_state <> 'superseded'"));
         assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
             .contains("recent_direct_event.created_at <= $2::timestamptz"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("recent_direct_event.invoice_id = targets.id"));
+        assert!(!LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("recent_direct_event.invoice_id = invoices.id"));
         assert!(!LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("status = 'partially_paid'"));
 
         let historical = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, false);
