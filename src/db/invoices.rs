@@ -300,6 +300,16 @@ struct InvoiceQuoteEligibilityRow {
     before_invoice_expiry: bool,
 }
 
+/// Accounting-only eligibility for a valuation quote. Unlike payer quote
+/// admission, this intentionally remains available after payment evidence so
+/// late funds can be valued without exposing a new instruction.
+#[derive(sqlx::FromRow)]
+struct InvoiceValuationEligibilityRow {
+    pricing_mode: String,
+    fiat_amount_minor: Option<i32>,
+    fiat_currency: Option<String>,
+}
+
 /// One immutable payer instruction identity within a quote version.  Direct
 /// instructions and provider-backed instructions use the same attribution
 /// shape; this function only persists already-known evidence and never calls a
@@ -1279,10 +1289,8 @@ pub(crate) async fn create_or_reuse_late_observation_valuation_quote_locked(
         ));
     }
 
-    let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
-        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
-                presentation_status, \
-                expires_at > clock_timestamp() AS before_invoice_expiry \
+    let invoice_state = sqlx::query_as::<_, InvoiceValuationEligibilityRow>(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency \
            FROM invoices WHERE id = $1 FOR UPDATE",
     )
     .bind(invoice_id)
@@ -1493,10 +1501,8 @@ pub(crate) async fn capture_direct_observation_candidate_locked(
         return Ok(false);
     }
 
-    let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
-        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
-                presentation_status, \
-                expires_at > clock_timestamp() AS before_invoice_expiry \
+    let invoice_state = sqlx::query_as::<_, InvoiceValuationEligibilityRow>(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency \
            FROM invoices WHERE id = $1 FOR UPDATE",
     )
     .bind(invoice_id)
