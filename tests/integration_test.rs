@@ -2872,7 +2872,8 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", transient_failure).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
-    assert_eq!(response["code"], "ServiceUnavailable");
+    assert_eq!(response["code"], "FIAT_SETTLEMENT_TEMPORARILY_UNAVAILABLE");
+    assert_eq!(response["details"]["retry_after_seconds"], 3);
     assert_safe_application_error_reason(&response, &api_key);
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
