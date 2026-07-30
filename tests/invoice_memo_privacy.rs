@@ -5,7 +5,7 @@
 //! public response. These are pure serialization tests (no DB) that pin the
 //! wire shape so a future field addition to a public struct fails loudly.
 
-use pay_service::invoice::{InvoiceListItem, InvoiceStatusResponse};
+use pay_service::invoice::{InvoiceListItem, InvoiceStatusResponse, MerchantPaymentSummary};
 use uuid::Uuid;
 
 /// The signed invoice list is the ONE place a merchant's private memo is
@@ -22,6 +22,8 @@ fn signed_list_item_exposes_memo() {
         settlement_status: "none".to_string(),
         amount_sat: 1000,
         remaining_amount_sat: 0,
+        accepting_payments: false,
+        top_up_allowed: false,
         fiat_amount_minor: None,
         fiat_currency: None,
         memo: Some("table 5 — decaf".to_string()),
@@ -35,6 +37,23 @@ fn signed_list_item_exposes_memo() {
         paid_via: None,
         paid_at_unix: None,
         paid_amount_sat: None,
+        payment_summary: MerchantPaymentSummary {
+            observed_amount_sat: 1000,
+            credited_amount_sat: 1000,
+            remaining_amount_sat: 0,
+            excess_amount_sat: 0,
+            logical_payment_count: 1,
+            multiple_payments: false,
+            late_payment_count: 0,
+            has_late_payment: false,
+            first_payment_at_unix: Some(0),
+            last_payment_at_unix: Some(0),
+            accepting_payments: false,
+            top_up_allowed: false,
+            requires_merchant_action: false,
+            attention_reasons: vec![],
+            fiat: None,
+        },
         settlement_details: None,
         fiat_conversion: None,
     };
@@ -69,6 +88,8 @@ fn public_status_response_hides_memo() {
         fiat_amount_minor: None,
         fiat_currency: None,
         remaining_amount_sat: 1000,
+        accepting_payments: true,
+        top_up_allowed: false,
         payment_tolerance_sat: 0,
         creation_rate_minor_per_btc: None,
         rate_minor_per_btc: None,

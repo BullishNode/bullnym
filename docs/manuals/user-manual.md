@@ -313,10 +313,12 @@ rule.
 
 ## Underpayment, partial payment, and overpayment
 
-If less than the amount due arrives, the invoice normally remains partial and
-shows a remaining balance. A small configured tolerance can count a slight
-shortfall as paid; the server owns that calculation. Do not calculate it from
-the screen yourself.
+If less than the amount due arrives, the invoice records the short payment and
+shows a remaining balance for information. It does not offer a top-up on that
+invoice. The payer must contact the merchant, who may create a separate invoice
+if another payment is appropriate. A small configured tolerance can count a
+slight shortfall as paid; the server owns that calculation. Do not calculate it
+from the screen yourself.
 
 The outer invoice deadline closes new instructions, while the server's bounded
 payment-grace window lets already-sent direct payments finish observation. An
@@ -331,17 +333,16 @@ actual received value, rail, and settlement status before deciding what to do.
 For a merged-release fiat invoice, each payment event receives fiat credit
 from its own authoritative rate evidence. Sats first durably observed before a
 quote expires keep that quote's rate, but only for the sats actually observed.
-An underpayment does not lock the old rate for the unpaid balance.
+An underpayment does not lock the old rate for the informational unpaid balance.
 
 Sats first observed at or after expiry will require a trustworthy rate snapshot
 covering the observation time. If none exists, the money remains visible but
 unvalued and cannot complete the invoice. Bullnym will not guess with a later
-unrelated market rate. A later payment therefore uses the rate authoritative at
-its own first observation, not the first partial payment's rate.
-
-After valued partial payments, the next quote covers only the remaining fiat
-face value. It does not reprice fiat credit already committed to earlier
-payment events.
+unrelated market rate. A late payment sent to a previously copied instruction
+therefore uses the rate authoritative at its own first observation, not the
+first short payment's rate. Bullnym does not create a new quote for the
+remainder. Fiat credit already committed to earlier payment events is never
+repriced.
 
 ## Quote expiry, stale QR codes, and repeated clicks
 

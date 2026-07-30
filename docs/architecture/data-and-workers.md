@@ -125,8 +125,9 @@ instead of inheriting another process's health. Liquid and Bitcoin watchers run
 an immediate startup scan, and the claimer/reconciler/recovery workers run an
 immediate startup cycle before admission can open their dependent rail.
 For direct Liquid invoices, the fast lane contains newly-created targets plus
-any target with partial presentation or pending/resolution-pending direct
-settlement; the historical lane is the exact eligible complement. Cancelled,
+targets with a newly recorded direct event or pending/resolution-pending direct
+settlement; the historical lane is the exact eligible complement. A settled
+short payment is not pinned merely by its informational remainder. Cancelled,
 expired, and invoices from subsequently archived surfaces remain eligible for
 late-money and reorg observation. Each fully applied or explicitly isolated
 invoice advances only its own durable lane offset. That offset is restart
@@ -161,7 +162,7 @@ fully applied or explicitly isolated obligation. A new epoch starts after that
 offset, wraps once through the beginning up to its frozen starting offset, and
 only then completes. A crash before the offset write repeats an idempotent
 obligation; it cannot skip one. The recent lane prioritizes age-new invoices,
-`presentation_status = partial`, and direct settlement that is pending or in
+newly recorded direct events, and direct settlement that is pending or in
 resolution. Historical is the exact complement inside the eligible set, so the
 lanes are disjoint and old cancelled/expired destinations remain eligible.
 The persisted offset controls rotation only: every new process starts with

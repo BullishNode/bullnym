@@ -296,6 +296,7 @@ struct InvoiceQuoteEligibilityRow {
     fiat_currency: Option<String>,
     status: String,
     presentation_status: Option<String>,
+    settlement_status: String,
     before_invoice_expiry: bool,
 }
 
@@ -419,8 +420,8 @@ where
     Ok(())
 }
 
-/// Exact server-owned value used by `presentation_status` and payable top-up
-/// instructions. Active/legacy accounting events contribute, as do verified
+/// Exact server-owned value used by `presentation_status` and informational
+/// remaining-amount projections. Active/legacy accounting events contribute, as do verified
 /// provisional direct observations. Superseded or unverified evidence never
 /// contributes. A missing map entry means the invoice has no event rows; the
 /// caller may fall back to its accounting cache for legacy compatibility.
@@ -451,6 +452,128 @@ pub async fn invoice_presentation_received_sats<'e, E: sqlx::PgExecutor<'e>>(
     .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct InvoiceMerchantPaymentSummary {
+    pub invoice_id: Uuid,
+    pub observed_amount_sat: i64,
+    pub logical_payment_count: i64,
+    pub late_payment_count: i64,
+    pub first_payment_at_unix: i64,
+    pub last_payment_at_unix: i64,
+}
+
+/// Aggregate payer-visible evidence into merchant-facing logical payments.
+/// Mixed Bitcoin/fiat outputs share their settlement identity, direct outputs
+/// in one transaction share their txid, and one Boltz swap is one payment.
+/// This deliberately differs from counting accounting-event rows.
+pub async fn invoice_merchant_payment_summaries<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_ids: &[Uuid],
+) -> Result<HashMap<Uuid, InvoiceMerchantPaymentSummary>, sqlx::Error> {
+    if invoice_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, InvoiceMerchantPaymentSummary>(
+        "WITH active_events AS ( \
+             SELECT event.invoice_id, event.amount_sat, \
+                    CASE \
+                      WHEN event.bull_bitcoin_settlement_id IS NOT NULL \
+                        THEN 'settlement:' || event.bull_bitcoin_settlement_id::TEXT \
+                      WHEN mixed_settlement.id IS NOT NULL \
+                        THEN 'settlement:' || mixed_settlement.id::TEXT \
+                      WHEN event.source IN ('bitcoin_direct', 'liquid_direct') \
+                           AND event.txid IS NOT NULL \
+                        THEN 'direct:' || event.rail || ':' || event.txid \
+                      WHEN event.boltz_swap_id IS NOT NULL \
+                        THEN 'boltz:' || event.boltz_swap_id \
+                      WHEN event.merchant_chain_swap_id IS NOT NULL \
+                        THEN 'chain:' || event.merchant_chain_swap_id::TEXT \
+                      ELSE 'event:' || event.id::TEXT \
+                    END AS payment_identity, \
+                    COALESCE(event.quote_first_observed_at, observation.first_seen_at, \
+                             event.created_at) AS observed_at, \
+                    COALESCE(event.quote_first_observed_at, observation.first_seen_at, \
+                             event.created_at) > invoice.expires_at AS late \
+               FROM invoice_payment_events event \
+               JOIN invoices invoice ON invoice.id = event.invoice_id \
+          LEFT JOIN invoice_payment_observations observation \
+                 ON observation.id = event.observation_id \
+          LEFT JOIN swap_records reverse_swap \
+                 ON reverse_swap.boltz_swap_id = event.boltz_swap_id \
+          LEFT JOIN LATERAL ( \
+                    SELECT settlement.id \
+                      FROM bull_bitcoin_settlements settlement \
+                     WHERE settlement.purpose = 'mixed' \
+                       AND (settlement.chain_swap_id = event.merchant_chain_swap_id \
+                            OR settlement.reverse_swap_id = reverse_swap.id) \
+                     ORDER BY settlement.created_at, settlement.id \
+                     LIMIT 1 \
+               ) mixed_settlement ON TRUE \
+              WHERE event.invoice_id = ANY($1::UUID[]) \
+                AND event.accounting_state <> 'superseded' \
+                AND ( \
+                  event.accounting_state IN ('active', 'legacy_unverified') \
+                  OR (event.source IN ('bitcoin_direct', 'liquid_direct') \
+                      AND event.verification_state = 'verified' \
+                      AND observation.last_seen_state = 'seen_unconfirmed') \
+                ) \
+         ) \
+         SELECT invoice_id, COALESCE(SUM(amount_sat), 0)::BIGINT AS observed_amount_sat, \
+                COUNT(DISTINCT payment_identity)::BIGINT AS logical_payment_count, \
+                COUNT(DISTINCT payment_identity) FILTER (WHERE late)::BIGINT \
+                    AS late_payment_count, \
+                FLOOR(EXTRACT(EPOCH FROM MIN(observed_at)))::BIGINT \
+                    AS first_payment_at_unix, \
+                FLOOR(EXTRACT(EPOCH FROM MAX(observed_at)))::BIGINT \
+                    AS last_payment_at_unix \
+           FROM active_events GROUP BY invoice_id",
+    )
+    .bind(invoice_ids)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.invoice_id, row)).collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct InvoiceMerchantFiatSummary {
+    pub invoice_id: Uuid,
+    pub currency: String,
+    pub target_amount_minor: i64,
+    pub credited_amount_minor: i64,
+    pub remaining_amount_minor: i64,
+}
+
+pub async fn invoice_merchant_fiat_summaries<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_ids: &[Uuid],
+) -> Result<HashMap<Uuid, InvoiceMerchantFiatSummary>, sqlx::Error> {
+    if invoice_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, InvoiceMerchantFiatSummary>(
+        "SELECT invoice.id AS invoice_id, invoice.fiat_currency AS currency, \
+                invoice.fiat_amount_minor::BIGINT AS target_amount_minor, \
+                LEAST(invoice.fiat_amount_minor::BIGINT, \
+                      COALESCE(SUM(projection.active_fiat_credited_minor), 0)::BIGINT) \
+                    AS credited_amount_minor, \
+                GREATEST(invoice.fiat_amount_minor::BIGINT \
+                         - COALESCE(SUM(projection.active_fiat_credited_minor), 0)::BIGINT, 0) \
+                    AS remaining_amount_minor \
+           FROM invoices invoice \
+      LEFT JOIN invoice_quote_active_fiat_projection projection \
+             ON projection.invoice_id = invoice.id \
+          WHERE invoice.id = ANY($1::UUID[]) \
+            AND invoice.pricing_mode = 'fiat_fixed' \
+            AND invoice.fiat_amount_minor IS NOT NULL \
+            AND invoice.fiat_currency IS NOT NULL \
+       GROUP BY invoice.id, invoice.fiat_currency, invoice.fiat_amount_minor",
+    )
+    .bind(invoice_ids)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.invoice_id, row)).collect())
 }
 
 /// Single-invoice transaction-aware counterpart used while an offer creator
@@ -855,9 +978,9 @@ where
 /// response loss therefore returns the committed version rather than adding a
 /// second one.
 ///
-/// Fully valued active partial evidence is subtracted under the same lock, so
-/// the next version prices only the remaining fiat. Any unvalued event keeps
-/// the separate late-observation policy fail-closed.
+/// Any payment evidence closes payer admission. Valuation-only quote versions
+/// remain available to account for late evidence, but a payer-instruction
+/// quote is never created for a remaining balance.
 pub async fn create_or_reuse_current_invoice_quote(
     pool: &PgPool,
     invoice_id: Uuid,
@@ -868,7 +991,7 @@ pub async fn create_or_reuse_current_invoice_quote(
 
     let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
         "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
-                    presentation_status, \
+                    presentation_status, settlement_status, \
                     expires_at > clock_timestamp() AS before_invoice_expiry \
                FROM invoices WHERE id = $1 FOR UPDATE",
     )
@@ -881,14 +1004,9 @@ pub async fn create_or_reuse_current_invoice_quote(
     if invoice_state.pricing_mode != "fiat_fixed"
         || invoice_state.fiat_amount_minor.is_none()
         || invoice_state.fiat_currency.is_none()
-        || !matches!(
-            invoice_state.status.as_str(),
-            "unpaid" | "partially_paid" | "in_progress"
-        )
-        || !matches!(
-            invoice_state.presentation_status.as_deref(),
-            Some("unpaid" | "partial")
-        )
+        || invoice_state.status != "unpaid"
+        || invoice_state.presentation_status.as_deref() != Some("unpaid")
+        || !matches!(invoice_state.settlement_status.as_str(), "none" | "pending")
         || !invoice_state.before_invoice_expiry
     {
         return Err(sqlx::Error::Protocol(
@@ -1976,12 +2094,25 @@ const LIQUID_WATCHER_ELIGIBLE_PREDICATE_SQL: &str = "( \
        AND liquid_blinding_key_hex IS NOT NULL";
 
 /// Canonical priority predicate shared by both lanes. Old invoices with a
-/// partial presentation or unsettled direct evidence remain on the fast lane;
-/// historical is the exact negation within the same eligible cohort.
+/// unsettled direct evidence or a newly recorded direct event remain on the
+/// fast lane. A settled short payment does not stay hot merely because its
+/// informational remainder is positive. The event timestamp is immutable, unlike an
+/// observation's last-seen timestamp, so periodic scans cannot keep an old
+/// invoice hot forever. Historical is the exact negation within the same
+/// eligible cohort.
 pub(crate) const LIQUID_WATCHER_RECENT_PREDICATE_SQL: &str = "( \
              created_at > $2::timestamptz - ($3 || ' seconds')::interval \
-             OR COALESCE(presentation_status = 'partial', FALSE) \
              OR direct_settlement_status IN ('pending', 'resolution_pending') \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_events recent_direct_event \
+                  WHERE recent_direct_event.invoice_id = invoices.id \
+                    AND recent_direct_event.source = 'liquid_direct' \
+                    AND recent_direct_event.accounting_state <> 'superseded' \
+                    AND recent_direct_event.superseded_by_event_id IS NULL \
+                    AND recent_direct_event.created_at <= $2::timestamptz \
+                    AND recent_direct_event.created_at > \
+                        $2::timestamptz - ($3 || ' seconds')::interval \
+             ) \
            )";
 
 /// Lane-aware production query. `{lane_predicate}` is replaced with the
@@ -2201,9 +2332,10 @@ pub async fn list_liquid_watcher_invoice_lane_page(
     Ok(LiquidWatcherInvoicePage { rows, has_more })
 }
 
-/// Frozen-lane backlog observation. `oldest_due_lag_secs` is bounded at zero
-/// when the lane is empty or database time would otherwise produce a negative
-/// duration.
+/// Frozen-lane backlog observation. The timestamp and age describe the oldest
+/// invoice in the eligible lane; they are deliberately not labelled as a
+/// scheduling due time. Age is bounded at zero when the lane is empty or
+/// database time would otherwise produce a negative duration.
 pub async fn liquid_watcher_lane_lag(
     pool: &PgPool,
     payment_grace_secs: u64,
@@ -4283,12 +4415,12 @@ mod status_tests {
 
     fn recent_liquid_lane_facts(
         age_new: bool,
-        presentation_status: &str,
         direct_settlement_status: &str,
+        recent_direct_event: bool,
     ) -> bool {
         age_new
-            || presentation_status == "partial"
             || matches!(direct_settlement_status, "pending" | "resolution_pending")
+            || recent_direct_event
     }
 
     #[test]
@@ -4348,29 +4480,32 @@ mod status_tests {
     }
 
     #[test]
-    fn old_partial_or_settling_liquid_targets_stay_recent() {
-        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("presentation_status = 'partial'"));
+    fn settling_or_newly_paid_liquid_targets_stay_recent_without_pin_for_short_payment() {
+        assert!(!LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("presentation_status = 'partial'"));
         assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
             .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
         assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("created_at >"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("recent_direct_event.source = 'liquid_direct'"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("recent_direct_event.accounting_state <> 'superseded'"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("recent_direct_event.created_at <= $2::timestamptz"));
         assert!(!LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("status = 'partially_paid'"));
 
         let historical = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, false);
         assert!(historical.contains("OR status IN ('cancelled', 'expired')"));
         assert!(historical.contains(&format!("NOT {LIQUID_WATCHER_RECENT_PREDICATE_SQL}")));
 
-        assert!(recent_liquid_lane_facts(false, "partial", "none"));
-        assert!(recent_liquid_lane_facts(false, "unpaid", "pending"));
-        assert!(recent_liquid_lane_facts(
-            false,
-            "payment_received",
-            "resolution_pending"
-        ));
-        assert!(recent_liquid_lane_facts(true, "unpaid", "none"));
+        assert!(!recent_liquid_lane_facts(false, "none", false));
+        assert!(recent_liquid_lane_facts(false, "pending", false));
+        assert!(recent_liquid_lane_facts(false, "resolution_pending", false));
+        assert!(recent_liquid_lane_facts(true, "none", false));
+        assert!(recent_liquid_lane_facts(false, "none", true));
 
         // Old cancelled/expired rows remain in the eligible cohort above, but
-        // without partial or settling evidence they are the exact complement.
-        assert!(!recent_liquid_lane_facts(false, "unpaid", "none"));
+        // without new or settling evidence they are the exact complement.
+        assert!(!recent_liquid_lane_facts(false, "none", false));
     }
 
     #[test]

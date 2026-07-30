@@ -110,12 +110,23 @@ const BITCOIN_WATCHER_ELIGIBLE_PREDICATE: &str = "bitcoin_address IS NOT NULL \
            )";
 
 /// One canonical priority definition shared by both page and lag queries.
+/// Newly recorded direct events keep a closed invoice hot long enough to find
+/// repeat outputs without refreshing the window on every observation scan.
 /// Historical is constructed as its literal negation inside the same eligible
 /// set, so an invoice cannot enter both lanes or fall into a nullable gap.
 const BITCOIN_WATCHER_PRIORITY_PREDICATE: &str = "( \
              created_at > $3::timestamptz - ($1 || ' seconds')::interval \
-             OR COALESCE(presentation_status = 'partial', FALSE) \
              OR direct_settlement_status IN ('pending', 'resolution_pending') \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_events recent_direct_event \
+                  WHERE recent_direct_event.invoice_id = invoices.id \
+                    AND recent_direct_event.source = 'bitcoin_direct' \
+                    AND recent_direct_event.accounting_state <> 'superseded' \
+                    AND recent_direct_event.superseded_by_event_id IS NULL \
+                    AND recent_direct_event.created_at <= $3::timestamptz \
+                    AND recent_direct_event.created_at > \
+                        $3::timestamptz - ($1 || ' seconds')::interval \
+             ) \
            )";
 
 const BITCOIN_WATCHER_PAGE_SQL_TEMPLATE: &str = "SELECT \
@@ -583,10 +594,15 @@ mod tests {
                 .count(),
             1
         );
-        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
-            .contains("COALESCE(presentation_status = 'partial', FALSE)"));
+        assert!(!BITCOIN_WATCHER_PRIORITY_PREDICATE.contains("presentation_status = 'partial'"));
         assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
             .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
+        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
+            .contains("recent_direct_event.source = 'bitcoin_direct'"));
+        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
+            .contains("recent_direct_event.accounting_state <> 'superseded'"));
+        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
+            .contains("recent_direct_event.created_at <= $3::timestamptz"));
         assert!(
             BITCOIN_WATCHER_ELIGIBLE_PREDICATE.contains("OR status IN ('cancelled', 'expired')")
         );

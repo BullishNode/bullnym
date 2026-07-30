@@ -56,14 +56,17 @@ allowing installed Payment Page and POS shells to reopen without network.
 
 The live payment screen combines server-owned `presentation_status` with
 `settlement_status`; accounting `status` remains available but cannot declare a
-payment final by itself. Verified partial evidence keeps top-up rails visible.
-Sufficient or overpaid pending evidence hides rails and shows calm settlement
+payment final by itself. Any verified positive payment evidence closes every
+rail on that invoice; a short payment shows its informational remainder but
+never a replacement QR, address, BIP21, quote, order, or BOLT11. Sufficient or
+overpaid pending evidence likewise hides rails and shows calm settlement
 support. `resolution_pending` shows a visible payment issue. Unknown wire values
 are non-final, non-cancellable, hide rails, and keep polling rather than being
 treated as not-found or unpaid.
 
 One idempotently managed detail interval polls through pending, resolution,
-unknown, and settled-partial states because the latter remains payable. It
+unknown, and settled-short states so late money sent to an already copied
+instruction remains observable; polling does not imply payability. It
 stops on settled sufficient/overpaid projections or existing stop-polling
 incidents. Network failure retains the last trustworthy state, and only a real
 not-found response contributes to the not-found streak. The Liquid WebSocket

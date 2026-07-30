@@ -4,6 +4,7 @@
   // old QrCode.svelte + inline copy button; same qrcode-to-data-URL
   // approach, same card chrome.
   import QRCode from 'qrcode'
+  import { onDestroy } from 'svelte'
   import { Copy, CreditCard } from 'lucide-svelte'
   import Button from './Button.svelte'
 
@@ -19,6 +20,19 @@
     onBoltCard?: () => void
   } = $props()
   let dataUrl = $state('')
+  let copied = $state(false)
+  let copyReset: ReturnType<typeof setTimeout> | undefined
+
+  async function copyPayment() {
+    await navigator.clipboard.writeText(value)
+    copied = true
+    if (copyReset) clearTimeout(copyReset)
+    copyReset = setTimeout(() => (copied = false), 1_500)
+  }
+
+  onDestroy(() => {
+    if (copyReset) clearTimeout(copyReset)
+  })
 
   $effect(() => {
     const exactValue = value
@@ -44,9 +58,9 @@
     <img class="mx-auto aspect-square w-full max-w-[300px]" src={dataUrl} alt={label} />
   {/if}
   <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
-    <Button variant="secondary" onclick={() => navigator.clipboard.writeText(value)}>
+    <Button variant="secondary" onclick={copyPayment}>
       <Copy size={18} />
-      Copy
+      {copied ? 'Copied' : 'Copy'}
     </Button>
     {#if showBoltCard}
       <Button variant="secondary" onclick={onBoltCard}>

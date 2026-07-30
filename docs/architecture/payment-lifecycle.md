@@ -245,8 +245,8 @@ Payment status is the product/accounting state of the session.
 
 - `unpaid`: no payment evidence counted.
 - `in_progress`: payment evidence has been seen but is not countable yet.
-- `partially_paid`: counted payments exist, but the target is not met and the
-  session is still payable.
+- `partially_paid`: counted payments exist, but the target is not met. The
+  remaining amount is informational; payer admission is closed.
 - `paid`: counted payments meet the target within tolerance.
 - `underpaid`: the session expired after receiving some value below the target.
 - `overpaid`: counted payments exceed the target.
@@ -486,6 +486,8 @@ Invoices:
 - merchant can cancel only while `unpaid`
 - do not cancel `partially_paid`
 - safest initial rule: do not cancel once `in_progress`
+- any positive payment evidence closes all new instructions; a merchant may
+  create a separate invoice, but Bullnym never solicits a top-up
 - terminal statuses are not cancellable
 
 ## Testing Contract
@@ -517,7 +519,7 @@ style assertions unless a test is intentionally documenting a transition period.
 Minimum scenario coverage:
 
 - duplicate payment event idempotency
-- partial then completion
+- partial closes admission while a late cached-instruction payment is still counted
 - partial then expiry
 - overpayment
 - mixed rails

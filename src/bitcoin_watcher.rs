@@ -9,7 +9,8 @@
 //! Two persisted scheduling lanes balance responsiveness with restart-safe
 //! fairness and API budget:
 //! - Recent lane (active cadence, default 30s): invoices created in the last
-//!   `active_window_secs` (default 1h), plus partial or direct-settling invoices.
+//!   `active_window_secs` (default 1h), plus direct-settling invoices and
+//!   invoices with a newly recorded direct event.
 //! - Historical lane (idle cadence, default 5min): the exact eligible complement,
 //!   including old closed and evidence-bearing invoices.
 //!
@@ -657,13 +658,13 @@ impl BitcoinWatcher {
             epoch.begin(snapshot, starting_offset);
 
             match self.fetch_lane_lag(tier, epoch).await {
-                Ok((backlog, oldest_due, oldest_due_lag_secs)) => {
+                Ok((backlog, oldest_invoice_created_at, oldest_invoice_age_secs)) => {
                     tracing::info!(
                         event = "bitcoin_watcher_lane_backlog",
                         lane = tier.label(),
                         backlog,
-                        oldest_due = ?oldest_due,
-                        oldest_due_lag_secs,
+                        oldest_invoice_created_at = ?oldest_invoice_created_at,
+                        oldest_invoice_age_secs,
                         "bitcoin_watcher: frozen lane backlog"
                     );
                 }
@@ -800,7 +801,7 @@ impl BitcoinWatcher {
         tier: WatchTier,
         epoch: &BitcoinTierScanEpoch,
     ) -> Result<db::BitcoinWatcherInvoicePage, sqlx::Error> {
-        // The recent lane combines age-new, partial, and direct-settling work.
+        // The recent lane combines age-new, newly-paid, and direct-settling work.
         // Historical is the exact eligible complement, retaining old closed
         // rows because cancellation suppresses instructions, not evidence.
         let snapshot = epoch

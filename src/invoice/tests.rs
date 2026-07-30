@@ -485,15 +485,28 @@ fn presentation_projection_controls_new_payment_instructions() {
     let mut inv = invoice_fixture();
     assert!(invoice_payment_rails_are_payable(&inv));
 
+    inv.settlement_status = "pending".to_string();
+    assert!(
+        invoice_payment_rails_are_payable(&inv),
+        "a fresh fiat invoice may reserve settlement policy before payment"
+    );
+
     inv.presentation_status = None;
     assert!(!invoice_payment_rails_are_payable(&inv));
 
     inv.status = "in_progress".to_string();
     inv.presentation_status = Some("partial".to_string());
     inv.settlement_status = "pending".to_string();
-    assert!(invoice_payment_rails_are_payable(&inv));
+    assert!(!invoice_payment_rails_are_payable(&inv));
 
     inv.status = "partially_paid".to_string();
+    inv.presentation_status = Some("partial".to_string());
+    inv.settlement_status = "settled".to_string();
+    assert!(
+        !invoice_payment_rails_are_payable(&inv),
+        "a remaining balance is informational and must not authorize a top-up"
+    );
+
     inv.presentation_status = Some("payment_received".to_string());
     assert!(!invoice_payment_rails_are_payable(&inv));
 

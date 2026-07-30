@@ -1337,27 +1337,17 @@ fn inject_invoice_pwa_shell(shell: &str, config: &InvoicePwaConfig) -> Option<St
 }
 
 fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
-    if !matches!(
-        inv.status.as_str(),
-        "unpaid" | "in_progress" | "partially_paid"
-    ) {
-        return false;
-    }
-
-    match (
-        inv.presentation_status.as_deref(),
-        inv.settlement_status.as_str(),
-    ) {
-        // No accepted evidence: the normal fresh-invoice state.
-        (Some("unpaid"), "none") => true,
-        // A partial direct payment remains payable while it confirms and even
-        // after that contribution reaches finality. The server projection is
-        // authoritative; clients must not reproduce amount/tolerance rules.
-        (Some("partial"), "none" | "pending" | "settled") => true,
-        // Sufficient/overpaid evidence, incidents, and unknown projections all
-        // suppress new instructions and provider-side offer creation.
-        _ => false,
-    }
+    // An invoice admits one payer attempt. Any positive accepted or
+    // provisional evidence closes every public rail; a remaining balance is
+    // merchant accounting information and never authorizes a top-up offer.
+    // Persisted instructions that were exposed before this boundary remain
+    // durable for reconciliation, but are no longer returned to the payer.
+    inv.status == "unpaid"
+        && inv.presentation_status.as_deref() == Some("unpaid")
+        // Fiat-fixed invoices reserve provider policy before payment and
+        // legitimately carry `pending` here. Presentation remains the
+        // positive-evidence boundary; incident states fail closed.
+        && matches!(inv.settlement_status.as_str(), "none" | "pending")
 }
 
 struct PublicDirectPaymentAddresses<'a> {
@@ -1640,6 +1630,11 @@ pub struct InvoiceStatusResponse {
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     pub remaining_amount_sat: i64,
+    /// Whether the server will currently expose an initial payment
+    /// instruction. This becomes false on the first credible payment evidence.
+    pub accepting_payments: bool,
+    /// Bullnym never solicits a remaining-balance payment on the same invoice.
+    pub top_up_allowed: bool,
     pub payment_tolerance_sat: i64,
     /// Immutable invoice-creation reference rate (R1), available only for
     /// fiat-priced invoices. This is distinct from the current payer quote.
@@ -1741,12 +1736,12 @@ pub async fn status(
     let mut inv = db::get_invoice_by_id(&mut *snapshot, id)
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
-    let payment_open = matches!(
-        inv.status.as_str(),
-        "unpaid" | "in_progress" | "partially_paid"
-    );
-    let wake_bitcoin = payment_open && inv.accept_btc && inv.bitcoin_address.is_some();
-    let wake_liquid = payment_open && inv.accept_liquid && inv.liquid_address.is_some();
+    // An exposed direct-chain address remains an evidence obligation after the
+    // invoice closes. Polling a paid/underpaid invoice must therefore retain
+    // the same bounded fast path as the first payment so repeat and late
+    // outputs do not wait for the broad historical lane.
+    let wake_bitcoin = inv.accept_btc && inv.bitcoin_address.is_some();
+    let wake_liquid = inv.accept_liquid && inv.liquid_address.is_some();
     if wake_bitcoin || wake_liquid {
         // Do not hold a repeatable-read snapshot while the watcher applies its
         // authoritative generation. The refreshed snapshot below is the only
@@ -1905,6 +1900,7 @@ pub async fn status(
         bitcoin_chain_eligibility,
         existing_quote_chain_offer,
     );
+    let accepting_payments = invoice_payment_rails_are_payable(&inv);
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -1915,6 +1911,8 @@ pub async fn status(
         fiat_amount_minor: inv.fiat_amount_minor,
         fiat_currency: inv.fiat_currency,
         remaining_amount_sat: remaining_sat,
+        accepting_payments,
+        top_up_allowed: false,
         payment_tolerance_sat: tolerance_sat,
         creation_rate_minor_per_btc,
         rate_minor_per_btc: inv.rate_minor_per_btc,
@@ -2496,8 +2494,8 @@ fn fixed_checkout_lightning_offer(pr: String, merchant_amount_sat: i64) -> Optio
 
 /// Return the latest still-payable BOLT11 for an invoice, refreshing it
 /// through Boltz when the previous offer has expired. The server presentation
-/// projection decides payability: unpaid and partial may create a replacement,
-/// while sufficient, incident, and unknown evidence cannot.
+/// projection decides payability: only an evidence-free unpaid invoice may
+/// create a replacement. A short payment never authorizes a top-up BOLT11.
 /// The outer invoice `expires_at` remains the hard merchant lifetime;
 /// after that deadline, this helper will not create another swap.
 async fn ensure_reusable_lightning_offer(
@@ -5512,6 +5510,8 @@ pub struct InvoiceListItem {
     pub settlement_status: String,
     pub amount_sat: i64,
     pub remaining_amount_sat: i64,
+    pub accepting_payments: bool,
+    pub top_up_allowed: bool,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     /// Private note attached at checkout (PoS description / donor message).
@@ -5528,6 +5528,8 @@ pub struct InvoiceListItem {
     pub paid_via: Option<String>,
     pub paid_at_unix: Option<i64>,
     pub paid_amount_sat: Option<i64>,
+    /// Authenticated merchant-only accounting and attention projection.
+    pub payment_summary: MerchantPaymentSummary,
     /// Present only on this signed merchant projection. Public invoice reads
     /// never receive Bull Bitcoin order or fiat-credit details.
     pub settlement_details: Option<MerchantSettlementDetails>,
@@ -5535,6 +5537,34 @@ pub struct InvoiceListItem {
     /// Bitcoin settlement authoritative. Only its coarse local reason is
     /// exposed to the merchant.
     pub fiat_conversion: Option<MerchantFiatConversionOverride>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct MerchantPaymentSummary {
+    pub observed_amount_sat: i64,
+    pub credited_amount_sat: i64,
+    pub remaining_amount_sat: i64,
+    pub excess_amount_sat: i64,
+    pub logical_payment_count: i64,
+    pub multiple_payments: bool,
+    pub late_payment_count: i64,
+    pub has_late_payment: bool,
+    pub first_payment_at_unix: Option<i64>,
+    pub last_payment_at_unix: Option<i64>,
+    pub accepting_payments: bool,
+    pub top_up_allowed: bool,
+    pub requires_merchant_action: bool,
+    pub attention_reasons: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fiat: Option<MerchantFiatPaymentSummary>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct MerchantFiatPaymentSummary {
+    pub currency: String,
+    pub target_amount_minor: i64,
+    pub credited_amount_minor: i64,
+    pub remaining_amount_minor: i64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -5805,21 +5835,87 @@ pub async fn list_signed(
         .await;
     let has_more = rows.len() >= page_size as usize;
     let invoice_ids = rows.iter().map(|invoice| invoice.id).collect::<Vec<_>>();
-    let presentation_received =
-        db::invoice_presentation_received_sats(&mut *snapshot, &invoice_ids).await?;
+    let payment_summaries =
+        db::invoice_merchant_payment_summaries(&mut *snapshot, &invoice_ids).await?;
+    let fiat_summaries = db::invoice_merchant_fiat_summaries(&mut *snapshot, &invoice_ids).await?;
     let settlement_rows =
         db::invoice_bull_bitcoin_settlement_projections(&mut *snapshot, &params.npub, &invoice_ids)
             .await?;
     snapshot.commit().await?;
     let mut settlement_projections = merchant_invoice_settlement_projections(settlement_rows);
+    let mut payment_summaries = payment_summaries;
+    let mut fiat_summaries = fiat_summaries;
     let invoices = rows
         .into_iter()
         .map(|inv| {
-            let received = presentation_received
-                .get(&inv.id)
-                .copied()
+            let payment_projection = payment_summaries.remove(&inv.id);
+            let received = payment_projection
+                .as_ref()
+                .map(|summary| summary.observed_amount_sat)
                 .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
             let remaining = remaining_amount_from_received(&inv, received);
+            let excess = received.saturating_sub(inv.amount_sat).max(0);
+            let logical_payment_count = payment_projection
+                .as_ref()
+                .map_or(0, |summary| summary.logical_payment_count);
+            let multiple_payments = logical_payment_count > 1;
+            let late_payment_count = payment_projection
+                .as_ref()
+                .map_or(0, |summary| summary.late_payment_count);
+            let short_payment = received > 0 && remaining > 0;
+            let short_payment_pending = short_payment
+                && matches!(
+                    inv.settlement_status.as_str(),
+                    "pending" | "resolution_pending"
+                );
+            let mut attention_reasons = Vec::with_capacity(4);
+            if short_payment_pending {
+                attention_reasons.push("short_payment_pending");
+            } else if short_payment {
+                attention_reasons.push("underpaid");
+            }
+            if multiple_payments {
+                attention_reasons.push("multiple_payments");
+            }
+            if late_payment_count > 0 {
+                attention_reasons.push("late_payment");
+            }
+            if excess > 0 {
+                attention_reasons.push("overpaid");
+            }
+            let accepting_payments = invoice_payment_rails_are_payable(&inv);
+            let requires_merchant_action = attention_reasons
+                .iter()
+                .any(|reason| *reason != "short_payment_pending");
+            let fiat = fiat_summaries
+                .remove(&inv.id)
+                .map(|summary| MerchantFiatPaymentSummary {
+                    currency: summary.currency,
+                    target_amount_minor: summary.target_amount_minor,
+                    credited_amount_minor: summary.credited_amount_minor,
+                    remaining_amount_minor: summary.remaining_amount_minor,
+                });
+            let payment_summary = MerchantPaymentSummary {
+                observed_amount_sat: received,
+                credited_amount_sat: inv.paid_amount_sat.unwrap_or(0),
+                remaining_amount_sat: remaining,
+                excess_amount_sat: excess,
+                logical_payment_count,
+                multiple_payments,
+                late_payment_count,
+                has_late_payment: late_payment_count > 0,
+                first_payment_at_unix: payment_projection
+                    .as_ref()
+                    .map(|summary| summary.first_payment_at_unix),
+                last_payment_at_unix: payment_projection
+                    .as_ref()
+                    .map(|summary| summary.last_payment_at_unix),
+                accepting_payments,
+                top_up_allowed: false,
+                requires_merchant_action,
+                attention_reasons,
+                fiat,
+            };
             let projection = settlement_projections.remove(&inv.id).unwrap_or_default();
             // A funded provider binding is effective financial evidence and
             // supersedes any speculative rail attempt retained for audit.
@@ -5856,6 +5952,8 @@ pub async fn list_signed(
                 settlement_status: inv.settlement_status,
                 amount_sat: inv.amount_sat,
                 remaining_amount_sat: remaining,
+                accepting_payments,
+                top_up_allowed: false,
                 fiat_amount_minor: inv.fiat_amount_minor,
                 fiat_currency: inv.fiat_currency,
                 memo: inv.memo,
@@ -5869,6 +5967,7 @@ pub async fn list_signed(
                 paid_via: inv.paid_via,
                 paid_at_unix: inv.paid_at_unix,
                 paid_amount_sat: inv.paid_amount_sat,
+                payment_summary,
                 settlement_details,
                 fiat_conversion: fallback_reason.map(|reason| MerchantFiatConversionOverride {
                     status: "overridden",

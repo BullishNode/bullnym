@@ -1138,12 +1138,12 @@ async fn poll_invoice_addresses(
         )
         .await
         {
-            Ok((backlog, oldest_due, oldest_due_lag_secs)) => tracing::info!(
+            Ok((backlog, oldest_invoice_created_at, oldest_invoice_age_secs)) => tracing::info!(
                 event = "liquid_watcher_lane_backlog",
                 lane = tier.label(),
                 backlog,
-                oldest_due = ?oldest_due,
-                oldest_due_lag_secs,
+                oldest_invoice_created_at = ?oldest_invoice_created_at,
+                oldest_invoice_age_secs,
                 "chain_watcher: frozen Liquid invoice lane backlog"
             ),
             Err(e) => tracing::warn!(
