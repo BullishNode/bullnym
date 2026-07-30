@@ -227,11 +227,10 @@ export function isTerminalView(v: PayView): boolean {
   )
 }
 
-/** True for the "live, rails-visible" views — QR/tab bar renders. Once a
- * payment is detected (in_progress / settling) we stop showing the QR and
- * render the "Payment received" panel instead. */
+/** True only before payment evidence. A short payment closes every rail; its
+ * remaining balance is informational and never renders another QR. */
 export function showsRails(v: PayView): boolean {
-  return v.kind === 'waiting' || v.kind === 'partially_paid' || v.kind === 'partially_paid_pending'
+  return v.kind === 'waiting'
 }
 
 /** Unknown values and every accepted-evidence state are intentionally
@@ -240,10 +239,10 @@ export function isCancelableStatus(status: InvoiceStatus): boolean {
   return status.status === 'unpaid' && status.presentation_status === 'unpaid' && status.settlement_status === 'none'
 }
 
-/** Automatic detail polling continues through payable partials, pending,
- * resolution, and unknown projections. A settled partial is still payable, so
- * it must keep observing a later top-up. Settled sufficient/overpaid states and
- * existing stop-polling incidents remain manually refreshable. */
+/** Automatic detail polling continues through short, pending, resolution, and
+ * unknown projections. A settled short payment remains monitored because a
+ * previously copied address can still receive late money; polling never
+ * implies that a top-up instruction is available. */
 export function shouldPollDetail(status: InvoiceStatus, view = derivePayView(status)): boolean {
   if (view.kind === 'refunded' || view.kind === 'failed') return false
   if (view.kind === 'needs_review') return false
@@ -267,8 +266,8 @@ export function payViewLabel(v: PayView, remainingAmountSat: number | null): str
     case 'partially_paid':
     case 'partially_paid_pending':
       return remainingAmountSat != null
-        ? `Partially paid — ${new Intl.NumberFormat().format(remainingAmountSat)} sat due`
-        : 'Partially paid'
+        ? `Payment short — ${new Intl.NumberFormat().format(remainingAmountSat)} sat remaining`
+        : 'Payment short'
     case 'settling':
       return 'Payment received'
     case 'overpaid_pending':
@@ -298,8 +297,11 @@ export function payViewSupport(v: PayView): string | null {
   switch (v.kind) {
     case 'settling':
     case 'partially_paid_pending':
+      return 'Settlement pending. This invoice is closed to additional payments.'
     case 'overpaid_pending':
       return 'Settlement pending'
+    case 'partially_paid':
+      return 'This invoice is closed. Contact the merchant for a new payment request.'
     case 'resolution_pending':
       return 'Settlement problem — being checked'
     case 'unknown':
@@ -464,18 +466,14 @@ export const LN_REFRESH_COOLDOWN_MS = 15_000
  * The Lightning offer to hold after a `/status` poll, mirroring
  * the former standalone invoice flow. Adopt a fresh server-issued offer; CLEAR a
  * stale one to null when the server reports no offer on a still-payable
- * invoice (waiting/partially_paid) so shouldRefreshLightning re-requests it.
- * Without the clear, a partial payment that invalidates the full-amount
- * BOLT11 (server returns lightning_pr=null until POST /lightning) would leave
- * the old, wrong-amount offer on screen and in Bolt Card taps.
+ * evidence-free invoice. After a short payment, the old BOLT11 is removed and
+ * never replaced for the remaining balance.
  */
 export function nextLightningPr(current: string | null, status: InvoiceStatus): string | null {
   if (status.lightning_pr) return status.lightning_pr
+  if (status.accepting_payments === false || hasPaymentEvidence(status)) return null
   const v = derivePayView(status)
-  if (
-    (v.kind === 'waiting' || v.kind === 'partially_paid' || v.kind === 'partially_paid_pending') &&
-    (status.accept_ln ?? true)
-  ) return null
+  if (v.kind === 'waiting' && (status.accept_ln ?? true)) return null
   return current
 }
 
@@ -522,7 +520,7 @@ export function shouldRefreshLightning(params: {
 }): boolean {
   const { accept, pr, view, refreshing, lastFailedAt, now } = params
   if (!accept || pr || refreshing) return false
-  if (view.kind !== 'waiting' && view.kind !== 'partially_paid' && view.kind !== 'partially_paid_pending') return false
+  if (view.kind !== 'waiting') return false
   if (lastFailedAt != null && now - lastFailedAt < LN_REFRESH_COOLDOWN_MS) return false
   return true
 }

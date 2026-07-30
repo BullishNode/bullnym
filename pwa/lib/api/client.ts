@@ -86,6 +86,11 @@ export interface InvoiceStatus {
   fiat_amount_minor: number | null
   fiat_currency: string | null
   remaining_amount_sat: number
+  /** Server-owned payment-admission projection. False after any credible
+   * payment evidence; absent only during a rolling server upgrade. */
+  accepting_payments?: boolean
+  /** Bullnym never creates a remaining-balance instruction on this invoice. */
+  top_up_allowed?: boolean
   payment_tolerance_sat: number
   rate_minor_per_btc: number | null
   rate_locks_until_unix: number

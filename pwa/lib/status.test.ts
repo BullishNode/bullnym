@@ -77,14 +77,16 @@ describe('derivePayView combined server projection', () => {
     ).toEqual({ kind: 'settling' })
   })
 
-  it('keeps partial payment instructions visible while settlement is pending', () => {
+  it('closes payment instructions after a short payment while settlement is pending', () => {
     const view = derivePayView(
       makeStatus({ status: 'partially_paid', presentation_status: 'partial', settlement_status: 'pending' }),
     )
     expect(view).toEqual({ kind: 'partially_paid_pending' })
-    expect(showsRails(view)).toBe(true)
-    expect(payViewLabel(view, 1234)).toBe('Partially paid — 1,234 sat due')
-    expect(payViewSupport(view)).toBe('Settlement pending')
+    expect(showsRails(view)).toBe(false)
+    expect(payViewLabel(view, 1234)).toBe('Payment short — 1,234 sat remaining')
+    expect(payViewSupport(view)).toBe(
+      'Settlement pending. This invoice is closed to additional payments.',
+    )
   })
 
   it('preserves overpaid copy while provisional and finalizes only when accounting agrees', () => {
@@ -186,13 +188,16 @@ describe('derivePayView combined server projection', () => {
     }
   })
 
-  it('keeps finalized partial payable without reporting a terminal sale', () => {
+  it('keeps a finalized short payment monitored without offering a top-up', () => {
     const view = derivePayView(
       makeStatus({ status: 'partially_paid', presentation_status: 'partial', settlement_status: 'settled' }),
     )
     expect(view).toEqual({ kind: 'partially_paid' })
-    expect(showsRails(view)).toBe(true)
+    expect(showsRails(view)).toBe(false)
     expect(isTerminalView(view)).toBe(false)
+    expect(payViewSupport(view)).toBe(
+      'This invoice is closed. Contact the merchant for a new payment request.',
+    )
   })
 })
 
@@ -363,7 +368,7 @@ describe('polling and cancellation', () => {
     }
   })
 
-  it('keeps polling a settled partial so a later top-up is observed', () => {
+  it('keeps polling a settled short payment only to observe late money', () => {
     expect(
       shouldPollDetail(
         makeStatus({ status: 'partially_paid', presentation_status: 'partial', settlement_status: 'settled' }),
@@ -413,10 +418,10 @@ describe('Lightning offer decisions', () => {
     now: 1_000_000,
   }
 
-  it('refreshes waiting and partial states, including partial+pending', () => {
+  it('refreshes only the evidence-free waiting state', () => {
     expect(shouldRefreshLightning(base)).toBe(true)
-    expect(shouldRefreshLightning({ ...base, view: { kind: 'partially_paid' } })).toBe(true)
-    expect(shouldRefreshLightning({ ...base, view: { kind: 'partially_paid_pending' } })).toBe(true)
+    expect(shouldRefreshLightning({ ...base, view: { kind: 'partially_paid' } })).toBe(false)
+    expect(shouldRefreshLightning({ ...base, view: { kind: 'partially_paid_pending' } })).toBe(false)
   })
 
   it('never refreshes sufficient, incident, or unknown states', () => {
@@ -441,7 +446,7 @@ describe('Lightning offer decisions', () => {
     ).toBe(true)
   })
 
-  it('adopts fresh offers, clears stale partial offers, and retains hidden ones', () => {
+  it('adopts fresh offers and clears stale ones after any payment evidence', () => {
     expect(nextLightningPr('old', makeStatus({ lightning_pr: 'new' }))).toBe('new')
     expect(
       nextLightningPr(
@@ -451,10 +456,10 @@ describe('Lightning offer decisions', () => {
     ).toBeNull()
     expect(
       nextLightningPr(
-        'keep',
+        'stale-paid',
         makeStatus({ status: 'paid', presentation_status: 'payment_received', settlement_status: 'pending' }),
       ),
-    ).toBe('keep')
+    ).toBeNull()
   })
 })
 

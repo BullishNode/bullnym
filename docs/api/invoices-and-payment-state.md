@@ -176,7 +176,9 @@ Each `invoices` item contains:
 | `pricing_mode` | `sat_fixed` or `fiat_fixed` |
 | `settlement_status` | Settlement state from the table below |
 | `amount_sat` | Locked invoice amount in sats |
-| `remaining_amount_sat` | Amount still due in sats |
+| `remaining_amount_sat` | Informational amount not yet credited in sats; it never authorizes a top-up |
+| `accepting_payments` | Whether the server may expose the invoice's initial payment instructions; false after any positive evidence |
+| `top_up_allowed` | Always `false` in this contract |
 | `fiat_amount_minor` | Original fiat minor-unit amount, or `null` |
 | `fiat_currency` | Original ISO currency code, or `null` |
 | `memo` | Private merchant note, or `null`; checkout `note` is exposed here but never on public status/render routes |
@@ -190,6 +192,7 @@ Each `invoices` item contains:
 | `paid_via` | Credited payment rail, or `null` |
 | `paid_at_unix` | Credited payment time in Unix seconds, or `null` |
 | `paid_amount_sat` | Credited amount in sats, or `null` |
+| `payment_summary` | Authenticated merchant-only observed/credited/remaining/excess amounts, logical and late-payment counts, timestamps, attention reasons, admission flags, and optional fiat summary |
 
 `page` must be 1-1000. `pageSize` must be positive and is capped by the server
 at 100; sign the capped value if requesting more than 100. Supported status
@@ -280,7 +283,7 @@ instructions are `null` whenever the server projection says that no payment
 rail is payable, including terminal and cancelled invoices. The authenticated
 invoice list retains the stored direct addresses for merchant reconciliation.
 Every public payload is paired with its exact typed payer amount. Direct Liquid
-equals the merchant remainder. Fixed-checkout Lightning is grossed up so the
+equals the original merchant amount while admission remains open. Fixed-checkout Lightning is grossed up so the
 merchant nets face value after the provider claim, lockup, and percentage
 costs; the payer's wallet may add its own routing fee. The Bitcoin chain amount
 is copied from the persisted, validated user lock and can likewise exceed
@@ -303,7 +306,7 @@ Invoice `status` values:
 |---|---|
 | `unpaid` | No credited value. Offers may still be payable before expiry. |
 | `in_progress` | Payment detected or swap underway; continue polling and do not request duplicate payment. |
-| `partially_paid` | Credited amount is below the terminal threshold. Show remaining amount. Checkout partials terminalize after a configured grace period. |
+| `partially_paid` | Credited amount is below the terminal threshold. Show the informational remaining amount, hide all instructions, and direct the payer to the merchant. Checkout partials terminalize after a configured grace period. |
 | `paid` | Within the advertised invoice-wide tolerance. Fulfilled. |
 | `underpaid` | Terminal payment remained below required tolerance. Requires merchant policy/manual resolution. |
 | `overpaid` | More than requested was credited. Fulfilled, with possible merchant refund policy. |
@@ -316,7 +319,7 @@ Invoice `status` values:
 | Value | Client interpretation |
 |---|---|
 | `unpaid` | No valid active or provisional direct value contributes. |
-| `partial` | Active plus verified provisional value remains below the server tolerance; top-up rails remain payable. |
+| `partial` | Active plus verified provisional value remains below the server tolerance; all new payer admission is closed. |
 | `payment_received` | Active plus verified provisional value satisfies the invoice; hide new instructions. |
 | `overpaid` | Active plus verified provisional value exceeds the target; hide new instructions. |
 
@@ -324,8 +327,10 @@ The server owns value, mixed-rail, fiat, and tolerance calculations. A null or
 unknown presentation value is non-final and non-cancellable, hides payment
 instructions, and must not be mapped to `unpaid`.
 `remaining_amount_sat` is likewise server-owned: it subtracts exact active plus
-verified provisional presentation value so partial top-up instructions and new
-Lightning offers cannot request the already-observed amount again.
+verified provisional presentation value and is returned for payer/merchant
+information only. No rail may turn it into a new instruction on the same
+invoice. Previously exposed instructions remain watched because they may still
+receive late or repeated money.
 
 Settlement status is independent:
 
@@ -398,9 +403,9 @@ fields are one exact payer instruction; Bolt Card and manual clients must pay
 the typed BOLT11 principal, not the lower merchant remainder. It lazily creates
 or refreshes the current BOLT11 and is public/rate-limited. The invoice must
 accept Lightning and the
-combined server projection must remain payable: known `unpaid` with no
-settlement evidence, or known `partial` presentation. Sufficient, overpaid,
-incident, terminal, and unknown projections cannot mint a new offer. Call it
+combined server projection must remain payable: known `unpaid` with no payment
+evidence. Partial, sufficient, overpaid, incident, terminal, and unknown
+projections cannot mint a new offer. Call it
 only when a payable invoice's cached offer is absent or expired. A new BOLT11
 does not create a new invoice.
 
@@ -421,7 +426,8 @@ The integration suite exercises the offer-lock contention response.
 Use bounded polling with backoff and stop only when the combined presentation
 and settlement projection is final. Accounting `paid` with settlement
 `pending` continues polling; `resolution_pending`, unknown values, and a
-settled-but-partial payable projection also keep polling. Settled
+settled short-payment projection also keep polling to detect late use of an
+already copied instruction. This monitoring never reopens payer admission. Settled
 sufficient/overpaid projections plus `claim_stuck`, `refunded`, and `failed`
 stop the automatic detail loop under the current contract. A reasonable UI
 starts at 2-3 seconds while visible, backs off, and suspends in the background.

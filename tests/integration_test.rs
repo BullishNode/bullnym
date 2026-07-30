@@ -2646,6 +2646,53 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
 }
 
 #[tokio::test]
+async fn fiat_settlement_configuration_pool_contention_returns_bounded_retry_contract() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-config-contention", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&admin, "fiat-config-contention", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let constrained = constrained_test_pool(1, None);
+    let held = constrained.acquire().await.unwrap();
+    let app = test_app(test_state(constrained.clone()));
+    let timestamp = auth_timestamp();
+    let signature = sign_la_action_with_timestamp(
+        &keypair,
+        fiat_settlement::ACTION_GET,
+        &npub,
+        "",
+        &["1"],
+        timestamp,
+    );
+    let started = std::time::Instant::now();
+    let (status, headers, body) = get_json_with_headers(
+        &app,
+        &format!(
+            "/api/v1/fiat-settlement?version=1&npub={npub}&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "FIAT_SETTLEMENT_TEMPORARILY_UNAVAILABLE");
+    assert_eq!(body["details"]["retry_after_seconds"], 3);
+    assert_eq!(headers.get("retry-after").unwrap(), "3");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "configuration contention exceeded the server bound: {elapsed:?}"
+    );
+
+    drop(held);
+    drop(app);
+    constrained.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
 async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -2825,7 +2872,8 @@ async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_error
     );
     let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", transient_failure).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
-    assert_eq!(response["code"], "ServiceUnavailable");
+    assert_eq!(response["code"], "FIAT_SETTLEMENT_TEMPORARILY_UNAVAILABLE");
+    assert_eq!(response["details"]["retry_after_seconds"], 3);
     assert_safe_application_error_reason(&response, &api_key);
     assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
     assert!(!response.to_string().contains(&api_key));
@@ -16439,7 +16487,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
 }
 
 #[tokio::test]
-async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_terminalizes() {
+async fn partial_payment_closes_lazy_lightning_admission_without_provider_work() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let nym = "lazyofferpartialrace";
@@ -16464,14 +16512,6 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     )
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE invoice_payment_events SET created_at = NOW() - INTERVAL '20 minutes' \
-         WHERE invoice_id = $1",
-    )
-    .bind(invoice.id)
-    .execute(&pool)
-    .await
-    .unwrap();
     let before = pay_service::db::get_invoice_by_id(&pool, invoice.id)
         .await
         .unwrap()
@@ -16479,175 +16519,33 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     assert_eq!(before.status, "partially_paid");
     assert_eq!(before.presentation_status.as_deref(), Some("partial"));
 
-    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
-        .await
-        .unwrap() as u64;
-    let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", 649, first_key_index)
-            .await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
-    config.boltz.api_url = provider.base_url.clone();
+    config.boltz.api_url = boltz_url;
     let app = test_app(test_state_with_config(pool.clone(), config));
-    let request_app = app.clone();
     let path = format!("/api/v1/invoices/{}/lightning", invoice.id);
-    let request = tokio::spawn(async move { post_json(&request_app, &path, json!({})).await });
-
-    provider.wait_until_request_is_blocked().await;
-    let terminalized = tokio::time::timeout(
-        Duration::from_secs(2),
-        pay_service::db::terminalize_stale_checkout_partial_invoice(&pool, invoice.id, 900),
-    )
-    .await
-    .expect("partial terminalization blocked behind provider I/O")
-    .unwrap();
-    assert_eq!(terminalized, 1);
-    provider.release_response().await;
-
-    let (status, body) = tokio::time::timeout(Duration::from_secs(3), request)
-        .await
-        .expect("lazy offer request did not finish after provider release")
-        .expect("lazy offer request task failed");
-    let stale_bolt11 = provider.latest_invoice().await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["code"], "ServiceUnavailable");
-    assert!(body.get("pr").is_none(), "stale offer escaped: {body}");
-    assert!(!body.to_string().contains(&stale_bolt11));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    let requests = provider.requests.lock().await;
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].get("invoiceAmount").is_none());
-    assert_eq!(requests[0]["onchainAmount"], 620);
-    assert_eq!(requests[0]["pairHash"], "11".repeat(32));
-    drop(requests);
-
-    let recorded: (String, i64, Option<uuid::Uuid>, Option<i64>, String) = sqlx::query_as(
-        "SELECT invoice, amount_sat, invoice_id, key_index, status \
-         FROM swap_records WHERE boltz_swap_id = $1",
-    )
-    .bind("LAZY_OFFER_PARTIAL_RACE_1")
-    .fetch_one(&pool)
-    .await
-    .expect("successful provider result was not durably recorded");
-    assert_eq!(recorded.0, stale_bolt11);
-    assert_eq!(recorded.1, 600);
-    assert_eq!(recorded.2, Some(invoice.id));
-    assert!(recorded.3.is_some());
-    assert_eq!(recorded.4, "pending");
-    let final_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(final_invoice.status, "underpaid");
+    let (status, body) = post_json(&app, &path, json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "InvalidAmount");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    let swap_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(swap_count, 0);
     let (detail_status, detail) =
         get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
     assert_eq!(detail_status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["remaining_amount_sat"], 600);
+    assert_eq!(detail["accepting_payments"], false);
+    assert_eq!(detail["top_up_allowed"], false);
     assert!(detail["lightning_pr"].is_null());
+    assert!(detail["liquid_address"].is_null());
 
-    provider.shutdown().await;
-    cleanup_db(&pool).await;
-}
-
-#[tokio::test]
-async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-    let nym = "lazyoffercommitorder";
-    let npub = create_test_user(&pool, nym).await;
-    let invoice = insert_test_invoice(&pool, nym, &npub, "lq1lazyoffercommitorder", 3_600).await;
-    sqlx::query("UPDATE invoices SET accept_ln = TRUE WHERE id = $1")
-        .bind(invoice.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    pay_service::db::record_invoice_payment(
-        &pool,
-        invoice.id,
-        liquid_direct_evidence(
-            "liquid_direct:7171717171717171717171717171717171717171717171717171717171717171:0",
-            400,
-            "7171717171717171717171717171717171717171717171717171717171717171",
-            0,
-            "lq1lazyoffercommitorder",
-        ),
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE invoice_payment_events SET created_at = NOW() - INTERVAL '20 minutes' \
-         WHERE invoice_id = $1",
-    )
-    .bind(invoice.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
-        .await
-        .unwrap() as u64;
-    let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", 649, first_key_index)
-            .await;
-    let mut config = test_config();
-    config.boltz.api_url = provider.base_url.clone();
-    let app = test_app(test_state_with_config(pool.clone(), config));
-    let commit_hook = invoice::install_invoice_integration_test_hook(
-        invoice::InvoiceIntegrationTestHookPoint::OfferBeforeCommit,
-    );
-    let request_app = app.clone();
-    let path = format!("/api/v1/invoices/{}/lightning", invoice.id);
-    let request = tokio::spawn(async move { post_json(&request_app, &path, json!({})).await });
-
-    provider.wait_until_request_is_blocked().await;
-    provider.release_response().await;
-    tokio::time::timeout(Duration::from_secs(2), commit_hook.wait_until_reached())
-        .await
-        .expect("offer did not reach its final validation/row-lock boundary");
-
-    let terminal_pool = pool.clone();
-    let invoice_id = invoice.id;
-    let mut terminalizer = tokio::spawn(async move {
-        pay_service::db::terminalize_stale_checkout_partial_invoice(&terminal_pool, invoice_id, 900)
-            .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut terminalizer)
-            .await
-            .is_err(),
-        "terminalization must wait for the validated offer transaction to commit"
-    );
-
-    commit_hook.release();
-    let (status, body) = tokio::time::timeout(Duration::from_secs(3), request)
-        .await
-        .expect("offer request did not finish after commit release")
-        .expect("offer request task failed");
-    let bolt11 = provider.latest_invoice().await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["pr"], bolt11);
-    assert_eq!(body["lightning_amount_sat"], 649);
-
-    let terminalized = tokio::time::timeout(Duration::from_secs(2), terminalizer)
-        .await
-        .expect("terminalization did not finish after offer commit")
-        .expect("terminalization task failed")
-        .unwrap();
-    assert_eq!(terminalized, 1);
-    let final_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(final_invoice.status, "underpaid");
-    let recorded: (String, i64, String) = sqlx::query_as(
-        "SELECT invoice, amount_sat, status FROM swap_records WHERE boltz_swap_id = $1",
-    )
-    .bind("LAZY_OFFER_COMMIT_ORDER_1")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(recorded, (bolt11, 600, "pending".to_string()));
-
-    provider.shutdown().await;
+    provider_task.abort();
+    let _ = provider_task.await;
     cleanup_db(&pool).await;
 }
 
@@ -21369,6 +21267,11 @@ async fn fiat_only_quote_replay_returns_the_bound_unfunded_instruction() {
             None
         )
     );
+    let (detail_status, detail) =
+        get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(detail_status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["accepting_payments"], true);
+    assert_eq!(detail["top_up_allowed"], false);
 
     let (replay_status, replay) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
     assert_eq!(replay_status, StatusCode::OK, "{replay}");
@@ -23136,6 +23039,9 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
     let new_unpaid = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlanenew000")
         .await
         .unwrap();
+    let old_newly_paid = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlaneoldnewpayment")
+        .await
+        .unwrap();
 
     sqlx::query(
         "UPDATE invoices SET \
@@ -23146,6 +23052,42 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
          WHERE id = $1",
     )
     .bind(old_cancelled.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 08:45:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-13 00:00:00+00' \
+         WHERE id = $1",
+    )
+    .bind(old_newly_paid.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let recent_txid = "3232323232323232323232323232323232323232323232323232323232323232";
+    let recent_event_key = format!("bitcoin_direct:{recent_txid}:0");
+    pay_service::db::record_invoice_payment(
+        &pool,
+        old_newly_paid.id,
+        bitcoin_direct_evidence(
+            &recent_event_key,
+            1_000,
+            recent_txid,
+            0,
+            "bc1qlaneoldnewpayment",
+        ),
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+            SET created_at = TIMESTAMPTZ '2026-07-12 11:45:00+00' \
+          WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(old_newly_paid.id)
+    .bind(&recent_event_key)
     .execute(&pool)
     .await
     .unwrap();
@@ -23212,7 +23154,7 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
     assert!(!recent.has_more);
     assert_eq!(
         recent.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-        vec![old_partial.id, old_settling.id, new_unpaid.id]
+        vec![old_newly_paid.id, old_settling.id, new_unpaid.id]
     );
     let bounded_recent = pay_service::db::list_bitcoin_watcher_invoice_page(
         &pool,
@@ -23233,7 +23175,7 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
             .iter()
             .map(|row| row.id)
             .collect::<Vec<_>>(),
-        vec![old_partial.id, old_settling.id]
+        vec![old_newly_paid.id, old_settling.id]
     );
 
     let historical = pay_service::db::list_bitcoin_watcher_invoice_page(
@@ -23251,7 +23193,7 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
     assert!(!historical.has_more);
     assert_eq!(
         historical.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-        vec![old_cancelled.id, old_expired.id]
+        vec![old_cancelled.id, old_expired.id, old_partial.id]
     );
 
     let rotation_start = old_settling.id;
@@ -23289,7 +23231,7 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
     .unwrap();
     assert_eq!(
         wrap.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-        vec![old_partial.id, old_settling.id]
+        vec![old_newly_paid.id, old_settling.id]
     );
 
     let (recent_count, recent_oldest, recent_lag) = pay_service::db::bitcoin_watcher_lane_lag(
@@ -23302,8 +23244,8 @@ async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bound
     .await
     .unwrap();
     assert_eq!(recent_count, 3);
-    assert!(recent_oldest.unwrap().starts_with("2026-07-12 09:00:00"));
-    assert_eq!(recent_lag, 10_800);
+    assert!(recent_oldest.unwrap().starts_with("2026-07-12 08:45:00"));
+    assert_eq!(recent_lag, 11_700);
 
     cleanup_db(&pool).await;
 }
@@ -23591,6 +23533,9 @@ async fn public_contract_tracks_exact_provisional_value_and_accounting_finality(
     assert_eq!(body["presentation_status"], "partial");
     assert_eq!(body["settlement_status"], "pending");
     assert_eq!(body["remaining_amount_sat"], 600);
+    assert_eq!(body["accepting_payments"], false);
+    assert_eq!(body["top_up_allowed"], false);
+    assert!(body["bitcoin_address"].is_null());
     assert_eq!(body["paid_amount_sat"], Value::Null);
 
     let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");
@@ -23606,6 +23551,28 @@ async fn public_contract_tracks_exact_provisional_value_and_accounting_finality(
     assert_eq!(body["invoices"][0]["presentation_status"], "partial");
     assert_eq!(body["invoices"][0]["settlement_status"], "pending");
     assert_eq!(body["invoices"][0]["remaining_amount_sat"], 600);
+    assert_eq!(body["invoices"][0]["accepting_payments"], false);
+    assert_eq!(body["invoices"][0]["top_up_allowed"], false);
+    assert_eq!(
+        body["invoices"][0]["payment_summary"]["observed_amount_sat"],
+        400
+    );
+    assert_eq!(
+        body["invoices"][0]["payment_summary"]["logical_payment_count"],
+        1
+    );
+    assert_eq!(
+        body["invoices"][0]["payment_summary"]["remaining_amount_sat"],
+        600
+    );
+    assert_eq!(
+        body["invoices"][0]["payment_summary"]["requires_merchant_action"],
+        false
+    );
+    assert_eq!(
+        body["invoices"][0]["payment_summary"]["attention_reasons"],
+        json!(["short_payment_pending"])
+    );
     assert_eq!(body["invoices"][0]["paid_amount_sat"], Value::Null);
 
     let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "paid");
@@ -26744,7 +26711,10 @@ async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit()
 async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let npub = create_test_user(&pool, "eventacct").await;
+    let (npub, _, _, keypair) = sign_registration_with_keypair("eventacct", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "eventacct", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
     let invoice = insert_test_invoice(&pool, "eventacct", &npub, "lq1eventacct", 60).await;
     let tolerances = pay_service::db::InvoiceAccountingTolerances {
         payment_grace_secs: 0,
@@ -26850,6 +26820,69 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     assert_eq!(overpaid.presentation_status.as_deref(), Some("overpaid"));
     assert_eq!(overpaid.settlement_status, "settled");
     assert_eq!(overpaid.paid_amount_sat, Some(1_010));
+
+    // A second output in the same transaction increases value but remains one
+    // logical payer payment in the merchant summary.
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        bitcoin_direct_evidence(
+            "bitcoin_direct:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:2",
+            5,
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            2,
+            "bc1qeventacct",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    // Preserve two on-time logical payments and make only the final distinct
+    // transaction late relative to the merchant's original deadline.
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events SET created_at = NOW() - INTERVAL '20 minutes' \
+          WHERE invoice_id = $1 AND event_key IN ($2, $3)",
+    )
+    .bind(invoice.id)
+    .bind("liquid_direct:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0")
+    .bind("bitcoin_direct:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:0")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(pool.clone()));
+    let (signature, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={npub}&page=1&pageSize=10&timestamp={timestamp}&signature={signature}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = &body["invoices"][0]["payment_summary"];
+    assert_eq!(summary["observed_amount_sat"], 1_015);
+    assert_eq!(summary["credited_amount_sat"], 1_015);
+    assert_eq!(summary["remaining_amount_sat"], 0);
+    assert_eq!(summary["excess_amount_sat"], 15);
+    assert_eq!(summary["logical_payment_count"], 3);
+    assert_eq!(summary["multiple_payments"], true);
+    assert_eq!(summary["late_payment_count"], 1);
+    assert_eq!(summary["has_late_payment"], true);
+    assert_eq!(summary["accepting_payments"], false);
+    assert_eq!(summary["top_up_allowed"], false);
+    assert_eq!(summary["requires_merchant_action"], true);
+    assert_eq!(
+        summary["attention_reasons"],
+        json!(["multiple_payments", "late_payment", "overpaid"])
+    );
 
     cleanup_db(&pool).await;
 }
@@ -28117,7 +28150,7 @@ async fn stale_wallet_partial_stays_payable() {
 }
 
 #[tokio::test]
-async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
+async fn checkout_underpaid_liquid_address_counts_late_cached_instruction_payment() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "underwatch").await;
@@ -28185,7 +28218,7 @@ async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
 }
 
 #[tokio::test]
-async fn checkout_underpaid_insufficient_topup_stays_underpaid() {
+async fn checkout_underpaid_insufficient_late_cached_instruction_payment_stays_underpaid() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "undertopup").await;
@@ -29015,6 +29048,8 @@ async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
         insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldexpired", -10).await;
     let new_unpaid =
         insert_test_invoice(&pool, "liquidlane", &npub, "lq1lanenewunpaid", 3_600).await;
+    let old_newly_paid =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldnewpayment", 3_600).await;
 
     sqlx::query(
         "UPDATE invoices \
@@ -29025,6 +29060,27 @@ async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
     )
     .bind(old_partial.id)
     .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE invoices SET created_at = NOW() - INTERVAL '2 days' WHERE id = $1")
+        .bind(old_newly_paid.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recent_txid = "3333333333333333333333333333333333333333333333333333333333333333";
+    let recent_event_key = format!("liquid_direct:{recent_txid}:0");
+    pay_service::db::record_invoice_payment(
+        &pool,
+        old_newly_paid.id,
+        liquid_direct_evidence(
+            &recent_event_key,
+            1_000,
+            recent_txid,
+            0,
+            "lq1laneoldnewpayment",
+        ),
+        direct_lifecycle_tolerances(),
+    )
     .await
     .unwrap();
     sqlx::query(
@@ -29075,8 +29131,9 @@ async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
         historical.rows.into_iter().map(|row| row.id).collect();
 
     assert!(recent_ids.is_disjoint(&historical_ids));
-    assert!(recent_ids.contains(&old_partial.id));
+    assert!(historical_ids.contains(&old_partial.id));
     assert!(recent_ids.contains(&old_settling.id));
+    assert!(recent_ids.contains(&old_newly_paid.id));
     assert!(recent_ids.contains(&new_unpaid.id));
     assert!(historical_ids.contains(&old_cancelled.id));
     assert!(historical_ids.contains(&old_expired.id));
@@ -29116,20 +29173,20 @@ async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
         recent_ids
     );
 
-    let (recent_backlog, recent_oldest_due, recent_lag_secs) =
+    let (recent_backlog, recent_oldest_invoice, recent_oldest_invoice_age_secs) =
         pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, true)
             .await
             .unwrap();
-    let (historical_backlog, historical_oldest_due, historical_lag_secs) =
+    let (historical_backlog, historical_oldest_invoice, historical_oldest_invoice_age_secs) =
         pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, false)
             .await
             .unwrap();
     assert_eq!(recent_backlog, recent_ids.len() as i64);
-    assert!(recent_oldest_due.is_some());
-    assert!(recent_lag_secs >= 0);
+    assert!(recent_oldest_invoice.is_some());
+    assert!(recent_oldest_invoice_age_secs >= 0);
     assert_eq!(historical_backlog, historical_ids.len() as i64);
-    assert!(historical_oldest_due.is_some());
-    assert!(historical_lag_secs >= 0);
+    assert!(historical_oldest_invoice.is_some());
+    assert!(historical_oldest_invoice_age_secs >= 0);
 
     cleanup_db(&pool).await;
 }

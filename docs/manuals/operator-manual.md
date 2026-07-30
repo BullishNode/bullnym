@@ -744,15 +744,17 @@ enters integrity hold.
 ## Watchers, scheduling, and backlog
 
 Bitcoin and Liquid direct watchers use deterministic recent and historical
-lanes. Recent, partial, and settling invoices receive most capacity; a reserved
-share covers expired, cancelled, archived, and old targets. Cursors survive
+lanes. Newly created, newly paid, and settling invoices receive most capacity;
+a reserved share covers expired, cancelled, archived, settled-short, and old
+targets. Cursors survive
 restart, but a new process must prove its own full startup traversal before its
 dependent admission opens.
 
 Monitor:
 
 - last successful cycle and duration for every worker;
-- recent/historical backlog count, oldest due time, and lane lag;
+- recent/historical backlog count plus oldest invoice creation time/age (not a
+  scheduler due timestamp);
 - frozen lane start, persisted cursor progress, wraps, and no-progress pages;
 - reconcilers, settlement repair, slow recovery, fee refresh, manifest
   delivery/audit, OG repair, and GC;

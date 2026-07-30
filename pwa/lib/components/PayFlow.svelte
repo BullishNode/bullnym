@@ -290,8 +290,8 @@
           {@render terminalPanel(
             '!',
             'warn',
-            'Underpaid',
-            `Expected ${terminal.status.amount_sat} sat, got ${terminal.status.paid_amount_sat ?? 0} sat`,
+            'Payment short',
+            `Received ${terminal.status.paid_amount_sat ?? 0} of ${terminal.status.amount_sat} sats. This invoice is closed; contact the merchant for a new payment request.`,
             'Back',
           )}
         {:else if terminal.kind === 'expired'}

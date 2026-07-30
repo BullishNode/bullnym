@@ -59,7 +59,9 @@ evidence may already exist.
 ## Status
 
 `GET /api/v1/invoices/:id/status` returns public payment state, settlement
-state, remaining amount, reusable offers, and direct Bitcoin observations.
+state, remaining amount, admission flags, currently valid offers, and direct
+Bitcoin observations. `accepting_payments` becomes false after the first
+positive payment evidence and `top_up_allowed` is always false.
 
 Payment status is accounting state:
 

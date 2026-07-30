@@ -76,6 +76,12 @@ pub enum AppError {
     /// The supplied or stored scoped credential is malformed, inactive,
     /// revoked, or lacks the required scope.
     BullBitcoinCredentialInvalid,
+    /// A fiat-settlement dependency or serialization boundary is temporarily
+    /// unavailable. The bounded retry hint is part of the authenticated API
+    /// contract and must not be inferred from human-readable text.
+    FiatSettlementTemporarilyUnavailable {
+        retry_after_seconds: u64,
+    },
     /// LUD-12 comment validation or stable-retry failure. The inner value is
     /// always server-authored static text and must never contain payer input.
     InvalidComment(&'static str),
@@ -203,9 +209,10 @@ impl AppError {
             | Self::BackendThrottled
             | Self::TooManyPendingReservations => ErrorClass::RateLimit,
 
-            Self::ServiceUnavailable(_) | Self::QuoteBusy { .. } | Self::PurgeBlocked(_) => {
-                ErrorClass::Capacity
-            }
+            Self::ServiceUnavailable(_)
+            | Self::FiatSettlementTemporarilyUnavailable { .. }
+            | Self::QuoteBusy { .. }
+            | Self::PurgeBlocked(_) => ErrorClass::Capacity,
 
             Self::MoneyAdmissionUnavailable
             | Self::ElectrumError(_)
@@ -245,6 +252,9 @@ impl AppError {
             Self::FiatConversionKycRequired => "FIAT_CONVERSION_KYC_REQUIRED",
             Self::BullBitcoinCredentialRequired => "FIAT_CREDENTIAL_REQUIRED",
             Self::BullBitcoinCredentialInvalid => "FIAT_CREDENTIAL_INVALID",
+            Self::FiatSettlementTemporarilyUnavailable { .. } => {
+                "FIAT_SETTLEMENT_TEMPORARILY_UNAVAILABLE"
+            }
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
@@ -320,6 +330,12 @@ impl std::fmt::Display for AppError {
             Self::BullBitcoinCredentialInvalid => {
                 write!(f, "Bull Bitcoin scoped credential is invalid")
             }
+            Self::FiatSettlementTemporarilyUnavailable {
+                retry_after_seconds,
+            } => write!(
+                f,
+                "fiat settlement is temporarily unavailable; retry after {retry_after_seconds} seconds"
+            ),
             Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
@@ -368,6 +384,13 @@ impl IntoResponse for AppError {
             AppError::MoneyAdmissionUnavailable => {
                 tracing::warn!("money admission temporarily unavailable")
             }
+            AppError::FiatSettlementTemporarilyUnavailable {
+                retry_after_seconds,
+            } => tracing::warn!(
+                event = "fiat_settlement_temporarily_unavailable",
+                retry_after_seconds,
+                "fiat-settlement request reached its bounded availability limit"
+            ),
             AppError::QuoteBusy {
                 invoice_id,
                 quote_version_id,
@@ -430,6 +453,9 @@ impl IntoResponse for AppError {
             AppError::FiatConversionKycRequired => "To activate fiat conversion, your account needs the right KYC permissions. Please complete your KYC to enable unlimited trading. You can continue with Bitcoin only and enable fiat conversion later.".into(),
             AppError::BullBitcoinCredentialRequired => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
             AppError::BullBitcoinCredentialInvalid => "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
+            AppError::FiatSettlementTemporarilyUnavailable { .. } => {
+                "Fiat settlement is temporarily unavailable. Retry after the indicated delay.".into()
+            }
             AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
                 "This Bitcoin address is already assigned or has transaction history. Generate a fresh receive address and try again.".into()
@@ -492,6 +518,9 @@ impl IntoResponse for AppError {
             AppError::AliasAlreadyAssigned { alias } => Some(json!({"alias": alias})),
             AppError::PurgeBlocked(n) => Some(json!({"pending_count": n})),
             AppError::ProofOfFundsRequired { min_sat } => Some(json!({"min_sat": min_sat})),
+            AppError::FiatSettlementTemporarilyUnavailable {
+                retry_after_seconds,
+            } => Some(json!({"retry_after_seconds": retry_after_seconds})),
             _ => None,
         };
 
@@ -531,6 +560,7 @@ impl IntoResponse for AppError {
 
             AppError::BackendThrottled
             | AppError::ServiceUnavailable(_)
+            | AppError::FiatSettlementTemporarilyUnavailable { .. }
             | AppError::MoneyAdmissionUnavailable
             | AppError::QuoteBusy { .. }
             | AppError::ElectrumError(_)
@@ -559,10 +589,17 @@ impl IntoResponse for AppError {
         }
 
         let mut response = (status, axum::Json(body)).into_response();
-        if matches!(self, AppError::QuoteBusy { .. }) {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        let retry_after_seconds = match &self {
+            AppError::QuoteBusy { .. } => Some(1),
+            AppError::FiatSettlementTemporarilyUnavailable {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        if let Some(retry_after_seconds) = retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
         }
         response
     }
@@ -695,12 +732,32 @@ mod tests {
                 "credential_required" => AppError::BullBitcoinCredentialRequired,
                 "credential_invalid" => AppError::BullBitcoinCredentialInvalid,
                 "kyc_required" => AppError::FiatConversionKycRequired,
+                "temporarily_unavailable" => AppError::FiatSettlementTemporarilyUnavailable {
+                    retry_after_seconds: 3,
+                },
                 unknown => panic!("unknown fiat-settlement error fixture case: {unknown}"),
             };
             let (status, body) = response_json(error).await;
             assert_eq!(status.as_u16(), case.http_status, "{} status", case.name);
             assert_eq!(body, case.response, "{} response", case.name);
         }
+    }
+
+    #[tokio::test]
+    async fn fiat_settlement_temporary_error_carries_bounded_retry_hint() {
+        let response = AppError::FiatSettlementTemporarilyUnavailable {
+            retry_after_seconds: 3,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "3");
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read temporary fiat-settlement response");
+        let value: Value = serde_json::from_slice(&body).expect("parse temporary response");
+        assert_eq!(value["code"], "FIAT_SETTLEMENT_TEMPORARILY_UNAVAILABLE");
+        assert_eq!(value["details"]["retry_after_seconds"], 3);
     }
 
     #[tokio::test]

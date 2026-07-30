@@ -12,6 +12,7 @@ use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth;
@@ -35,6 +36,8 @@ pub const ACTION_DELETE_CREDENTIAL: &str = "bull-bitcoin-credential-delete";
 
 const VERSION_FIELD: &str = "1";
 const LIST_LIMIT_MAX: i64 = 100;
+const TEMPORARY_RETRY_AFTER_SECONDS: u64 = 3;
+const CONFIGURATION_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -322,9 +325,13 @@ pub async fn configuration(
         query.timestamp,
         &query.signature,
     )?;
-    let result = db::select_fiat_settlement_configuration(&state.db, &query.npub)
-        .await
-        .map_err(map_store_error)?;
+    let result = tokio::time::timeout(
+        CONFIGURATION_QUERY_TIMEOUT,
+        db::select_fiat_settlement_configuration(&state.db, &query.npub),
+    )
+    .await
+    .map_err(|_| temporarily_unavailable())?
+    .map_err(map_configuration_store_error)?;
     configuration_response(result)
 }
 
@@ -549,15 +556,24 @@ fn map_store_error(error: FiatSettlementStoreError) -> AppError {
             AppError::AuthError("fiat-settlement identity is unavailable".into())
         }
         FiatSettlementStoreError::CredentialRequired => AppError::BullBitcoinCredentialRequired,
-        FiatSettlementStoreError::CredentialDraining => AppError::ServiceUnavailable(
-            "the previous scoped credential still supervises a settlement".into(),
-        ),
-        FiatSettlementStoreError::CredentialChanged => AppError::ServiceUnavailable(
-            "the scoped credential changed while eligibility was being checked; retry".into(),
-        ),
+        FiatSettlementStoreError::CredentialDraining
+        | FiatSettlementStoreError::CredentialChanged => temporarily_unavailable(),
         FiatSettlementStoreError::Sqlx(_) => {
             AppError::DbError("fiat-settlement persistence failed".into())
         }
+    }
+}
+
+fn map_configuration_store_error(error: FiatSettlementStoreError) -> AppError {
+    match error {
+        FiatSettlementStoreError::Sqlx(sqlx::Error::PoolTimedOut) => temporarily_unavailable(),
+        other => map_store_error(other),
+    }
+}
+
+fn temporarily_unavailable() -> AppError {
+    AppError::FiatSettlementTemporarilyUnavailable {
+        retry_after_seconds: TEMPORARY_RETRY_AFTER_SECONDS,
     }
 }
 
@@ -573,9 +589,7 @@ fn map_preflight_error(error: crate::bull_bitcoin::BullBitcoinError) -> AppError
         | BullBitcoinError::Transport
         | BullBitcoinError::Upstream
         | BullBitcoinError::MalformedResponse
-        | BullBitcoinError::NotFound => {
-            AppError::ServiceUnavailable("Bull Bitcoin eligibility check is unavailable".into())
-        }
+        | BullBitcoinError::NotFound => temporarily_unavailable(),
         BullBitcoinError::InvalidOwner
         | BullBitcoinError::InvalidProduct
         | BullBitcoinError::InvalidCurrency

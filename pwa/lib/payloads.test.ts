@@ -53,9 +53,9 @@ describe('liquidUri', () => {
     )
   })
 
-  it('uses the remaining amount, not any other amount, in 8dp form', () => {
-    // A partial payment leaves e.g. 543 sat remaining out of an original
-    // 10,800 sat invoice — the URI must reflect the remaining amount.
+  it('formats any explicitly supplied payer amount in 8dp form', () => {
+    // The generic builder remains exact; payment-state admission decides
+    // whether any URI may be shown and never calls this for a short balance.
     expect(liquidUri('lq1qxyz', 543, LIQUID_BTC_ASSET_ID)).toBe(`liquidnetwork:lq1qxyz?amount=0.00000543&assetid=${LIQUID_BTC_ASSET_ID}`)
   })
 })

@@ -1056,16 +1056,9 @@
     return `${minutes}:${(seconds % 60).toString().padStart(2, '0')}`
   })
 
-  // After a partial payment the original amount is misleading, so the primary
-  // display switches to the remaining amount due (finding #5 / review item 5,
-  // mirroring the prior invoice renderer's "{remaining} sat remaining".
-  const mainAmount = $derived(
-    !isFiatFixed &&
-      (view.kind === 'partially_paid' || view.kind === 'partially_paid_pending') &&
-      remainingAmountSat !== null
-      ? `${new Intl.NumberFormat().format(remainingAmountSat)} sat`
-      : amountLabel,
-  )
+  // Keep the original requested amount prominent after a short payment. The
+  // remaining amount appears only in status copy and never becomes a new QR.
+  const mainAmount = $derived(amountLabel)
   const problemView = $derived(
     view.kind === 'needs_review' || view.kind === 'resolution_pending' || view.kind === 'unknown',
   )
@@ -1078,7 +1071,7 @@
   aria-hidden={bitcoinRiskOpen ? 'true' : undefined}
 >
   <div class="flex w-full flex-col items-center gap-1">
-    <p class="font-display text-7xl tabular-nums tracking-display leading-none">{mainAmount}</p>
+    <p class="max-w-full break-words text-center font-display text-6xl tabular-nums tracking-display leading-none sm:text-7xl">{mainAmount}</p>
     <div class="flex items-center gap-1.5">
       <p class={`inline-flex items-center gap-1.5 text-xs font-semibold ${payViewTone(view)}`}>
         <span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
@@ -1119,7 +1112,7 @@
       </div>
     {:else}
     <div
-      class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]"
+      class="inline-flex max-w-full overflow-x-auto rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]"
       role="tablist"
       aria-label="Payment rail"
     >
