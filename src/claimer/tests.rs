@@ -664,6 +664,7 @@ struct MockUtxoBackend {
     raw_txs: HashMap<String, Vec<u8>>,
     find_calls: Mutex<Vec<(String, u32)>>,
     spender: Option<String>,
+    tx_exists_error: Option<String>,
 }
 
 #[async_trait]
@@ -710,6 +711,70 @@ impl UtxoBackend for MockUtxoBackend {
             .push((txid_hex.to_string(), vout));
         Ok(self.spender.clone())
     }
+
+    async fn tx_exists(&self, txid_hex: &str) -> Result<bool, AppError> {
+        if let Some(error) = self.tx_exists_error.as_ref() {
+            return Err(AppError::ElectrumError(error.clone()));
+        }
+        Ok(self.raw_txs.contains_key(txid_hex))
+    }
+}
+
+#[tokio::test]
+async fn fresh_reverse_claim_does_not_probe_for_prior_broadcast() {
+    assert!(
+        !persisted_reverse_claim_already_observed(false, None, "fresh-claim")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn persisted_reverse_claim_skips_rebroadcast_only_when_observed() {
+    let claim_txid = "journaled-claim";
+    let observed: Arc<dyn UtxoBackend> = Arc::new(MockUtxoBackend {
+        raw_txs: HashMap::from([(claim_txid.to_string(), vec![1, 2, 3])]),
+        find_calls: Mutex::new(vec![]),
+        spender: None,
+        tx_exists_error: None,
+    });
+    let absent: Arc<dyn UtxoBackend> = Arc::new(MockUtxoBackend {
+        raw_txs: HashMap::new(),
+        find_calls: Mutex::new(vec![]),
+        spender: None,
+        tx_exists_error: None,
+    });
+
+    assert!(
+        persisted_reverse_claim_already_observed(true, Some(&observed), claim_txid)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !persisted_reverse_claim_already_observed(true, Some(&absent), claim_txid)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn persisted_reverse_claim_rebroadcast_probe_fails_closed() {
+    let unavailable: Arc<dyn UtxoBackend> = Arc::new(MockUtxoBackend {
+        raw_txs: HashMap::new(),
+        find_calls: Mutex::new(vec![]),
+        spender: None,
+        tx_exists_error: Some("observer unavailable".into()),
+    });
+
+    assert!(matches!(
+        persisted_reverse_claim_already_observed(true, Some(&unavailable), "journaled-claim").await,
+        Err(AppError::ElectrumError(message)) if message == "observer unavailable"
+    ));
+    assert!(matches!(
+        persisted_reverse_claim_already_observed(true, None, "journaled-claim").await,
+        Err(AppError::ClaimError(message))
+            if message.contains("without a Liquid transaction observer")
+    ));
 }
 
 struct ChainClaimJournalFixture {
@@ -802,6 +867,7 @@ fn chain_claim_journal_fixture() -> ChainClaimJournalFixture {
         )]),
         find_calls: Mutex::new(vec![]),
         spender: None,
+        tx_exists_error: None,
     });
 
     ChainClaimJournalFixture {
@@ -958,6 +1024,7 @@ async fn recover_claim_from_lockup_spend_returns_discovered_spender() {
         ]),
         find_calls: Mutex::new(vec![]),
         spender: Some(spender.clone()),
+        tx_exists_error: None,
     });
 
     let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();
@@ -988,6 +1055,7 @@ async fn recover_claim_from_lockup_spend_returns_none_when_unspent() {
         raw_txs: HashMap::from([(lockup_txid.to_string(), serialize(&lockup_tx))]),
         find_calls: Mutex::new(vec![]),
         spender: None,
+        tx_exists_error: None,
     });
 
     let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();
@@ -1022,6 +1090,7 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
         ]),
         find_calls: Mutex::new(vec![]),
         spender: Some(spending_tx.txid().to_string()),
+        tx_exists_error: None,
     });
 
     let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();

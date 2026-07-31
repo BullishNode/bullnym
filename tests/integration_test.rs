@@ -13171,9 +13171,16 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     ) = spawn_parent_gated_liquid_broadcast_server(parent_txid, parent_raw_hex).await;
     let first_pool = pool.clone();
     let first_electrum_url = electrum_url.clone();
+    let first_backend = backend.clone();
     let first_claim = tokio::spawn(async move {
         let clients = claimer::LiquidClaimClientFactory::try_new(vec![first_electrum_url]).unwrap();
-        claimer::exercise_journaled_reverse_claim_retry(&first_pool, swap_id, &clients).await
+        claimer::exercise_journaled_reverse_claim_retry(
+            &first_pool,
+            swap_id,
+            &clients,
+            &first_backend,
+        )
+        .await
     });
     tokio::time::timeout(Duration::from_secs(3), parent_seen.notified())
         .await
@@ -13267,10 +13274,17 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     parent_visible.store(true, Ordering::SeqCst);
     let recovery_pool = restarted.clone();
     let recovery_electrum_url = electrum_url.clone();
+    let recovery_backend = backend.clone();
     let recovery = tokio::spawn(async move {
         let clients =
             claimer::LiquidClaimClientFactory::try_new(vec![recovery_electrum_url]).unwrap();
-        claimer::exercise_journaled_reverse_claim_retry(&recovery_pool, swap_id, &clients).await
+        claimer::exercise_journaled_reverse_claim_retry(
+            &recovery_pool,
+            swap_id,
+            &clients,
+            &recovery_backend,
+        )
+        .await
     });
     tokio::time::timeout(Duration::from_secs(3), broadcast_seen.notified())
         .await
@@ -13327,6 +13341,99 @@ async fn candidate_gate_settled_webhook_coalesces_at_broadcast_rpc_and_restart_r
     server_task.abort();
     let _ = server_task.await;
     cleanup_db(&restarted).await;
+}
+
+#[tokio::test]
+async fn candidate_gate_visible_journaled_claim_finalizes_without_a_second_broadcast_rpc() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "reversevisibleclaim";
+    create_test_user(&pool, nym).await;
+    let swap_id =
+        seed_claimable_reverse_pool_swap(&pool, nym, "REVERSE_VISIBLE_JOURNALED_CLAIM", "{}", None)
+            .await;
+
+    let merchant_address = pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 0).unwrap();
+    let merchant_blinding_key =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &merchant_address)
+            .unwrap();
+    let (_, _, response) = issue84_chain_creation_response(511, 512, "REVERSE_VISIBLE_FIXTURE");
+    let (claim_tx_hex, claim_txid, actual_fee_sat, actual_fee_rate_sat_vb, parent_backend) =
+        persisted_liquid_claim_fixture(&response, &merchant_address, &merchant_blinding_key);
+    let claim_transaction: boltz_client::elements::Transaction =
+        boltz_client::elements::encode::deserialize(&hex::decode(&claim_tx_hex).unwrap()).unwrap();
+    let parent_txid = claim_transaction.input[0].previous_output.txid.to_string();
+    let parent_raw = parent_backend.get_raw_tx(&parent_txid).await.unwrap();
+    let observed_backend: Arc<dyn pay_service::utxo::UtxoBackend> =
+        Arc::new(FakeChainClaimSource {
+            raw_transactions: HashMap::from([
+                (parent_txid, parent_raw),
+                (claim_txid.clone(), hex::decode(&claim_tx_hex).unwrap()),
+            ]),
+        });
+
+    sqlx::query(
+        "UPDATE swap_records \
+         SET status = 'claiming', next_claim_attempt_at = NOW() - INTERVAL '1 second', \
+             claim_tx_hex = $2, claim_txid = $3, claim_path = 'script', \
+             claim_actual_fee_sat = $4, claim_actual_fee_rate_sat_vb = $5, \
+             claim_fee_decision_purpose = 'reverse_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = $5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1' \
+         WHERE id = $1",
+    )
+    .bind(swap_id)
+    .bind(&claim_tx_hex)
+    .bind(&claim_txid)
+    .bind(actual_fee_sat)
+    .bind(actual_fee_rate_sat_vb)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (electrum_url, broadcast_calls, server_task) =
+        spawn_counting_liquid_broadcast_server().await;
+    let clients = claimer::LiquidClaimClientFactory::try_new(vec![electrum_url]).unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        claimer::exercise_journaled_reverse_claim_retry(
+            &pool,
+            swap_id,
+            &clients,
+            &observed_backend,
+        ),
+    )
+    .await
+    .expect("visible persisted claim recovery must not wait on the broadcaster")
+    .unwrap();
+
+    assert!(matches!(outcome, claimer::ClaimOutcome::Broadcast));
+    assert_eq!(
+        broadcast_calls.load(Ordering::SeqCst),
+        0,
+        "a claim transaction already visible on Liquid must not cross the broadcast RPC again"
+    );
+    let finalized = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_VISIBLE_JOURNALED_CLAIM")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finalized.status, "claimed");
+    assert_eq!(finalized.claim_txid.as_deref(), Some(claim_txid.as_str()));
+    assert_eq!(finalized.claim_attempts, 0);
+    assert!(finalized.last_claim_error.is_none());
+
+    server_task.abort();
+    let _ = server_task.await;
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]

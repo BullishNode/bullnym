@@ -323,13 +323,12 @@ pub trait UtxoBackend: Send + Sync {
     /// Does a transaction with this txid exist on the Liquid network
     /// (in mempool or confirmed)?
     ///
-    /// Used by the claim path's post-broadcast probe: when
-    /// `try_broadcast_tx` returns an error that isn't "already in utxo
-    /// set" (e.g. a timeout or `txn-already-known` worded slightly
-    /// differently), we probe Electrum to see if our tx is actually
-    /// on the network. If it is, the broadcast was effectively
-    /// successful and we mark `Claimed` instead of recording a
-    /// failure.
+    /// Used by both claim-recovery boundaries. Before a persisted claim is
+    /// rebroadcast, this proves whether the exact journaled transaction
+    /// already reached Liquid. After a fresh broadcast returns an ambiguous
+    /// error (for example a timeout or differently worded already-known
+    /// response), the same probe determines whether the write actually
+    /// succeeded.
     ///
     /// Default impl: try `get_raw_tx`, treat `UtxoNotFound` as "doesn't
     /// exist". Other errors propagate so a transient Electrum hiccup

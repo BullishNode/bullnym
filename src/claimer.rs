@@ -3550,6 +3550,23 @@ async fn wait_for_reverse_claim_parents(
     }
 }
 
+async fn persisted_reverse_claim_already_observed(
+    had_persisted_claim: bool,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    claim_txid: &str,
+) -> Result<bool, AppError> {
+    if !had_persisted_claim {
+        return Ok(false);
+    }
+    let backend = utxo_backend.ok_or_else(|| {
+        AppError::ClaimError(
+            "persisted reverse claim cannot be retried without a Liquid transaction observer"
+                .into(),
+        )
+    })?;
+    backend.tx_exists(claim_txid).await
+}
+
 async fn defer_reverse_claim_for_parent_visibility(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
@@ -3666,6 +3683,7 @@ pub async fn exercise_journaled_reverse_claim_retry(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
     claim_clients: &LiquidClaimClientFactory,
+    utxo_backend: &Arc<dyn UtxoBackend>,
 ) -> Result<ClaimOutcome, AppError> {
     claim_swap_inner(
         pool,
@@ -3673,7 +3691,7 @@ pub async fn exercise_journaled_reverse_claim_retry(
         None,
         Some(claim_clients),
         "http://127.0.0.1:1",
-        None,
+        Some(utxo_backend),
         db::InvoiceAccountingTolerances::default(),
         None,
         None,
@@ -4602,100 +4620,125 @@ async fn claim_swap_inner(
     // produces the misleading missing/spent error from #263.
     //
     // Broadcast is pure I/O against Electrum and may take seconds. We
-    // hold no DB connection or lock during the call. If the process
-    // dies between here and the final update, the next sweep tick re-acquires
-    // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
-    // THIS exact tx (idempotent).
+    // hold no DB connection or lock during the call. If the process dies
+    // after a successful write but before the final database update, the next
+    // sweep must prove whether the journaled transaction is already visible
+    // before it is allowed to call the broadcast RPC again.
     let mut txid = btc_like_txid(&claim_tx);
-    let (liquid_client, claim_endpoint) = claim_clients.connect_with_endpoint().await?;
-    if !wait_for_reverse_claim_parents(&claim_endpoint, &claim_tx).await? {
-        defer_reverse_claim_for_parent_visibility(pool, swap.id, &txid).await?;
+    let already_observed =
+        match persisted_reverse_claim_already_observed(had_persisted_claim, utxo_backend, &txid)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                tracing::warn!(
+                    event = "claim_rebroadcast_observation_failed",
+                    swap_id = %swap.boltz_swap_id,
+                    claim_txid = %txid,
+                    error = %error,
+                    "persisted claim transaction could not be checked; refusing to rebroadcast"
+                );
+                return Err(error);
+            }
+        };
+    if already_observed {
         tracing::info!(
-            event = "reverse_claim_parent_visibility_deferred",
+            event = "claim_rebroadcast_already_observed",
             swap_id = %swap.boltz_swap_id,
             claim_txid = %txid,
-            retry_after = REVERSE_PARENT_VISIBILITY_RETRY,
-            "Liquid lockup is not visible to the exact claim broadcaster; no broadcast was attempted"
+            "persisted claim transaction is already visible; skipping rebroadcast and resuming finalization"
         );
-        return Ok(ClaimOutcome::PendingBroadcastReadiness {
-            reason: LIQUID_PARENT_VISIBILITY_PENDING_REASON,
-        });
-    }
-    let chain_client = ChainClient::new().with_liquid(liquid_client);
+    } else {
+        let (liquid_client, claim_endpoint) = claim_clients.connect_with_endpoint().await?;
+        if !wait_for_reverse_claim_parents(&claim_endpoint, &claim_tx).await? {
+            defer_reverse_claim_for_parent_visibility(pool, swap.id, &txid).await?;
+            tracing::info!(
+                event = "reverse_claim_parent_visibility_deferred",
+                swap_id = %swap.boltz_swap_id,
+                claim_txid = %txid,
+                retry_after = REVERSE_PARENT_VISIBILITY_RETRY,
+                "Liquid lockup is not visible to the exact claim broadcaster; no broadcast was attempted"
+            );
+            return Ok(ClaimOutcome::PendingBroadcastReadiness {
+                reason: LIQUID_PARENT_VISIBILITY_PENDING_REASON,
+            });
+        }
+        let chain_client = ChainClient::new().with_liquid(liquid_client);
 
-    if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
-        // `try_broadcast_tx` only swallows `"already in block chain"` /
-        // `"already in utxo set"` (boltz-rust wrappers.rs:199-212). Other
-        // mempool-acceptance phrasings vary by node implementation
-        // (`"txn-already-known"`, `"transaction already in block chain"`,
-        // timeouts after a successful write, etc.) and bubble as Err.
-        //
-        // Probe the multi-URL utxo backend for the txid before we
-        // declare failure — if the tx is on the network, the broadcast
-        // was effectively successful and we should mark Claimed instead
-        // of feeding the failure to the backoff schedule.
-        if let Some(backend) = utxo_backend {
-            match backend.tx_exists(&txid).await {
-                Ok(true) => {
-                    tracing::info!(
-                        event = "claim_broadcast_probe_recovered",
-                        swap_id = %swap.boltz_swap_id,
-                        txid = %txid,
-                        broadcast_error = %broadcast_err,
-                        "broadcast errored but tx is on chain; treating as success"
-                    );
-                    // fall through to the final status update
-                }
-                Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
-                    Ok(Some(spending_txid)) => {
+        if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
+            // `try_broadcast_tx` only swallows `"already in block chain"` /
+            // `"already in utxo set"` (boltz-rust wrappers.rs:199-212). Other
+            // mempool-acceptance phrasings vary by node implementation
+            // (`"txn-already-known"`, `"transaction already in block chain"`,
+            // timeouts after a successful write, etc.) and bubble as Err.
+            //
+            // Probe the multi-URL utxo backend for the txid before we
+            // declare failure — if the tx is on the network, the broadcast
+            // was effectively successful and we should mark Claimed instead
+            // of feeding the failure to the backoff schedule.
+            if let Some(backend) = utxo_backend {
+                match backend.tx_exists(&txid).await {
+                    Ok(true) => {
                         tracing::info!(
-                            event = "claim_outspend_recovered",
+                            event = "claim_broadcast_probe_recovered",
                             swap_id = %swap.boltz_swap_id,
-                            expected_txid = %txid,
-                            recovered_txid = %spending_txid,
+                            txid = %txid,
                             broadcast_error = %broadcast_err,
-                            "claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                            "broadcast errored but tx is on chain; treating as success"
                         );
-                        txid = spending_txid;
+                        // fall through to the final status update
                     }
-                    Ok(None) => {
-                        return Err(AppError::ClaimError(format!(
-                            "broadcast failed: {broadcast_err}"
-                        )));
-                    }
-                    Err(recovery_err) => {
-                        tracing::warn!(
-                            "claim outspend recovery failed for {}: {recovery_err}; \
+                    Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                        Ok(Some(spending_txid)) => {
+                            tracing::info!(
+                                event = "claim_outspend_recovered",
+                                swap_id = %swap.boltz_swap_id,
+                                expected_txid = %txid,
+                                recovered_txid = %spending_txid,
+                                broadcast_error = %broadcast_err,
+                                "claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                            );
+                            txid = spending_txid;
+                        }
+                        Ok(None) => {
+                            return Err(AppError::ClaimError(format!(
+                                "broadcast failed: {broadcast_err}"
+                            )));
+                        }
+                        Err(recovery_err) => {
+                            tracing::warn!(
+                                "claim outspend recovery failed for {}: {recovery_err}; \
                                  treating broadcast as failed",
+                                swap.boltz_swap_id
+                            );
+                            return Err(AppError::ClaimError(format!(
+                                "broadcast failed: {broadcast_err}"
+                            )));
+                        }
+                    },
+                    Err(probe_err) => {
+                        // Probe itself failed (Electrum hiccup). Conservatively
+                        // assume the tx isn't on chain and propagate the
+                        // original broadcast error so the wrapper records a
+                        // failure and we retry on backoff. Log the probe error
+                        // for diagnosis.
+                        tracing::warn!(
+                            "tx_exists probe failed for {}: {probe_err}; \
+                         treating broadcast as failed",
                             swap.boltz_swap_id
                         );
                         return Err(AppError::ClaimError(format!(
                             "broadcast failed: {broadcast_err}"
                         )));
                     }
-                },
-                Err(probe_err) => {
-                    // Probe itself failed (Electrum hiccup). Conservatively
-                    // assume the tx isn't on chain and propagate the
-                    // original broadcast error so the wrapper records a
-                    // failure and we retry on backoff. Log the probe error
-                    // for diagnosis.
-                    tracing::warn!(
-                        "tx_exists probe failed for {}: {probe_err}; \
-                         treating broadcast as failed",
-                        swap.boltz_swap_id
-                    );
-                    return Err(AppError::ClaimError(format!(
-                        "broadcast failed: {broadcast_err}"
-                    )));
                 }
+            } else {
+                // No utxo backend configured (dev/test). Honor the broadcast
+                // error verbatim.
+                return Err(AppError::ClaimError(format!(
+                    "broadcast failed: {broadcast_err}"
+                )));
             }
-        } else {
-            // No utxo backend configured (dev/test). Honor the broadcast
-            // error verbatim.
-            return Err(AppError::ClaimError(format!(
-                "broadcast failed: {broadcast_err}"
-            )));
         }
     }
 
