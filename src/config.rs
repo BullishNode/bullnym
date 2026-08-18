@@ -385,6 +385,18 @@ pub struct FeaturesConfig {
     /// obligations continue to reconcile when this is false.
     #[serde(default)]
     pub bull_bitcoin_fiat_settlement: bool,
+    /// Reject unsigned `GET /register/lookup` requests.
+    ///
+    /// Requiring the signature is API-breaking, and the client is a mobile
+    /// app: there is no version negotiation on this server, so every already
+    /// installed build would start failing the moment this is enforced. The
+    /// disclosure being closed is an npub-to-nym linkage, not funds, so the
+    /// rollout is staged instead — deploy permissive, ship the signing
+    /// client, watch `register_lookup_unsigned` fall to zero, then enforce.
+    ///
+    /// A signature that *is* supplied is always verified, on either setting.
+    #[serde(default)]
+    pub require_signed_registration_lookup: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -395,6 +407,7 @@ impl Default for FeaturesConfig {
             payment_pages: default_feature_enabled(),
             nip05: false,
             bull_bitcoin_fiat_settlement: false,
+            require_signed_registration_lookup: false,
         }
     }
 }

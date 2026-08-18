@@ -26300,8 +26300,9 @@ async fn reservation_list_v2_rejects_wrong_nym() {
     );
     assert_eq!(
         get_path(&app, &foreign_owner_uri).await.0,
-        StatusCode::UNAUTHORIZED,
-        "a valid signature must not inspect another owner's nym",
+        StatusCode::NOT_FOUND,
+        "a valid signature from a non-owner gets the same 404 as an \
+         unregistered nym, so the route cannot be used to enumerate nyms",
     );
 
     cleanup_db(&pool).await;
@@ -31880,8 +31881,15 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
-    let npub = create_test_user(&pool, "lookup-contract").await;
-    let lookup_uri = format!("/register/lookup?npub={npub}");
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lookup-contract", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "lookup-contract", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let (lookup_signature, lookup_timestamp) =
+        sign_la_action(&keypair, "register-lookup", &npub, "", &[]);
+    let lookup_uri = format!(
+        "/register/lookup?npub={npub}&timestamp={lookup_timestamp}&signature={lookup_signature}"
+    );
     let assert_lookup_shape = |body: &Value| {
         let object = body.as_object().expect("registration lookup object");
         assert_eq!(
@@ -31978,6 +31986,72 @@ async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availabilit
         offline_with_alias["quota"],
         json!({"used": 1, "cap": 1, "remaining": 0})
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_name_lookup_requires_owner_signature() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lookup-signed", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "lookup-signed", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // While the signature rollout is staged, an unsigned lookup is still
+    // served so mobile builds already in users' hands keep working. It is
+    // counted via `register_lookup_unsigned`, not silently accepted.
+    let unsigned = format!("/register/lookup?npub={npub}");
+    assert_eq!(get_path(&app, &unsigned).await.0, StatusCode::OK);
+
+    // A half-supplied credential is malformed, never legacy, so it is
+    // rejected on either setting.
+    let half = format!("/register/lookup?npub={npub}&timestamp=1700000000");
+    assert_eq!(get_path(&app, &half).await.0, StatusCode::UNAUTHORIZED);
+
+    // A valid signature from a different key is rejected.
+    let (_, _, _, other_keypair) = sign_registration_with_keypair("lookup-other", TEST_DESCRIPTOR);
+    let (foreign_signature, foreign_timestamp) =
+        sign_la_action(&other_keypair, "register-lookup", &npub, "", &[]);
+    let foreign = format!(
+        "/register/lookup?npub={npub}&timestamp={foreign_timestamp}&signature={foreign_signature}"
+    );
+    assert_eq!(get_path(&app, &foreign).await.0, StatusCode::UNAUTHORIZED);
+
+    // The owner's signature succeeds.
+    let (signature, timestamp) = sign_la_action(&keypair, "register-lookup", &npub, "", &[]);
+    let signed = format!("/register/lookup?npub={npub}&timestamp={timestamp}&signature={signature}");
+    assert_eq!(get_path(&app, &signed).await.0, StatusCode::OK);
+
+    cleanup_db(&pool).await;
+}
+
+/// Once the operator has watched `register_lookup_unsigned` drain to zero,
+/// enforcement closes the linkage disclosure for good.
+#[tokio::test]
+async fn permanent_name_lookup_enforces_signature_when_configured() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let mut config = test_config();
+    config.features.require_signed_registration_lookup = true;
+    let app = test_app(test_state_with_config(pool.clone(), config));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lookup-enforced", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "lookup-enforced", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let unsigned = format!("/register/lookup?npub={npub}");
+    assert_eq!(
+        get_path(&app, &unsigned).await.0,
+        StatusCode::UNAUTHORIZED,
+        "an unsigned lookup must not disclose the npub-to-nym linkage once enforced",
+    );
+
+    let (signature, timestamp) = sign_la_action(&keypair, "register-lookup", &npub, "", &[]);
+    let signed = format!("/register/lookup?npub={npub}&timestamp={timestamp}&signature={signature}");
+    assert_eq!(get_path(&app, &signed).await.0, StatusCode::OK);
 
     cleanup_db(&pool).await;
 }

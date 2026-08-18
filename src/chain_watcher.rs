@@ -70,6 +70,7 @@ fn liquid_emitted_output_count_would_be_hard_bound(current: usize, additional: u
         .is_none_or(liquid_emitted_output_count_is_hard_bound)
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ChainWatcherConfig {
     /// How often to scan the "active" set (users with a recent callback).
     pub active_tick_secs: u64,

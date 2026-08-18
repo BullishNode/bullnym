@@ -399,8 +399,15 @@ pub async fn delete_registration(
 // --- Lookup ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LookupParams {
     pub npub: String,
+    /// Present together with `signature`, or neither. Optional only so the
+    /// signature requirement can be rolled out to already-installed mobile
+    /// builds without breaking them; see
+    /// `FeaturesConfig::require_signed_registration_lookup`.
+    pub timestamp: Option<u64>,
+    pub signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -419,7 +426,21 @@ pub struct LookupResponse {
     pub quota: QuotaView,
 }
 
-/// GET /register/lookup?npub=<hex> — check if an npub has a registration
+/// GET /register/lookup?npub=<hex>&timestamp=<unix>&signature=<hex> — check
+/// if an npub has a registration.
+///
+/// The response links a public key to a permanent nym, Lightning Address,
+/// alias, and online status. That linkage is not otherwise public (NIP-05
+/// exposes the separate verification key), so the caller must prove key
+/// possession: auth uses the `bullpay-la-v2` `register-lookup` action with an
+/// empty nym slot and zero payload fields, signed by the queried npub.
+///
+/// A supplied signature is always verified. Whether a *missing* one is fatal
+/// is operator-controlled, because enforcing it is API-breaking against
+/// mobile builds already in users' hands — see
+/// `FeaturesConfig::require_signed_registration_lookup`. While permissive,
+/// every unsigned lookup emits `register_lookup_unsigned` so the operator can
+/// watch legacy traffic drain before enforcing.
 pub async fn lookup_by_npub(
     State(state): State<AppState>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
@@ -428,6 +449,28 @@ pub async fn lookup_by_npub(
 ) -> Result<Json<LookupResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
+    match (params.timestamp, params.signature.as_deref()) {
+        (Some(timestamp), Some(signature)) => {
+            auth::verify_la_v2("register-lookup", &params.npub, "", &[], timestamp, signature)?;
+        }
+        (None, None) if !state.config.features.require_signed_registration_lookup => {
+            // Legacy client. Counted, not served differently: the per-IP and
+            // distinct-npub gates below still apply.
+            tracing::warn!(
+                event = "register_lookup_unsigned",
+                "an unsigned registration lookup was served under the staged \
+                 rollout; enforce require_signed_registration_lookup once \
+                 this stops appearing"
+            );
+        }
+        // A half-supplied credential is always rejected, on either setting:
+        // it is a malformed request, never a legacy one.
+        _ => {
+            return Err(AppError::AuthError(
+                "register-lookup requires both timestamp and signature".into(),
+            ));
+        }
+    }
 
     // Bound how many distinct npubs one IP can probe. The per-IP
     // register rate caps query speed; this caps total enumeration
@@ -494,8 +537,17 @@ pub struct ReservationsResponse {
 pub async fn list_reservations(
     State(state): State<AppState>,
     Path(nym): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(params): Query<ReservationsAuthParams>,
 ) -> Result<Json<ReservationsResponse>, AppError> {
+    // Per-IP gate before any CPU/DB work. This endpoint was the only
+    // authenticated surface without one: every request costs a Schnorr
+    // verification and, worse, the 404-vs-401 split below used to disclose
+    // nym registrations (including inactive ones) to any throwaway key.
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    crate::lnurl::gate_metadata_per_ip(&state, peer, &headers, Some(&nym)).await?;
+
     auth::verify_la_v2(
         "reservation-list",
         &params.npub,
@@ -512,7 +564,9 @@ pub async fn list_reservations(
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
     if user.npub != params.npub {
-        return Err(AppError::AuthError("signer does not own this nym".into()));
+        // Uniform with the unregistered case: a valid signature from a
+        // non-owner must not confirm that this nym exists.
+        return Err(AppError::NymNotFound(nym.clone()));
     }
 
     let rows = db::list_reservations_for_nym(&state.db, &nym).await?;

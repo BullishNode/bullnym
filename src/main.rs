@@ -806,9 +806,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // running whenever this process owns background work.
             let settlement_state = state.clone();
             let settlement_cancel = cancel.clone();
-            tokio::spawn(async move {
-                bull_bitcoin_settlement::run_reconciler(settlement_state, settlement_cancel).await;
-            });
+            spawn_supervised(
+                "bull_bitcoin_settlement_reconciler",
+                cancel.clone(),
+                move || {
+                    let state = settlement_state.clone();
+                    let cancel = settlement_cancel.clone();
+                    tokio::spawn(async move {
+                        bull_bitcoin_settlement::run_reconciler(state, cancel).await;
+                    })
+                },
+            );
             tracing::info!(
                 interval_secs = config.bull_bitcoin.reconcile_interval_secs,
                 batch_size = config.bull_bitcoin.reconcile_batch_size,
@@ -823,36 +831,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             tracing::info!("Payment Page OG image reconciler started");
         }
-        let _claimer_task = claimer::spawn_background_claimer(
-            claimer::BackgroundClaimerDependencies::new(
-                pool.clone(),
-                config.clone(),
-                state.liquid_claim_client_factory.clone(),
-                state.utxo_backend.clone(),
-                state.fee_runtime.clone(),
-                state.clone(),
-                cancel.clone(),
-            ),
-            claimer::BackgroundClaimerReporters::new(
-                state.admission.reporter(admission::Worker::ReverseClaimer),
-                state.admission.reporter(admission::Worker::ChainClaimer),
-            ),
-        );
+        {
+            let claimer_pool = pool.clone();
+            let claimer_config = config.clone();
+            let claimer_state = state.clone();
+            let claimer_cancel = cancel.clone();
+            spawn_supervised("background_claimer", cancel.clone(), move || {
+                claimer::spawn_background_claimer(
+                    claimer::BackgroundClaimerDependencies::new(
+                        claimer_pool.clone(),
+                        claimer_config.clone(),
+                        claimer_state.liquid_claim_client_factory.clone(),
+                        claimer_state.utxo_backend.clone(),
+                        claimer_state.fee_runtime.clone(),
+                        claimer_state.clone(),
+                        claimer_cancel.clone(),
+                    ),
+                    claimer::BackgroundClaimerReporters::new(
+                        claimer_state
+                            .admission
+                            .reporter(admission::Worker::ReverseClaimer),
+                        claimer_state
+                            .admission
+                            .reporter(admission::Worker::ChainClaimer),
+                    ),
+                )
+            });
+        }
 
         // Reconciler: polls boltz_api.get_swap for every non-terminal swap
         // older than `min_age_secs` and patches our DB to match Boltz's
         // view. Closes the dropped-webhook gap (Boltz's webhook delivery
         // gives up after ~5 min) by querying state directly.
-        let _reverse_reconciler_task = reconciler::spawn(
-            pool.clone(),
-            state.boltz.clone(),
-            state.pricer.clone(),
-            Arc::new(config.reconciler.clone()),
-            cancel.clone(),
-            state
-                .admission
-                .reporter(admission::Worker::ReverseReconciler),
-        );
+        {
+            let rec_pool = pool.clone();
+            let rec_boltz = state.boltz.clone();
+            let rec_pricer = state.pricer.clone();
+            let rec_config = Arc::new(config.reconciler.clone());
+            let rec_cancel = cancel.clone();
+            let rec_admission = state.admission.clone();
+            spawn_supervised("reverse_reconciler", cancel.clone(), move || {
+                reconciler::spawn(
+                    rec_pool.clone(),
+                    rec_boltz.clone(),
+                    rec_pricer.clone(),
+                    rec_config.clone(),
+                    rec_cancel.clone(),
+                    rec_admission.reporter(admission::Worker::ReverseReconciler),
+                )
+            });
+        }
         tracing::info!(
             "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
             config.reconciler.interval_secs,
@@ -863,26 +891,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Chain-swap reconciler: same dropped-webhook recovery as above, but for
         // `chain_swap_records` (which the reverse reconciler does not touch).
         // Without this a chain swap stranded by a missed webhook never recovers.
-        let _chain_reconciler_task = reconciler::spawn_chain(
-            state.clone(),
-            Arc::new(config.reconciler.clone()),
-            cancel.clone(),
-            state.admission.reporter(admission::Worker::ChainReconciler),
-        );
+        {
+            let chain_rec_state = state.clone();
+            let chain_rec_config = Arc::new(config.reconciler.clone());
+            let chain_rec_cancel = cancel.clone();
+            let chain_rec_admission = state.admission.clone();
+            spawn_supervised("chain_reconciler", cancel.clone(), move || {
+                reconciler::spawn_chain(
+                    chain_rec_state.clone(),
+                    chain_rec_config.clone(),
+                    chain_rec_cancel.clone(),
+                    chain_rec_admission.reporter(admission::Worker::ChainReconciler),
+                )
+            });
+        }
         tracing::info!("chain reconciler started (shares reconciler config)");
 
         // Automatic Bitcoin fallback is a distinct existing-obligation
         // executor. It consumes only #82-authorized due markers and remains
         // active when admission closes; provider polling never decides or
         // broadcasts from this task.
-        let _automatic_fallback_task = chain_fallback::spawn_automatic_fallback_executor(
-            state.clone(),
-            Arc::new(config.reconciler.clone()),
-            cancel.clone(),
-            state
-                .admission
-                .reporter(admission::Worker::AutomaticFallback),
-        );
+        {
+            let fallback_state = state.clone();
+            let fallback_config = Arc::new(config.reconciler.clone());
+            let fallback_cancel = cancel.clone();
+            let fallback_admission = state.admission.clone();
+            spawn_supervised("automatic_fallback", cancel.clone(), move || {
+                chain_fallback::spawn_automatic_fallback_executor(
+                    fallback_state.clone(),
+                    fallback_config.clone(),
+                    fallback_cancel.clone(),
+                    fallback_admission.reporter(admission::Worker::AutomaticFallback),
+                )
+            });
+        }
         tracing::info!("automatic Bitcoin fallback executor started");
 
         // Settlement-repair: re-records invoice payment events for reverse
@@ -890,25 +932,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // completed (crash / transient failure between the claimed commit and
         // the flip). Closes the merchant-paid-but-invoice-unpaid gap; the flip
         // is idempotent so this is a safe no-op when the event already exists.
-        let _settlement_repair_task = reconciler::spawn_settlement_repair(
-            state.clone(),
-            Arc::new(config.reconciler.clone()),
-            cancel.clone(),
-            state
-                .admission
-                .reporter(admission::Worker::SettlementRepair),
-        );
+        {
+            let repair_state = state.clone();
+            let repair_config = Arc::new(config.reconciler.clone());
+            let repair_cancel = cancel.clone();
+            let repair_admission = state.admission.clone();
+            spawn_supervised("settlement_repair", cancel.clone(), move || {
+                reconciler::spawn_settlement_repair(
+                    repair_state.clone(),
+                    repair_config.clone(),
+                    repair_cancel.clone(),
+                    repair_admission.reporter(admission::Worker::SettlementRepair),
+                )
+            });
+        }
         tracing::info!("settlement repair started (shares reconciler config)");
 
         // Slow recovery: revives funded `claim_stuck` swaps back into the claim
         // sweep on a long capped backoff so a transient-outage-stranded output
         // isn't abandoned once the retry budget is spent (issue #63).
-        let _slow_recovery_task = reconciler::spawn_slow_recovery(
-            state.clone(),
-            Arc::new(config.reconciler.clone()),
-            cancel.clone(),
-            state.admission.reporter(admission::Worker::SlowRecovery),
-        );
+        {
+            let recovery_state = state.clone();
+            let recovery_config = Arc::new(config.reconciler.clone());
+            let recovery_cancel = cancel.clone();
+            let recovery_admission = state.admission.clone();
+            spawn_supervised("slow_recovery", cancel.clone(), move || {
+                reconciler::spawn_slow_recovery(
+                    recovery_state.clone(),
+                    recovery_config.clone(),
+                    recovery_cancel.clone(),
+                    recovery_admission.reporter(admission::Worker::SlowRecovery),
+                )
+            });
+        }
         tracing::info!("slow recovery started (shares reconciler config)");
 
         // Payment-state cleanup remains worker-owned because it changes
@@ -923,8 +979,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..gc::GcConfig::default()
             };
             let cancel_gc = cancel.clone();
-            tokio::spawn(async move {
-                gc::run(pool, cancel_gc, gc_cfg).await;
+            spawn_supervised("payment_state_gc", cancel.clone(), move || {
+                let pool = pool.clone();
+                let cancel = cancel_gc.clone();
+                let cfg = gc_cfg;
+                tokio::spawn(async move {
+                    gc::run(pool, cancel, cfg).await;
+                })
             });
             tracing::info!("operational payment-state GC started");
         }
@@ -940,23 +1001,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             let accounting_tolerances =
                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
-            let liquid_reporter = state.admission.reporter(admission::Worker::LiquidWatcher);
+            let liquid_admission = state.admission.clone();
             let liquid_wakeup = direct_watcher_wakeups.liquid.clone();
             let active = watcher_cfg.active_tick_secs;
             let idle = watcher_cfg.idle_tick_secs;
-            tokio::spawn(async move {
-                chain_watcher::run(
-                    pool,
-                    backend,
-                    rl,
-                    pricer,
-                    cancel_watcher,
-                    watcher_cfg,
-                    accounting_tolerances,
-                    liquid_reporter,
-                    liquid_wakeup,
-                )
-                .await;
+            spawn_supervised("chain_watcher", cancel.clone(), move || {
+                let pool = pool.clone();
+                let backend = backend.clone();
+                let rl = rl.clone();
+                let pricer = pricer.clone();
+                let cancel = cancel_watcher.clone();
+                let reporter = liquid_admission.reporter(admission::Worker::LiquidWatcher);
+                let wakeup = liquid_wakeup.clone();
+                tokio::spawn(async move {
+                    chain_watcher::run(
+                        pool,
+                        backend,
+                        rl,
+                        pricer,
+                        cancel,
+                        watcher_cfg,
+                        accounting_tolerances,
+                        reporter,
+                        wakeup,
+                    )
+                    .await;
+                })
             });
             tracing::info!(
                 "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
@@ -1004,7 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        tokio::signal::ctrl_c().await.ok();
+        shutdown_signal().await;
         tracing::info!("received shutdown signal");
         shutdown_admission.set_workers_enabled(false);
         cancel.cancel();
@@ -1013,6 +1083,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// SIGINT (Ctrl-C) and SIGTERM (systemd `systemctl stop`, `docker stop`,
+/// Kubernetes pod termination) both trigger the graceful drain. Without the
+/// SIGTERM arm the default termination action kills the process immediately
+/// and the admission-close/worker-cancel sequence above never runs.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                ctrl_c.await.ok();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
+}
+
+/// Restart a background worker when its task exits or panics without shutdown
+/// being requested. The factory runs per (re)start so every replacement gets
+/// fresh admission reporters: a dead worker closes its rail's admission until
+/// the replacement reports progress. Restart backoff doubles from 1s to a
+/// 60s cap and resets only on intentional shutdown.
+fn spawn_supervised<F>(worker: &'static str, cancel: CancellationToken, mut factory: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let outcome = factory().await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            match outcome {
+                Ok(()) => tracing::error!(
+                    event = "worker_exited_unexpectedly",
+                    worker,
+                    "background worker exited without shutdown requested; restarting"
+                ),
+                Err(error) => tracing::error!(
+                    event = "worker_task_failed",
+                    worker,
+                    %error,
+                    "background worker task failed; restarting"
+                ),
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+    });
 }
 
 fn build_router(state: AppState) -> Router {
