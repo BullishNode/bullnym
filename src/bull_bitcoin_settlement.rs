@@ -1509,6 +1509,43 @@ pub async fn run_reconciliation_once(state: &AppState) -> Result<(), SettlementS
     reconcile_once(state, stale_after_secs).await
 }
 
+/// Record a terminal `integrity_error` and say so.
+///
+/// This transition is permanent: `record_bull_bitcoin_terminal_problem`
+/// clears `next_attempt_at` and leaves `provider_missing_since` unset, so the
+/// reconciliation selector never picks the row up again and the recovery
+/// clause in `record_bull_bitcoin_observation` cannot readmit it. The
+/// merchant sees only `unavailable`, which reads the same as a transient
+/// provider outage. Without an event here a funded settlement can be
+/// abandoned for good with no operator signal anywhere — the `NotFound` path
+/// below is instrumented precisely because it has the same consequence.
+async fn record_terminal_integrity_problem(
+    state: &AppState,
+    settlement: &StoredBullBitcoinSettlement,
+    cause: &'static str,
+    detail: String,
+) -> Result<(), SettlementServiceError> {
+    let financial_evidence_present =
+        db::bull_bitcoin_financial_evidence_present(&state.db, settlement.id)
+            .await
+            .unwrap_or(true);
+    tracing::error!(
+        event = "bull_bitcoin_settlement_terminal_integrity_error",
+        settlement_id = %settlement.id,
+        invoice_id = ?settlement.invoice_id,
+        order_id = ?settlement.bull_bitcoin_order_id,
+        cause,
+        detail = %detail,
+        financial_evidence_present,
+        "a Bull Bitcoin settlement was terminally abandoned as an integrity \
+         error; this row will never be reconciled again and needs manual \
+         investigation if it was funded"
+    );
+    db::record_bull_bitcoin_terminal_problem(&state.db, settlement.id, "integrity_error")
+        .await
+        .map_err(|_| SettlementServiceError::Database)
+}
+
 async fn reconcile_settlement(
     state: &AppState,
     settlement: StoredBullBitcoinSettlement,
@@ -1590,13 +1627,19 @@ async fn reconcile_settlement(
             if observation.order_id != order_id
                 || observation.currency.as_str() != settlement.fiat_currency
             {
-                db::record_bull_bitcoin_terminal_problem(
-                    &state.db,
-                    settlement.id,
-                    "integrity_error",
+                record_terminal_integrity_problem(
+                    state,
+                    &settlement,
+                    "observation_identity_mismatch",
+                    format!(
+                        "observed order {} in {}, expected order {} in {}",
+                        observation.order_id,
+                        observation.currency.as_str(),
+                        order_id,
+                        settlement.fiat_currency
+                    ),
                 )
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+                .await?;
             } else {
                 let prefetched_rate = if settlement.actual_received_sat.is_none()
                     && observation.actual_received_sat.is_some()
@@ -1672,10 +1715,14 @@ async fn reconcile_settlement(
                 "A previously bound Bull Bitcoin order could not be read with its retained credential generation"
             );
         }
-        Err(BullBitcoinError::Integrity | BullBitcoinError::MalformedResponse) => {
-            db::record_bull_bitcoin_terminal_problem(&state.db, settlement.id, "integrity_error")
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+        Err(error @ (BullBitcoinError::Integrity | BullBitcoinError::MalformedResponse)) => {
+            record_terminal_integrity_problem(
+                state,
+                &settlement,
+                "unreadable_provider_response",
+                error.to_string(),
+            )
+            .await?;
         }
         Err(BullBitcoinError::NotFound) => {
             if provider_health_after_not_found == Some(Err(BullBitcoinError::Authentication)) {
@@ -1775,10 +1822,19 @@ async fn reconcile_settlement(
                 "A retryable exact-order provider read failed"
             );
         }
-        Err(_) => {
-            db::record_bull_bitcoin_terminal_problem(&state.db, settlement.id, "integrity_error")
-                .await
-                .map_err(|_| SettlementServiceError::Database)?;
+        Err(error) => {
+            // Reached by InvalidApiKey (a credential whose bytes are invalid
+            // in an HTTP header) and by the ungated limit branch in
+            // `classify_rpc_error`, which can return Minimum/Maximum/Policy
+            // on a read. Whether terminal is right for those is a separate
+            // question; until it is answered the transition is at least loud.
+            record_terminal_integrity_problem(
+                state,
+                &settlement,
+                "unclassified_provider_error",
+                error.to_string(),
+            )
+            .await?;
         }
     }
     Ok(())
