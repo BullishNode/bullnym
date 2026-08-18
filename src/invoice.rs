@@ -1661,8 +1661,11 @@ pub struct InvoiceStatusResponse {
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
-    /// Required object for fiat-fixed invoices and null for sat-fixed invoices.
-    /// This pure projection is the only browser authority for quote tabs.
+    /// Required object for fiat-fixed invoices. Also present (not null) for
+    /// sat-fixed invoices that carry a captured fiat-settlement policy, so
+    /// clients must tolerate it on either pricing mode; it is null only when
+    /// no fiat policy exists. This pure projection is the only browser
+    /// authority for quote tabs.
     pub quote_rail_availability: Option<PayerQuoteRailAvailability>,
 }
 

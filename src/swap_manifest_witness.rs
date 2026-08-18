@@ -21,6 +21,8 @@ use crate::swap_manifest_store::{
 
 /// Absolute number of records one witness load will authenticate and retain.
 pub const MAX_RECOVERY_WITNESS_RECORDS_V1: usize = MAX_MANIFEST_FULL_SCAN_RESULTS;
+/// Bounded concurrency for witness object fetches during startup load.
+const MANIFEST_WITNESS_FETCH_CONCURRENCY: usize = 16;
 
 /// Exact key material and signer pin used to open one configured witness.
 ///
@@ -258,28 +260,36 @@ impl RecoveryManifestWitnessLoaderV1 {
             Err(_) => return Err(RecoveryWitnessLoadError::StoreListFailed),
         };
         let mut manifests = Vec::with_capacity(objects.len());
-        for summary in objects {
-            let stored = self
-                .store
-                .get_v1(summary.id)
-                .await
-                .map_err(|_| RecoveryWitnessLoadError::StoreReadFailed)?;
-            if u64::try_from(stored.encoded().len()).ok() != Some(summary.encoded_bytes) {
-                return Err(RecoveryWitnessLoadError::StoreObjectChanged);
-            }
-            let manifest = SwapManifestV1::open(
-                stored.encoded(),
-                &self.secrets.encryption_key_id,
-                &self.secrets.encryption_key,
-                &self.secrets.expected_signer,
+        // Fetch in bounded concurrent chunks: every GET is an independent
+        // object-store round trip, so a serial loop made startup time linear
+        // in manifest count (up to 10k records) and could trip orchestrator
+        // liveness kills into a crash loop. Authentication and identity
+        // checks below are unchanged and still fail closed on the first
+        // invalid object.
+        for chunk in objects.chunks(MANIFEST_WITNESS_FETCH_CONCURRENCY) {
+            let stored_chunk = futures_util::future::join_all(
+                chunk.iter().map(|summary| self.store.get_v1(summary.id)),
             )
-            .map_err(|_| RecoveryWitnessLoadError::EnvelopeAuthenticationFailed)?;
-            if manifest.restore_identity.chain_swap_id != summary.id.chain_swap_id()
-                || manifest.restore_identity.manifest_id != summary.id.manifest_id()
-            {
-                return Err(RecoveryWitnessLoadError::ObjectIdentityMismatch);
+            .await;
+            for (summary, stored) in chunk.iter().zip(stored_chunk) {
+                let stored = stored.map_err(|_| RecoveryWitnessLoadError::StoreReadFailed)?;
+                if u64::try_from(stored.encoded().len()).ok() != Some(summary.encoded_bytes) {
+                    return Err(RecoveryWitnessLoadError::StoreObjectChanged);
+                }
+                let manifest = SwapManifestV1::open(
+                    stored.encoded(),
+                    &self.secrets.encryption_key_id,
+                    &self.secrets.encryption_key,
+                    &self.secrets.expected_signer,
+                )
+                .map_err(|_| RecoveryWitnessLoadError::EnvelopeAuthenticationFailed)?;
+                if manifest.restore_identity.chain_swap_id != summary.id.chain_swap_id()
+                    || manifest.restore_identity.manifest_id != summary.id.manifest_id()
+                {
+                    return Err(RecoveryWitnessLoadError::ObjectIdentityMismatch);
+                }
+                manifests.push(manifest);
             }
-            manifests.push(manifest);
         }
 
         let audit = audit_append_only_manifest_set_v1(&manifests)
