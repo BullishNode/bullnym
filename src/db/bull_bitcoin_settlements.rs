@@ -1595,9 +1595,31 @@ pub async fn record_bull_bitcoin_provider_authentication_retry(
     delay_secs: i64,
     persistent_watch_secs: i64,
 ) -> Result<(), sqlx::Error> {
+    record_bull_bitcoin_provider_read_hold(
+        pool,
+        settlement_id,
+        delay_secs,
+        persistent_watch_secs,
+        "authentication",
+    )
+    .await
+}
+
+/// Hold a bound settlement for another read attempt, recording why the last
+/// read failed. The row stays `pending`, so the merchant keeps seeing an
+/// in-progress conversion rather than a word that also means "brief provider
+/// outage", and reconciliation resumes on its own once the cause clears —
+/// a reconnected credential, or a provider that starts answering coherently.
+pub async fn record_bull_bitcoin_provider_read_hold(
+    pool: &PgPool,
+    settlement_id: Uuid,
+    delay_secs: i64,
+    persistent_watch_secs: i64,
+    error_class: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE bull_bitcoin_settlements \
-            SET provider_last_read_error_class = 'authentication', \
+            SET provider_last_read_error_class = $4, \
                 provider_last_read_error_at = now(), \
                 provider_not_found_first_at = NULL, \
                 provider_not_found_consecutive = 0, \
@@ -1616,6 +1638,7 @@ pub async fn record_bull_bitcoin_provider_authentication_retry(
     .bind(settlement_id)
     .bind(delay_secs)
     .bind(persistent_watch_secs)
+    .bind(error_class)
     .execute(pool)
     .await?;
     Ok(())

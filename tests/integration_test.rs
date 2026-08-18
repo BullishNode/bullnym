@@ -4813,15 +4813,34 @@ async fn bull_bitcoin_integrity_hold_retains_deletion_pending_credential() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(settlement_status, "integrity_error");
+    // A bound order may already be funded, so an unreadable response holds
+    // the conversion instead of writing it off. The merchant keeps seeing an
+    // in-progress conversion, and reconciliation resumes on its own.
+    assert_eq!(settlement_status, "pending");
     assert!(
-        logs.contains("bull_bitcoin_settlement_terminal_integrity_error"),
-        "terminally abandoning a settlement must emit an operator event: {logs}",
+        logs.contains("bull_bitcoin_settlement_unreadable"),
+        "holding an unreadable settlement must emit an operator event: {logs}",
     );
     assert!(
         logs.contains("unreadable_provider_response"),
-        "the event must name what made the row terminal: {logs}",
+        "the event must name why the read failed: {logs}",
     );
+    let (next_attempt_scheduled, error_class) =
+        sqlx::query_as::<_, (bool, Option<String>)>(
+            "SELECT next_attempt_at IS NOT NULL, provider_last_read_error_class \
+               FROM bull_bitcoin_settlements WHERE bull_bitcoin_order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        next_attempt_scheduled,
+        "a held conversion must stay scheduled for another read",
+    );
+    // The row stores the coarse bucket the CHECK constraint allows; the
+    // precise cause rides on the log event asserted above.
+    assert_eq!(error_class.as_deref(), Some("transient"));
 
     let deletion = pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &owner_npub)
         .await
