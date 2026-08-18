@@ -402,8 +402,12 @@ pub async fn delete_registration(
 #[serde(deny_unknown_fields)]
 pub struct LookupParams {
     pub npub: String,
-    pub timestamp: u64,
-    pub signature: String,
+    /// Present together with `signature`, or neither. Optional only so the
+    /// signature requirement can be rolled out to already-installed mobile
+    /// builds without breaking them; see
+    /// `FeaturesConfig::require_signed_registration_lookup`.
+    pub timestamp: Option<u64>,
+    pub signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -430,6 +434,13 @@ pub struct LookupResponse {
 /// exposes the separate verification key), so the caller must prove key
 /// possession: auth uses the `bullpay-la-v2` `register-lookup` action with an
 /// empty nym slot and zero payload fields, signed by the queried npub.
+///
+/// A supplied signature is always verified. Whether a *missing* one is fatal
+/// is operator-controlled, because enforcing it is API-breaking against
+/// mobile builds already in users' hands — see
+/// `FeaturesConfig::require_signed_registration_lookup`. While permissive,
+/// every unsigned lookup emits `register_lookup_unsigned` so the operator can
+/// watch legacy traffic drain before enforcing.
 pub async fn lookup_by_npub(
     State(state): State<AppState>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
@@ -438,14 +449,28 @@ pub async fn lookup_by_npub(
 ) -> Result<Json<LookupResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
-    auth::verify_la_v2(
-        "register-lookup",
-        &params.npub,
-        "",
-        &[],
-        params.timestamp,
-        &params.signature,
-    )?;
+    match (params.timestamp, params.signature.as_deref()) {
+        (Some(timestamp), Some(signature)) => {
+            auth::verify_la_v2("register-lookup", &params.npub, "", &[], timestamp, signature)?;
+        }
+        (None, None) if !state.config.features.require_signed_registration_lookup => {
+            // Legacy client. Counted, not served differently: the per-IP and
+            // distinct-npub gates below still apply.
+            tracing::warn!(
+                event = "register_lookup_unsigned",
+                "an unsigned registration lookup was served under the staged \
+                 rollout; enforce require_signed_registration_lookup once \
+                 this stops appearing"
+            );
+        }
+        // A half-supplied credential is always rejected, on either setting:
+        // it is a malformed request, never a legacy one.
+        _ => {
+            return Err(AppError::AuthError(
+                "register-lookup requires both timestamp and signature".into(),
+            ));
+        }
+    }
 
     // Bound how many distinct npubs one IP can probe. The per-IP
     // register rate caps query speed; this caps total enumeration
