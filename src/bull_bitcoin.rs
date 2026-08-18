@@ -179,11 +179,31 @@ impl FiatAmountMinor {
         self.0
     }
 
-    /// Parse an upstream JSON decimal exactly into two-decimal minor units.
+    /// Parse an upstream JSON decimal exactly into `currency`'s minor units.
     /// Scientific notation is accepted; excess non-zero precision is not.
-    pub fn parse_json_decimal(value: &str) -> Result<Self, BullBitcoinError> {
-        let minor = parse_positive_decimal_to_units(value, 2, i64::MAX)
+    ///
+    /// The scale is the currency's own, never a fixed two decimals: CRC and
+    /// COP are zero-decimal, so a payout of `5000` is 5000 minor units, not
+    /// 500000. Bullnym's pricer already normalizes every rate to
+    /// `pricer::currency_precision`, and the mobile client formats minor
+    /// units with the same per-currency precision, so a fixed scale here
+    /// would render CRC and COP amounts a hundredfold too large.
+    pub fn parse_json_decimal(
+        value: &str,
+        currency: FiatCurrency,
+    ) -> Result<Self, BullBitcoinError> {
+        // Parse at the wire's two decimals first, then rescale to the
+        // currency's own precision. Going straight to a zero-decimal scale
+        // would reject a sub-unit payout outright, and every parse failure
+        // here reaches a terminal `integrity_error` that no retry recovers —
+        // so a stray céntimo would abandon a funded settlement rather than
+        // round it. `rescale_minor_units` is the same half-up conversion the
+        // pricer uses to bring upstream rates onto this precision.
+        let wire_minor = parse_positive_decimal_to_units(value, 2, i64::MAX)
             .map_err(|_| BullBitcoinError::InvalidFiatAmount)?;
+        let precision = crate::pricer::currency_precision(currency.as_str());
+        let minor = crate::pricer::rescale_minor_units(wire_minor, 2, precision)
+            .ok_or(BullBitcoinError::InvalidFiatAmount)?;
         Self::new(minor)
     }
 }
@@ -596,14 +616,80 @@ mod tests {
             ("123.4500", 12_345),
         ] {
             assert_eq!(
-                FiatAmountMinor::parse_json_decimal(decimal)
+                FiatAmountMinor::parse_json_decimal(decimal, FiatCurrency::CAD)
                     .unwrap()
                     .as_minor(),
                 minor
             );
         }
         for invalid in ["0", "-1", "1.001", "0.001", "NaN", "1e100"] {
-            assert!(FiatAmountMinor::parse_json_decimal(invalid).is_err());
+            assert!(FiatAmountMinor::parse_json_decimal(invalid, FiatCurrency::CAD).is_err());
+        }
+    }
+
+    #[test]
+    fn fiat_minor_units_follow_each_currency_precision() {
+        // A zero-decimal payout of 5000 colones is 5000 minor units. Parsing
+        // it at a fixed two decimals yielded 500000, which the mobile client
+        // — which formats CRC and COP with zero decimals — then rendered a
+        // hundredfold too large next to a correctly scaled creation rate.
+        for currency in [FiatCurrency::CRC, FiatCurrency::COP] {
+            assert_eq!(
+                FiatAmountMinor::parse_json_decimal("5000", currency)
+                    .unwrap()
+                    .as_minor(),
+                5_000
+            );
+            // Trailing zeros and scientific notation reach the same value.
+            for equivalent in ["5000.00", "5000.0", "5e3"] {
+                assert_eq!(
+                    FiatAmountMinor::parse_json_decimal(equivalent, currency)
+                        .unwrap()
+                        .as_minor(),
+                    5_000
+                );
+            }
+            // A sub-unit on a zero-decimal currency rounds half-up rather
+            // than failing: every parse error here becomes a terminal
+            // `integrity_error` that no retry recovers, so a stray centimo
+            // must not abandon a funded settlement.
+            assert_eq!(
+                FiatAmountMinor::parse_json_decimal("5000.50", currency)
+                    .unwrap()
+                    .as_minor(),
+                5_001
+            );
+            assert_eq!(
+                FiatAmountMinor::parse_json_decimal("5000.49", currency)
+                    .unwrap()
+                    .as_minor(),
+                5_000
+            );
+        }
+        for currency in [
+            FiatCurrency::ARS,
+            FiatCurrency::CAD,
+            FiatCurrency::EUR,
+            FiatCurrency::MXN,
+            FiatCurrency::USD,
+        ] {
+            assert_eq!(
+                FiatAmountMinor::parse_json_decimal("5000", currency)
+                    .unwrap()
+                    .as_minor(),
+                500_000
+            );
+        }
+        // Every supported currency round-trips through the shared precision
+        // source, so adding one cannot silently inherit a fixed scale.
+        for currency in FiatCurrency::ALL {
+            let scale = crate::pricer::currency_precision(currency.as_str());
+            assert!(
+                FiatAmountMinor::parse_json_decimal("1", currency)
+                    .unwrap()
+                    .as_minor()
+                    == 10_i64.pow(u32::from(scale))
+            );
         }
     }
 
