@@ -212,9 +212,13 @@ owner, or permits the wallet to claim another name.
 
 Response: `{ "quota": { "used": 1, "cap": 1, "remaining": 0 } }`.
 
-## `GET /register/lookup?npub=<64-hex>`
+## `GET /register/lookup?npub=<64-hex>&timestamp=<unix>&signature=<hex>`
 
-Public and rate-limited. A successful response is:
+Authenticated and rate-limited. Sign the `register-lookup` action with an
+empty nym slot and zero payload fields, as defined in
+[Authentication](authentication.md). The signing key must be the queried
+`npub`: the caller proves possession of the key it is asking about. A
+successful response is:
 
 ```json
 {
@@ -231,9 +235,14 @@ reports only Lightning Address availability; it does not describe nym or alias
 ownership. `alias` is the permanent owner alias, or `null` when none
 has ever been claimed. Clients must require
 `public_name_policy == "permanent_names_v1"` before enabling permanent-name or
-alias UX. `quota` is the authoritative permanent-nym ownership quota. Because
-lookup is public, an authentication key is linkable to its Bullnym names;
-clients needing identity separation should use a dedicated auth key.
+alias UX. `quota` is the authoritative permanent-nym ownership quota.
+
+The response links a public key to a permanent nym, Lightning Address, alias,
+and online status. That linkage is not otherwise public — NIP-05 exposes the
+separate verification key — so the route requires proof of key possession
+instead of treating the linkage as public. An unsigned request is rejected
+with `400`, a valid signature from any other key with `401`. Unknown query
+parameters are rejected with `400`.
 
 ## `GET /api/reservations/:nym`
 
@@ -241,7 +250,9 @@ Query: `npub`, `timestamp`, and `signature`. Sign the `reservation-list`
 action with the route nym in the nym slot and zero payload fields, as defined
 in [Authentication](authentication.md). Returns
 `{ "reservations": [{ "outpoint", "addr_index", "fulfilled" }],
-"next_addr_idx": 42 }`. This is an owner diagnostics API, not a
+"next_addr_idx": 42 }`. A valid signature from a key that does not own the
+route nym returns the same `404` as an unregistered nym, so the route cannot
+be used to enumerate registrations. This is an owner diagnostics API, not a
 payment-status API. Permanent ownership keeps this read available when the
 individual Lightning Address is offline, while public metadata/callbacks and
 new reservations remain unavailable. GC can delete an unfulfilled reservation
