@@ -1509,41 +1509,95 @@ pub async fn run_reconciliation_once(state: &AppState) -> Result<(), SettlementS
     reconcile_once(state, stale_after_secs).await
 }
 
-/// Record a terminal `integrity_error` and say so.
+/// Why a bound order could not be read.
 ///
-/// This transition is permanent: `record_bull_bitcoin_terminal_problem`
-/// clears `next_attempt_at` and leaves `provider_missing_since` unset, so the
-/// reconciliation selector never picks the row up again and the recovery
-/// clause in `record_bull_bitcoin_observation` cannot readmit it. The
-/// merchant sees only `unavailable`, which reads the same as a transient
-/// provider outage. Without an event here a funded settlement can be
-/// abandoned for good with no operator signal anywhere — the `NotFound` path
-/// below is instrumented precisely because it has the same consequence.
-async fn record_terminal_integrity_problem(
+/// `as_str` is the grep handle carried on the log event; `persisted_class` is
+/// the coarse bucket stored on the row, which a CHECK constraint
+/// (`bull_bitcoin_settlements_provider_read_error_chk`, migration 080) limits
+/// to `not_found`, `not_found_unverified`, `transient` and `authentication`.
+/// The detail stays in the log rather than widening a constraint on a money
+/// table for the sake of a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldCause {
+    /// The read came back describing a different order or currency.
+    ObservationIdentityMismatch,
+    /// The response could not be parsed or contradicted itself.
+    UnreadableProviderResponse,
+    /// The stored credential cannot be used at all.
+    CredentialUnusable,
+    /// An order-creation verdict arrived in answer to a read.
+    ProviderAnsweredOutOfContext,
+}
+
+impl HoldCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservationIdentityMismatch => "observation_identity_mismatch",
+            Self::UnreadableProviderResponse => "unreadable_provider_response",
+            Self::CredentialUnusable => "credential_unusable",
+            Self::ProviderAnsweredOutOfContext => "provider_answered_out_of_context",
+        }
+    }
+
+    /// A credential we cannot use is the same situation as one the provider
+    /// rejects, so it shares that bucket and resumes the same way. Everything
+    /// else is "we could not read it this time".
+    const fn persisted_class(self) -> &'static str {
+        match self {
+            Self::CredentialUnusable => "authentication",
+            Self::ObservationIdentityMismatch
+            | Self::UnreadableProviderResponse
+            | Self::ProviderAnsweredOutOfContext => "transient",
+        }
+    }
+}
+
+/// Hold a settlement we could not read, and say so.
+///
+/// A bound order may already be funded, so an answer we cannot interpret is
+/// never grounds to write the conversion off: the row stays `pending` — which
+/// the merchant sees as an in-progress conversion rather than `unavailable`,
+/// the same word a brief provider outage produces — and reconciliation
+/// resumes by itself once the cause clears. That covers a reconnected
+/// credential and a provider that starts answering coherently again.
+///
+/// The trade is unbounded polling of a genuinely dead row, so every hold is
+/// loud. `bull_bitcoin_settlement_unreadable` is the grep handle: one line per
+/// stuck conversion per attempt, naming the settlement, the cause, and
+/// whether financial evidence exists.
+async fn hold_unreadable_settlement(
     state: &AppState,
     settlement: &StoredBullBitcoinSettlement,
-    cause: &'static str,
+    cause: HoldCause,
     detail: String,
 ) -> Result<(), SettlementServiceError> {
+    let cause_name = cause.as_str();
     let financial_evidence_present =
         db::bull_bitcoin_financial_evidence_present(&state.db, settlement.id)
             .await
             .unwrap_or(true);
     tracing::error!(
-        event = "bull_bitcoin_settlement_terminal_integrity_error",
+        event = "bull_bitcoin_settlement_unreadable",
         settlement_id = %settlement.id,
         invoice_id = ?settlement.invoice_id,
         order_id = ?settlement.bull_bitcoin_order_id,
-        cause,
+        cause = cause_name,
         detail = %detail,
         financial_evidence_present,
-        "a Bull Bitcoin settlement was terminally abandoned as an integrity \
-         error; this row will never be reconciled again and needs manual \
-         investigation if it was funded"
+        consecutive_attempts = settlement.reconcile_attempts,
+        "a bound Bull Bitcoin conversion could not be read and is being held \
+         for another attempt; if this keeps appearing for the same \
+         settlement_id the conversion is stuck and needs investigation"
     );
-    db::record_bull_bitcoin_terminal_problem(&state.db, settlement.id, "integrity_error")
-        .await
-        .map_err(|_| SettlementServiceError::Database)
+    db::record_bull_bitcoin_provider_read_hold(
+        &state.db,
+        settlement.id,
+        retry_delay_secs(state, settlement.reconcile_attempts),
+        late_payment_watch_delay_secs(state),
+        cause.persisted_class(),
+    )
+    .await
+    .map_err(|_| SettlementServiceError::Database)
 }
 
 async fn reconcile_settlement(
@@ -1627,10 +1681,10 @@ async fn reconcile_settlement(
             if observation.order_id != order_id
                 || observation.currency.as_str() != settlement.fiat_currency
             {
-                record_terminal_integrity_problem(
+                hold_unreadable_settlement(
                     state,
                     &settlement,
-                    "observation_identity_mismatch",
+                    HoldCause::ObservationIdentityMismatch,
                     format!(
                         "observed order {} in {}, expected order {} in {}",
                         observation.order_id,
@@ -1716,10 +1770,10 @@ async fn reconcile_settlement(
             );
         }
         Err(error @ (BullBitcoinError::Integrity | BullBitcoinError::MalformedResponse)) => {
-            record_terminal_integrity_problem(
+            hold_unreadable_settlement(
                 state,
                 &settlement,
-                "unreadable_provider_response",
+                HoldCause::UnreadableProviderResponse,
                 error.to_string(),
             )
             .await?;
@@ -1822,16 +1876,41 @@ async fn reconcile_settlement(
                 "A retryable exact-order provider read failed"
             );
         }
-        Err(error) => {
-            // Reached by InvalidApiKey (a credential whose bytes are invalid
-            // in an HTTP header) and by the ungated limit branch in
-            // `classify_rpc_error`, which can return Minimum/Maximum/Policy
-            // on a read. Whether terminal is right for those is a separate
-            // question; until it is answered the transition is at least loud.
-            record_terminal_integrity_problem(
+        // Listed one by one on purpose. A wildcard here used to send every
+        // unmatched variant to a permanent write-off, so adding a variant to
+        // `BullBitcoinError` silently changed what happens to real money.
+        // Exhaustive matching makes that a compile error instead.
+        Err(
+            error @ (BullBitcoinError::InvalidApiKey
+            | BullBitcoinError::CredentialEncryption),
+        ) => {
+            // The stored credential cannot be used at all — bytes that are
+            // invalid in an HTTP header, or that failed to decrypt. Same
+            // situation as a credential the provider rejects, so it gets the
+            // same treatment: hold, and resume when the merchant reconnects.
+            hold_unreadable_settlement(state, &settlement, HoldCause::CredentialUnusable, error.to_string())
+                .await?;
+        }
+        Err(
+            error @ (BullBitcoinError::Minimum
+            | BullBitcoinError::Maximum
+            | BullBitcoinError::Policy
+            | BullBitcoinError::BenchmarkEligibilityDenied
+            | BullBitcoinError::InvalidOwner
+            | BullBitcoinError::InvalidProduct
+            | BullBitcoinError::InvalidCurrency
+            | BullBitcoinError::InvalidBitcoinAmount
+            | BullBitcoinError::InvalidFiatAmount),
+        ) => {
+            // Order-creation semantics arriving on a read of an order that
+            // already exists. They should not occur; `classify_rpc_error`
+            // leaks the limit ones because its limit branch is not gated on
+            // `call_kind` the way the branches above it are. Nonsensical, but
+            // not evidence the conversion failed, so hold rather than judge.
+            hold_unreadable_settlement(
                 state,
                 &settlement,
-                "unclassified_provider_error",
+                HoldCause::ProviderAnsweredOutOfContext,
                 error.to_string(),
             )
             .await?;

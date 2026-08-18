@@ -283,15 +283,21 @@ fn classify_rpc_error(error: &Value, call_kind: RpcCallKind) -> BullBitcoinError
     {
         return BullBitcoinError::Authentication;
     }
-    if let Some(operator) = error
-        .pointer("/data/reason/limit/conditionalOperator")
-        .and_then(Value::as_str)
-    {
-        return match operator {
-            "GREATER_THAN" | "GREATER_THAN_OR_EQUAL" => BullBitcoinError::Minimum,
-            "LESS_THAN" | "LESS_THAN_OR_EQUAL" => BullBitcoinError::Maximum,
-            _ => BullBitcoinError::Policy,
-        };
+    // Limit evidence only means something while an order is being created.
+    // Ungated, this arm also fired on reads of an order that already exists,
+    // handing the reconciler an order-creation verdict about a possibly funded
+    // conversion. Gated like the two branches above it.
+    if call_kind == RpcCallKind::CreateOrder {
+        if let Some(operator) = error
+            .pointer("/data/reason/limit/conditionalOperator")
+            .and_then(Value::as_str)
+        {
+            return match operator {
+                "GREATER_THAN" | "GREATER_THAN_OR_EQUAL" => BullBitcoinError::Minimum,
+                "LESS_THAN" | "LESS_THAN_OR_EQUAL" => BullBitcoinError::Maximum,
+                _ => BullBitcoinError::Policy,
+            };
+        }
     }
     let message = error
         .get("message")
