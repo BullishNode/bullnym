@@ -4788,9 +4788,22 @@ async fn bull_bitcoin_integrity_hold_retains_deletion_pending_credential() {
         .await
         .unwrap();
 
-    pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
-        .await
-        .unwrap();
+    // This transition is permanent and the merchant only ever sees
+    // "unavailable", so it must not be silent.
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(log_writer.clone())
+        .finish();
+    let logs = {
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        pay_service::bull_bitcoin_settlement::run_reconciliation_once(&state)
+            .await
+            .unwrap();
+        log_writer.contents()
+    };
     assert_eq!(fake.read_call_count(), 1);
     let settlement_status = sqlx::query_scalar::<_, String>(
         "SELECT settlement_status FROM bull_bitcoin_settlements \
@@ -4801,6 +4814,14 @@ async fn bull_bitcoin_integrity_hold_retains_deletion_pending_credential() {
     .await
     .unwrap();
     assert_eq!(settlement_status, "integrity_error");
+    assert!(
+        logs.contains("bull_bitcoin_settlement_terminal_integrity_error"),
+        "terminally abandoning a settlement must emit an operator event: {logs}",
+    );
+    assert!(
+        logs.contains("unreadable_provider_response"),
+        "the event must name what made the row terminal: {logs}",
+    );
 
     let deletion = pay_service::db::request_bull_bitcoin_credential_deletion(&pool, &owner_npub)
         .await
