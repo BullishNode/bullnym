@@ -385,17 +385,21 @@ pub struct FeaturesConfig {
     /// obligations continue to reconcile when this is false.
     #[serde(default)]
     pub bull_bitcoin_fiat_settlement: bool,
-    /// Reject unsigned `GET /register/lookup` requests.
+    /// Reject unsigned `GET /register/lookup` requests. **On by default.**
     ///
-    /// Requiring the signature is API-breaking, and the client is a mobile
-    /// app: there is no version negotiation on this server, so every already
-    /// installed build would start failing the moment this is enforced. The
-    /// disclosure being closed is an npub-to-nym linkage, not funds, so the
-    /// rollout is staged instead — deploy permissive, ship the signing
-    /// client, watch `register_lookup_unsigned` fall to zero, then enforce.
+    /// The response links a public key to a permanent nym, Lightning Address,
+    /// alias and online status, so the caller must prove possession of the key
+    /// it is asking about.
+    ///
+    /// Enforcement is API-breaking and this server has no client version
+    /// negotiation, so the setting exists as an escape hatch: turning it off
+    /// serves unsigned lookups again, logging `register_lookup_unsigned` for
+    /// each one, which is what a staged rollout would need if a population of
+    /// older mobile builds ever has to be carried. There is no such population
+    /// today, so the default is to enforce rather than to disclose.
     ///
     /// A signature that *is* supplied is always verified, on either setting.
-    #[serde(default)]
+    #[serde(default = "default_feature_enabled")]
     pub require_signed_registration_lookup: bool,
 }
 
@@ -407,7 +411,7 @@ impl Default for FeaturesConfig {
             payment_pages: default_feature_enabled(),
             nip05: false,
             bull_bitcoin_fiat_settlement: false,
-            require_signed_registration_lookup: false,
+            require_signed_registration_lookup: default_feature_enabled(),
         }
     }
 }
