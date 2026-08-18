@@ -119,6 +119,45 @@ impl CycleHealth {
     }
 }
 
+/// Consecutive provider "swap not found" counts, keyed by Boltz swap id.
+/// Entries are cleared as soon as the provider returns the swap again.
+type ProviderNotFoundTracker = std::collections::HashMap<String, u32>;
+
+/// A provider 404 for one swap is routine (stale/foreign id). A 404 that
+/// persists across many ticks means the provider has lost a swap we still
+/// track — if that swap was funded, the obligation can never advance and the
+/// row polls forever, indistinguishable from noise. Escalate with a distinct
+/// error-level event on an exponential ladder so operators can trigger manual
+/// recovery (xpub restore / provider support) instead of discovering stuck
+/// funds by accident.
+fn track_provider_not_found(
+    tracker: &mut ProviderNotFoundTracker,
+    boltz_swap_id: &str,
+    local_status: &str,
+    error: &BoltzClientError,
+) {
+    let is_not_found = matches!(
+        error,
+        BoltzClientError::HTTPStatusNotSuccess(status, _)
+            if matches!(*status, reqwest::StatusCode::NOT_FOUND)
+    );
+    if !is_not_found {
+        return;
+    }
+    let count = tracker.entry(boltz_swap_id.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    if matches!(*count, 10 | 100 | 1_000 | 10_000) {
+        tracing::error!(
+            event = "provider_swap_not_found_persistent",
+            boltz_swap_id,
+            local_status,
+            consecutive_not_found = *count,
+            "provider has reported this swap as not found across many reconciler \
+             ticks; if it was funded it needs manual recovery investigation"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanOutcome {
     Progress,
@@ -244,6 +283,7 @@ pub fn spawn(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         let mut scan = EpochScan::<1>::default();
+        let mut provider_not_found = ProviderNotFoundTracker::default();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -270,6 +310,7 @@ pub fn spawn(
                         &reporter,
                         scan_epoch,
                         &mut scan.cursors[0],
+                        &mut provider_not_found,
                     ).await {
                         Ok(ScanOutcome::Cancelled) => {
                             scan.reset();
@@ -854,6 +895,7 @@ pub fn spawn_chain(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         let mut scan = EpochScan::<2>::default();
+        let mut provider_not_found = ProviderNotFoundTracker::default();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -878,6 +920,7 @@ pub fn spawn_chain(
                         &reporter,
                         scan_epoch,
                         &mut scan.cursors,
+                        &mut provider_not_found,
                     ).await {
                         Ok(ScanOutcome::Cancelled) => {
                             scan.reset();
@@ -1448,6 +1491,7 @@ async fn run_one_chain_tick(
     reporter: &WorkerReporter,
     epoch_micros: i64,
     cursors: &mut [ScanCursor; 2],
+    provider_not_found: &mut ProviderNotFoundTracker,
 ) -> Result<ScanOutcome, sqlx::Error> {
     let limit = config.max_per_tick;
     if limit == 0 {
@@ -1780,9 +1824,16 @@ async fn run_one_chain_tick(
             match poll_chain_swap_provider_once(state, swap).await {
                 Ok(()) => {
                     health.provider_succeeded();
+                    provider_not_found.remove(&swap.boltz_swap_id);
                 }
                 Err(ChainSwapProviderPollError::Provider(error)) => {
                     health.provider_error(&error);
+                    track_provider_not_found(
+                        provider_not_found,
+                        &swap.boltz_swap_id,
+                        &swap.status,
+                        &error,
+                    );
                     tracing::warn!(
                         "chain reconciler: get_swap({}) failed: {error}",
                         swap.boltz_swap_id
@@ -1827,6 +1878,7 @@ async fn run_one_tick(
     reporter: &WorkerReporter,
     epoch_micros: i64,
     cursor: &mut ScanCursor,
+    provider_not_found: &mut ProviderNotFoundTracker,
 ) -> Result<ScanOutcome, sqlx::Error> {
     let limit = config.max_per_tick;
     if limit == 0 {
@@ -1877,10 +1929,17 @@ async fn run_one_tick(
         let remote = match boltz.get_swap(&swap.boltz_swap_id).await {
             Ok(r) => {
                 health.provider_succeeded();
+                provider_not_found.remove(&swap.boltz_swap_id);
                 r
             }
             Err(e) => {
                 health.provider_error(&e);
+                track_provider_not_found(
+                    provider_not_found,
+                    &swap.boltz_swap_id,
+                    &swap.status,
+                    &e,
+                );
                 tracing::warn!("reconciler: get_swap({}) failed: {e}", swap.boltz_swap_id);
                 cursor.visit(swap.id);
                 continue;
