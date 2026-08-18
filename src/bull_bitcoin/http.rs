@@ -335,7 +335,7 @@ fn parse_created_order(
     if require_future_deadline && expires_at_unix <= chrono::Utc::now().timestamp() {
         return Err(BullBitcoinError::Integrity);
     }
-    let quoted_fiat = parse_optional_fiat_field(order, "payoutAmount")?;
+    let quoted_fiat = parse_optional_fiat_field(order, "payoutAmount", currency)?;
     Ok(CreatedSellOrder {
         order_id,
         currency,
@@ -391,10 +391,10 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
     // The locked fiat quote is present at any payout status, including a
     // repriced late payment. It is captured independently of the settled
     // credit so a pending leg can already show its amount.
-    let quoted_fiat_minor = parse_optional_fiat_field(order, "payoutAmount")?;
+    let quoted_fiat_minor = parse_optional_fiat_field(order, "payoutAmount", currency)?;
     let execution_rate_minor_per_btc = parse_execution_rate(order, currency)?;
     let credited_fiat_minor = if payout_status == "Completed" && !provider_terminal {
-        Some(parse_fiat_field(order, "payoutAmount")?)
+        Some(parse_fiat_field(order, "payoutAmount", currency)?)
     } else {
         None
     };
@@ -557,12 +557,16 @@ fn parse_bitcoin_value(value: &Value) -> Result<BitcoinAmountSat, BullBitcoinErr
         .map_err(|_| BullBitcoinError::MalformedResponse)
 }
 
-fn parse_fiat_field(value: &Value, field: &str) -> Result<FiatAmountMinor, BullBitcoinError> {
+fn parse_fiat_field(
+    value: &Value,
+    field: &str,
+    currency: FiatCurrency,
+) -> Result<FiatAmountMinor, BullBitcoinError> {
     let number = value
         .get(field)
         .and_then(Value::as_number)
         .ok_or(BullBitcoinError::MalformedResponse)?;
-    FiatAmountMinor::parse_json_decimal(&number.to_string())
+    FiatAmountMinor::parse_json_decimal(&number.to_string(), currency)
         .map_err(|_| BullBitcoinError::MalformedResponse)
 }
 
@@ -572,11 +576,12 @@ fn parse_fiat_field(value: &Value, field: &str) -> Result<FiatAmountMinor, BullB
 fn parse_optional_fiat_field(
     value: &Value,
     field: &str,
+    currency: FiatCurrency,
 ) -> Result<Option<FiatAmountMinor>, BullBitcoinError> {
     match value.get(field) {
         None => Ok(None),
         Some(field_value) if field_value.is_null() => Ok(None),
-        Some(_) => parse_fiat_field(value, field).map(Some),
+        Some(_) => parse_fiat_field(value, field, currency).map(Some),
     }
 }
 
@@ -594,7 +599,7 @@ fn parse_execution_rate(
             if rate_currency != payout_currency {
                 return Err(BullBitcoinError::Integrity);
             }
-            parse_fiat_field(value, "exchangeRateAmount").map(Some)
+            parse_fiat_field(value, "exchangeRateAmount", payout_currency).map(Some)
         }
         _ => Err(BullBitcoinError::MalformedResponse),
     }
@@ -1052,6 +1057,32 @@ mod tests {
         );
         assert!(observation.provider_final);
         assert!(!observation.provider_terminal);
+    }
+
+    #[test]
+    fn observation_scales_zero_decimal_payouts_to_whole_units() {
+        // CRC and COP have no sub-unit. A 32000-colon payout is 32000 minor
+        // units, and its rate is whole colones per BTC — the same scale the
+        // pricer uses for R1, so the two rates stay comparable on screen.
+        let observation = parse_order_observation(&serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payoutCurrency": "CRC",
+            "orderStatus": "Completed",
+            "payinStatus": "Completed",
+            "payoutStatus": "Completed",
+            "payinAmount": 0.001,
+            "payoutAmount": 32000,
+            "exchangeRateAmount": 32000000,
+            "exchangeRateCurrency": "CRC"
+        }))
+        .unwrap();
+        assert_eq!(observation.credited_fiat_minor.unwrap().as_minor(), 32_000);
+        assert_eq!(observation.quoted_fiat_minor.unwrap().as_minor(), 32_000);
+        assert_eq!(
+            observation.execution_rate_minor_per_btc.unwrap().as_minor(),
+            32_000_000
+        );
+        assert!(observation.provider_final);
     }
 
     #[test]

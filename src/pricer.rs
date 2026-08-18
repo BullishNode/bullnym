@@ -353,7 +353,7 @@ fn minor_per_btc_from_element(element: &RateElement) -> Result<i64, PricerError>
         .ok_or(PricerError::InvalidRate)
 }
 
-fn rescale_minor_units(value: i64, from_precision: u8, to_precision: u8) -> Option<i64> {
+pub(crate) fn rescale_minor_units(value: i64, from_precision: u8, to_precision: u8) -> Option<i64> {
     match from_precision.cmp(&to_precision) {
         std::cmp::Ordering::Equal => Some(value),
         std::cmp::Ordering::Less => {
