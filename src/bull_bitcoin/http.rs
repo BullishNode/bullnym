@@ -359,6 +359,9 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
     let order_status = safe_status(order, "orderStatus")?;
     let payin_status = safe_status(order, "payinStatus")?;
     let payout_status = safe_status(order, "payoutStatus")?;
+    warn_unknown_status("orderStatus", &order_status, KNOWN_ORDER_STATUSES);
+    warn_unknown_status("payinStatus", &payin_status, KNOWN_PAYIN_STATUSES);
+    warn_unknown_status("payoutStatus", &payout_status, KNOWN_PAYOUT_STATUSES);
 
     let changed_received = order
         .pointer("/payinAmountChanged/receivedAmount")
@@ -423,6 +426,63 @@ fn parse_order_observation(order: &Value) -> Result<OrderObservation, BullBitcoi
         provider_final,
         provider_terminal,
     })
+}
+
+/// The status vocabularies this client understands, per field.
+///
+/// Every decision below — was the payin observed, is the order terminal, did
+/// the payout complete — is an exact match against these English labels. An
+/// unrecognised value therefore means "no", silently: an unknown payin status
+/// makes a funded payment invisible, an unknown terminal status polls forever,
+/// an unknown payout status never credits. None of those announce themselves,
+/// which is why `warn_unknown_status` exists. A provider-side copy change
+/// ("Canceled" to "Cancelled", sentence case, translation) is all it takes.
+const KNOWN_ORDER_STATUSES: &[&str] = &[
+    "Not started",
+    "In progress",
+    "Under review",
+    "Awaiting confirmation",
+    "Completed",
+    "Canceled",
+    "Expired",
+    "Rejected",
+    "Payment deadline expired",
+];
+const KNOWN_PAYIN_STATUSES: &[&str] = &[
+    "Not started",
+    "In progress",
+    "Under review",
+    "Awaiting confirmation",
+    "Completed",
+    "Rejected",
+];
+const KNOWN_PAYOUT_STATUSES: &[&str] = &[
+    "Not started",
+    "In progress",
+    "Under review",
+    "Awaiting confirmation",
+    "Completed",
+    "Canceled",
+    "Failed",
+];
+
+/// Report a status this client does not know how to interpret.
+///
+/// Deliberately not an error: guessing at an unknown status would be worse
+/// than proceeding conservatively, and a settlement is never written off for
+/// one. But it must not pass in silence, because the resulting behaviour is
+/// indistinguishable from a payment that simply has not arrived.
+fn warn_unknown_status(field: &'static str, value: &str, known: &[&str]) {
+    if !known.contains(&value) {
+        tracing::warn!(
+            event = "unknown_provider_status",
+            field,
+            value,
+            "Bull Bitcoin reported a status this build does not recognise; it will \
+             be treated as not-observed, which can hide a funded payment or poll a \
+             finished order forever"
+        );
+    }
 }
 
 fn is_terminal_provider_outcome(
@@ -1089,6 +1149,51 @@ mod tests {
             32_000_000
         );
         assert!(observation.provider_final);
+    }
+
+    #[test]
+    fn every_status_the_parser_decides_on_is_in_a_known_vocabulary() {
+        // The guard against a silent provider copy change: if a decision here
+        // starts keying off a label that is not declared known, the warning
+        // never fires for it and the wedge is silent again.
+        for status in ["In progress", "Under review", "Awaiting confirmation", "Completed"] {
+            assert!(
+                KNOWN_PAYIN_STATUSES.contains(&status),
+                "payin decision uses undeclared {status}"
+            );
+        }
+        for status in ["Canceled", "Expired", "Rejected", "Payment deadline expired"] {
+            assert!(
+                KNOWN_ORDER_STATUSES.contains(&status),
+                "order decision uses undeclared {status}"
+            );
+        }
+        for status in ["Completed", "Canceled", "Failed"] {
+            assert!(
+                KNOWN_PAYOUT_STATUSES.contains(&status),
+                "payout decision uses undeclared {status}"
+            );
+        }
+        assert!(KNOWN_PAYIN_STATUSES.contains(&"Rejected"));
+    }
+
+    #[test]
+    fn an_unrecognised_status_still_parses_but_is_not_treated_as_observed() {
+        // Fail loud, not closed: a status we cannot interpret must not error
+        // the read (that path is terminal-adjacent) and must not be mistaken
+        // for a funded payment either.
+        let observation = parse_order_observation(&serde_json::json!({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "payoutCurrency": "CAD",
+            "orderStatus": "In progress",
+            "payinStatus": "Cancelled",
+            "payoutStatus": "Not started",
+            "payinAmount": 0.001
+        }))
+        .expect("an unknown status must not fail the read");
+        assert_eq!(observation.actual_received_sat, None);
+        assert!(!observation.provider_final);
+        assert!(!observation.provider_terminal);
     }
 
     #[test]
