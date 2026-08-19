@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, MatchedPath};
@@ -798,6 +798,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // Supervisor handles, so shutdown can wait for the workers rather than
+    // cancelling them and immediately dropping the runtime.
+    let mut supervised: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if config.workers.enabled {
         tracing::info!("background workers enabled");
         {
@@ -806,7 +809,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // running whenever this process owns background work.
             let settlement_state = state.clone();
             let settlement_cancel = cancel.clone();
-            spawn_supervised(
+            supervised.push(spawn_supervised(
                 "bull_bitcoin_settlement_reconciler",
                 cancel.clone(),
                 move || {
@@ -816,7 +819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bull_bitcoin_settlement::run_reconciler(state, cancel).await;
                     })
                 },
-            );
+            ));
             tracing::info!(
                 interval_secs = config.bull_bitcoin.reconcile_interval_secs,
                 batch_size = config.bull_bitcoin.reconcile_batch_size,
@@ -836,7 +839,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let claimer_config = config.clone();
             let claimer_state = state.clone();
             let claimer_cancel = cancel.clone();
-            spawn_supervised("background_claimer", cancel.clone(), move || {
+            supervised.push(spawn_supervised("background_claimer", cancel.clone(), move || {
                 claimer::spawn_background_claimer(
                     claimer::BackgroundClaimerDependencies::new(
                         claimer_pool.clone(),
@@ -856,7 +859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .reporter(admission::Worker::ChainClaimer),
                     ),
                 )
-            });
+            }));
         }
 
         // Reconciler: polls boltz_api.get_swap for every non-terminal swap
@@ -870,7 +873,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rec_config = Arc::new(config.reconciler.clone());
             let rec_cancel = cancel.clone();
             let rec_admission = state.admission.clone();
-            spawn_supervised("reverse_reconciler", cancel.clone(), move || {
+            supervised.push(spawn_supervised("reverse_reconciler", cancel.clone(), move || {
                 reconciler::spawn(
                     rec_pool.clone(),
                     rec_boltz.clone(),
@@ -879,7 +882,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec_cancel.clone(),
                     rec_admission.reporter(admission::Worker::ReverseReconciler),
                 )
-            });
+            }));
         }
         tracing::info!(
             "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
@@ -896,14 +899,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chain_rec_config = Arc::new(config.reconciler.clone());
             let chain_rec_cancel = cancel.clone();
             let chain_rec_admission = state.admission.clone();
-            spawn_supervised("chain_reconciler", cancel.clone(), move || {
+            supervised.push(spawn_supervised("chain_reconciler", cancel.clone(), move || {
                 reconciler::spawn_chain(
                     chain_rec_state.clone(),
                     chain_rec_config.clone(),
                     chain_rec_cancel.clone(),
                     chain_rec_admission.reporter(admission::Worker::ChainReconciler),
                 )
-            });
+            }));
         }
         tracing::info!("chain reconciler started (shares reconciler config)");
 
@@ -916,14 +919,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fallback_config = Arc::new(config.reconciler.clone());
             let fallback_cancel = cancel.clone();
             let fallback_admission = state.admission.clone();
-            spawn_supervised("automatic_fallback", cancel.clone(), move || {
+            supervised.push(spawn_supervised("automatic_fallback", cancel.clone(), move || {
                 chain_fallback::spawn_automatic_fallback_executor(
                     fallback_state.clone(),
                     fallback_config.clone(),
                     fallback_cancel.clone(),
                     fallback_admission.reporter(admission::Worker::AutomaticFallback),
                 )
-            });
+            }));
         }
         tracing::info!("automatic Bitcoin fallback executor started");
 
@@ -937,14 +940,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let repair_config = Arc::new(config.reconciler.clone());
             let repair_cancel = cancel.clone();
             let repair_admission = state.admission.clone();
-            spawn_supervised("settlement_repair", cancel.clone(), move || {
+            supervised.push(spawn_supervised("settlement_repair", cancel.clone(), move || {
                 reconciler::spawn_settlement_repair(
                     repair_state.clone(),
                     repair_config.clone(),
                     repair_cancel.clone(),
                     repair_admission.reporter(admission::Worker::SettlementRepair),
                 )
-            });
+            }));
         }
         tracing::info!("settlement repair started (shares reconciler config)");
 
@@ -956,14 +959,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let recovery_config = Arc::new(config.reconciler.clone());
             let recovery_cancel = cancel.clone();
             let recovery_admission = state.admission.clone();
-            spawn_supervised("slow_recovery", cancel.clone(), move || {
+            supervised.push(spawn_supervised("slow_recovery", cancel.clone(), move || {
                 reconciler::spawn_slow_recovery(
                     recovery_state.clone(),
                     recovery_config.clone(),
                     recovery_cancel.clone(),
                     recovery_admission.reporter(admission::Worker::SlowRecovery),
                 )
-            });
+            }));
         }
         tracing::info!("slow recovery started (shares reconciler config)");
 
@@ -979,14 +982,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..gc::GcConfig::default()
             };
             let cancel_gc = cancel.clone();
-            spawn_supervised("payment_state_gc", cancel.clone(), move || {
+            supervised.push(spawn_supervised("payment_state_gc", cancel.clone(), move || {
                 let pool = pool.clone();
                 let cancel = cancel_gc.clone();
                 let cfg = gc_cfg;
                 tokio::spawn(async move {
                     gc::run(pool, cancel, cfg).await;
                 })
-            });
+            }));
             tracing::info!("operational payment-state GC started");
         }
 
@@ -1005,7 +1008,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let liquid_wakeup = direct_watcher_wakeups.liquid.clone();
             let active = watcher_cfg.active_tick_secs;
             let idle = watcher_cfg.idle_tick_secs;
-            spawn_supervised("chain_watcher", cancel.clone(), move || {
+            supervised.push(spawn_supervised("chain_watcher", cancel.clone(), move || {
                 let pool = pool.clone();
                 let backend = backend.clone();
                 let rl = rl.clone();
@@ -1027,7 +1030,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 })
-            });
+            }));
             tracing::info!(
                 "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
                 active,
@@ -1081,6 +1084,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
+    // `serve` returning only means HTTP connections drained. Without waiting
+    // here the runtime drops and every background worker is aborted at its
+    // next await point — a claimer mid-broadcast, a reconciler mid-write — so
+    // the cancellation issued above would have had no time to take effect.
+    // The supervisors return promptly once cancelled; the timeout bounds a
+    // worker that does not.
+    if !supervised.is_empty() {
+        let drained = tokio::time::timeout(
+            WORKER_DRAIN_GRACE,
+            futures_util::future::join_all(supervised),
+        )
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                event = "worker_drain_timed_out",
+                grace_secs = WORKER_DRAIN_GRACE.as_secs(),
+                "background workers did not all stop within the drain grace; exiting anyway"
+            );
+        }
+    }
+
     tracing::info!("shutdown complete");
     Ok(())
 }
@@ -1115,34 +1139,87 @@ async fn shutdown_signal() {
 /// Restart a background worker when its task exits or panics without shutdown
 /// being requested. The factory runs per (re)start so every replacement gets
 /// fresh admission reporters: a dead worker closes its rail's admission until
-/// the replacement reports progress. Restart backoff doubles from 1s to a
-/// 60s cap and resets only on intentional shutdown.
-fn spawn_supervised<F>(worker: &'static str, cancel: CancellationToken, mut factory: F)
+/// the replacement reports progress.
+///
+/// Restarting is bounded. Each replacement gets a fresh `WorkerState`, which
+/// clears the failure record, so a worker that completes one cycle and then
+/// panics would otherwise flap its rail open and closed forever. After
+/// `WORKER_RESTART_BUDGET` restarts inside `WORKER_RESTART_WINDOW` the
+/// supervisor gives up and leaves the rail closed: a worker failing that
+/// often is not going to recover on its own, and staying down is both more
+/// honest and easier to notice than oscillating.
+///
+/// Backoff doubles from 1s to a 60s cap, and resets once a worker has run
+/// healthily for `WORKER_HEALTHY_RUN` — otherwise an occasional blip
+/// accumulates until every restart waits the full minute.
+///
+/// Returns the supervisor's handle so shutdown can wait for it.
+/// How long shutdown waits for background workers after HTTP drains.
+const WORKER_DRAIN_GRACE: Duration = Duration::from_secs(30);
+const WORKER_RESTART_BUDGET: usize = 5;
+const WORKER_RESTART_WINDOW: Duration = Duration::from_secs(900);
+const WORKER_HEALTHY_RUN: Duration = Duration::from_secs(300);
+
+fn spawn_supervised<F>(
+    worker: &'static str,
+    cancel: CancellationToken,
+    mut factory: F,
+) -> tokio::task::JoinHandle<()>
 where
     F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
 {
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
+        let mut restarts: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
         loop {
             if cancel.is_cancelled() {
                 return;
             }
+            let started = Instant::now();
             let outcome = factory().await;
             if cancel.is_cancelled() {
                 return;
             }
+            let ran_for = started.elapsed();
             match outcome {
                 Ok(()) => tracing::error!(
                     event = "worker_exited_unexpectedly",
                     worker,
+                    ran_for_secs = ran_for.as_secs(),
                     "background worker exited without shutdown requested; restarting"
                 ),
                 Err(error) => tracing::error!(
                     event = "worker_task_failed",
                     worker,
                     %error,
+                    ran_for_secs = ran_for.as_secs(),
                     "background worker task failed; restarting"
                 ),
+            }
+
+            let now = Instant::now();
+            while restarts
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) > WORKER_RESTART_WINDOW)
+            {
+                restarts.pop_front();
+            }
+            restarts.push_back(now);
+            if restarts.len() > WORKER_RESTART_BUDGET {
+                tracing::error!(
+                    event = "worker_restart_budget_exhausted",
+                    worker,
+                    restarts = restarts.len(),
+                    window_secs = WORKER_RESTART_WINDOW.as_secs(),
+                    "background worker failed too often to keep restarting; leaving it \
+                     stopped so its rail stays closed rather than flapping"
+                );
+                return;
+            }
+
+            // A worker that stayed up is not the same fault as one crash-looping.
+            if ran_for >= WORKER_HEALTHY_RUN {
+                backoff = Duration::from_secs(1);
             }
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -1150,7 +1227,7 @@ where
             }
             backoff = (backoff * 2).min(Duration::from_secs(60));
         }
-    });
+    })
 }
 
 fn build_router(state: AppState) -> Router {
