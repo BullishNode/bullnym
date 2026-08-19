@@ -1244,7 +1244,24 @@ fn fallback_for_definite_create_rejection(error: BullBitcoinError) -> Option<Fal
     }
 }
 
+/// One heartbeat per this many ticks (~30 minutes at the default cadence).
+const RECONCILER_HEARTBEAT_EVERY_N_TICKS: u64 = 60;
+
 pub async fn run_reconciler(state: AppState, cancel: CancellationToken) {
+    // This reconciler is the only thing that ever asks Bull Bitcoin whether a
+    // conversion finished, and it reports into nothing: admission gates
+    // payment rails, and fiat settlement is not one — it happens after a
+    // payment has landed, and Bull Bitcoin decides whether to accept the sell
+    // order. Wiring it into admission would take Lightning and Bitcoin
+    // payments down over a reporting fault, including for merchants with no
+    // fiat settlement at all. So the liveness signal is a heartbeat instead:
+    // if this stops appearing, nothing is chasing fiat conversions and no
+    // other alarm will say so.
+    tracing::info!(
+        event = "bull_bitcoin_reconciler_started",
+        interval_secs = state.config.bull_bitcoin.reconcile_interval_secs,
+        "Bull Bitcoin settlement reconciler started"
+    );
     let interval_secs = state.config.bull_bitcoin.reconcile_interval_secs;
     let stale_after_secs = state
         .config
@@ -1255,12 +1272,30 @@ pub async fn run_reconciler(state: AppState, cancel: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
+    let mut ticks: u64 = 0;
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => {
+                tracing::info!(
+                    event = "bull_bitcoin_reconciler_stopped",
+                    "Bull Bitcoin settlement reconciler stopped on shutdown"
+                );
+                return;
+            }
             _ = interval.tick() => {
                 if let Err(error) = reconcile_once(&state, stale_after_secs).await {
                     tracing::error!(error = %error, "Bull Bitcoin settlement reconciliation tick failed");
+                }
+                ticks = ticks.saturating_add(1);
+                // Heartbeat, not per-tick noise: at the default 30s cadence
+                // this is one line every ~30 minutes. Its absence is the
+                // signal worth grepping for.
+                if ticks.is_multiple_of(RECONCILER_HEARTBEAT_EVERY_N_TICKS) {
+                    tracing::info!(
+                        event = "bull_bitcoin_reconciler_heartbeat",
+                        ticks,
+                        "Bull Bitcoin settlement reconciler is alive"
+                    );
                 }
             }
         }
