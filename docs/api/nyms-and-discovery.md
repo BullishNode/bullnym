@@ -247,14 +247,15 @@ the queried `npub` is rejected with `401`, as is a request carrying only one
 of `timestamp`/`signature`, which is malformed rather than legacy. Unknown
 query parameters are rejected with `400`.
 
-Whether a *missing* signature is fatal is operator-controlled by the
-`features.require_signed_registration_lookup` setting, because enforcement is
-API-breaking and the client is a mobile app with no version negotiation on
-this server. The staged rollout is: deploy with the setting off, so builds
-already in users' hands keep working while every unsigned lookup emits a
-`register_lookup_unsigned` warning; ship the signing client; wait for that
-event to stop appearing; then turn the setting on, after which an unsigned
-lookup is rejected with `401`. The setting defaults to off.
+An unsigned request is rejected with `401`. That is
+`features.require_signed_registration_lookup`, which **defaults to on**.
+
+The setting exists as an escape hatch rather than a rollout stage. Enforcement
+is API-breaking and this server has no client version negotiation, so an
+operator carrying a population of older clients that cannot sign yet can turn
+it off: unsigned lookups are served again, and each one emits a
+`register_lookup_unsigned` warning so the legacy traffic can be watched until
+it stops. Turn it back on once it does.
 
 ## `GET /api/reservations/:nym`
 

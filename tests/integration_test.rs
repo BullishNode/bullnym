@@ -32019,11 +32019,9 @@ async fn permanent_name_lookup_requires_owner_signature() {
         .await
         .unwrap();
 
-    // While the signature rollout is staged, an unsigned lookup is still
-    // served so mobile builds already in users' hands keep working. It is
-    // counted via `register_lookup_unsigned`, not silently accepted.
+    // Enforced by default: the npub-to-nym linkage is not public.
     let unsigned = format!("/register/lookup?npub={npub}");
-    assert_eq!(get_path(&app, &unsigned).await.0, StatusCode::OK);
+    assert_eq!(get_path(&app, &unsigned).await.0, StatusCode::UNAUTHORIZED);
 
     // A half-supplied credential is malformed, never legacy, so it is
     // rejected on either setting.
@@ -32047,26 +32045,31 @@ async fn permanent_name_lookup_requires_owner_signature() {
     cleanup_db(&pool).await;
 }
 
-/// Once the operator has watched `register_lookup_unsigned` drain to zero,
-/// enforcement closes the linkage disclosure for good.
+/// Turning the setting off is the escape hatch for carrying a population of
+/// older clients that cannot sign yet. Unsigned lookups are served again, and
+/// a half-supplied credential is still refused because that is malformed
+/// rather than legacy.
 #[tokio::test]
-async fn permanent_name_lookup_enforces_signature_when_configured() {
+async fn permanent_name_lookup_serves_unsigned_when_enforcement_is_disabled() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let mut config = test_config();
-    config.features.require_signed_registration_lookup = true;
+    config.features.require_signed_registration_lookup = false;
     let app = test_app(test_state_with_config(pool.clone(), config));
-    let (npub, _, _, keypair) = sign_registration_with_keypair("lookup-enforced", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "lookup-enforced", &npub, TEST_DESCRIPTOR)
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lookup-legacy", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "lookup-legacy", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
 
     let unsigned = format!("/register/lookup?npub={npub}");
     assert_eq!(
         get_path(&app, &unsigned).await.0,
-        StatusCode::UNAUTHORIZED,
-        "an unsigned lookup must not disclose the npub-to-nym linkage once enforced",
+        StatusCode::OK,
+        "the escape hatch must serve a client that cannot sign yet",
     );
+
+    let half = format!("/register/lookup?npub={npub}&timestamp=1700000000");
+    assert_eq!(get_path(&app, &half).await.0, StatusCode::UNAUTHORIZED);
 
     let (signature, timestamp) = sign_la_action(&keypair, "register-lookup", &npub, "", &[]);
     let signed = format!("/register/lookup?npub={npub}&timestamp={timestamp}&signature={signature}");
