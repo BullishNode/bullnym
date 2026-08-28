@@ -6,7 +6,6 @@ current implementation.
 
 - [001 Product and feature boundaries](001-product-and-feature-boundaries.md)
 - [002 Deterministic wallet purposes](002-deterministic-wallet-purposes.md)
-- [003 Wallet manifest and recovery](003-wallet-manifest-and-recovery.md)
 - [004 Nostr identity role separation](004-nostr-identity-role-separation.md)
 - [005 Bullnym/mobile protocol contract](005-bullnym-mobile-protocol-contract.md)
 - [006 Payment rails and settlement](006-payment-rails-and-settlement.md)

@@ -3,16 +3,15 @@
 This document is the unifying picture for facts that are individually
 normative elsewhere: BIP85 product wallet purposes
 ([ADR 002](../adr/002-deterministic-wallet-purposes.md)), Nostr identity role
-separation ([ADR 004](../adr/004-nostr-identity-role-separation.md)), wallet
-manifest recovery ([ADR 003](../adr/003-wallet-manifest-and-recovery.md)), and
-the chain-swap recovery contract
+separation ([ADR 004](../adr/004-nostr-identity-role-separation.md)), and the
+chain-swap recovery contract
 ([chain-swap-recovery.md](../api/chain-swap-recovery.md)). Where this document
 and those disagree, those win.
 
 ## The derivation tree
 
-Every key material a Get Paid merchant uses — spending, identity, backup, and
-the failure-path destination — derives from one master seed:
+Every key material a Get Paid merchant uses — spending, identity, and the
+failure-path destination — derives from one master seed:
 
 ```text
 master seed (the default wallet)
@@ -31,15 +30,11 @@ master seed (the default wallet)
 │     ├── 102' → Payment Page wallet      (Liquid CT descriptor)
 │     └── 103' → POS wallet               (Liquid CT descriptor)
 │
-├── BIP85 Nostr keys, m/83696968'/128002'/{identity}'/1' (ADR 004;
-│   identities 100'–199' reserved for application roles)
-│     ├── 100' → unified wallet-backup key   (wallet_backup stream)
-│     ├── 101' → Bullnym server auth key     (this key's npub is the
-│     │                                       identity Bullnym sees)
-│     └── 102' → NIP-05 public verification key
-│
-└── BIP85 backup encryption key, m/83696968'/1642'/0'/1'
-      (encrypts the wallet_backup ciphertext the server stores opaquely)
+└── BIP85 Nostr keys, m/83696968'/128002'/{identity}'/1' (ADR 004;
+    identities 100'–199' reserved for application roles)
+      ├── 101' → Bullnym server auth key     (this key's npub is the
+      │                                       identity Bullnym sees)
+      └── 102' → NIP-05 public verification key
 ```
 
 The product wallet indexes above reflect the shipping mobile
@@ -48,7 +43,7 @@ documents the same scheme.
 
 Consequences:
 
-- **One backup recovers everything.** Restoring the master seed re-derives the
+- **One seed recovers ownership.** Restoring the master seed re-derives the
   spending wallets, every product wallet, the Nostr role keys — and therefore
   the npub — and the wallet that owns the committed recovery address. Nothing
   the server stores is required to reconstruct ownership; server state is
@@ -56,10 +51,9 @@ Consequences:
 - **Derivation is one-way.** A BIP85 child seed (for example the POS wallet's)
   yields that wallet and nothing above it: not the master, not the npub, not
   the recovery wallet. Compartments below the root are real.
-- **The role keys are deliberately distinct.** Backup, server auth, and public
-  verification never share a key, so private backup activity, authenticated
-  API traffic, and public identity cannot be linked through key reuse
-  (ADR 004).
+- **The role keys are deliberately distinct.** Server authentication and
+  public verification never share a key, so authenticated API traffic and
+  public identity cannot be linked through key reuse (ADR 004).
 
 ## Happy path versus failure path
 

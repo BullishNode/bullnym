@@ -27,7 +27,7 @@ use pay_service::{
     og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
     registration, startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
-    version, wallet_backup, watcher_wakeup, AppState,
+    version, watcher_wakeup, AppState,
 };
 
 #[tokio::main]
@@ -743,9 +743,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    // Signed backup gates and other HTTP controls persist cross-process rate
-    // events even in web-only mode, so their retention loop cannot depend on
-    // payment workers being enabled.
+    // HTTP controls persist cross-process rate events even in web-only mode,
+    // so their retention loop cannot depend on payment workers being enabled.
     {
         let rate_limit_gc_pool = pool.clone();
         let rate_limit_gc_cancel = cancel.clone();
@@ -762,41 +761,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         });
         tracing::info!(tick_secs, retention_secs, "rate-limit GC started");
-    }
-    // Tombstones outlive the five-minute signed-request window, then become
-    // disposable. Every HTTP process may run this bounded SKIP LOCKED sweep;
-    // concurrent processes divide work without blocking request transactions.
-    {
-        let cleanup_pool = pool.clone();
-        let cleanup_cancel = cancel.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            tick.tick().await;
-            loop {
-                tokio::select! {
-                    _ = cleanup_cancel.cancelled() => return,
-                    _ = tick.tick() => {
-                        match db::cleanup_expired_wallet_backup_tombstones(
-                            &cleanup_pool,
-                            wallet_backup::TOMBSTONE_RETENTION_SECS,
-                            500,
-                        ).await {
-                            Ok(removed) if removed > 0 => tracing::info!(
-                                event = "wallet_backup_tombstones_cleaned",
-                                removed,
-                                "expired wallet backup tombstones removed"
-                            ),
-                            Ok(_) => {}
-                            Err(error) => tracing::error!(
-                                event = "wallet_backup_tombstone_cleanup_failed",
-                                error_class = ?error.class(),
-                                "wallet backup tombstone cleanup failed"
-                            ),
-                        }
-                    }
-                }
-            }
-        });
     }
     // Supervisor handles, so shutdown can wait for the workers rather than
     // cancelling them and immediately dropping the runtime.
@@ -1457,13 +1421,8 @@ fn build_router(state: AppState) -> Router {
         router.fallback(not_found)
     };
 
-    let standard_router = router.layer(RequestBodyLimitLayer::new(64 * 1024));
-
-    standard_router
-        // Backup stores need a 3 MiB JSON envelope for a maximum 2 MiB
-        // decoded object. Keeping this as a separately layered router leaves
-        // the established 64 KiB ceiling intact for every other endpoint.
-        .merge(wallet_backup::router())
+    router
+        .layer(RequestBodyLimitLayer::new(64 * 1024))
         // Keep private invoice and invoice-API responses out of shared/browser
         // caches, search indexes, and outbound Referer headers. This applies to
         // success and error responses at the route boundary.

@@ -26,7 +26,8 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=83
+EXPECTED_MIGRATION_NUMBERS=({1..63} {65..75} {77..83})
+EXPECTED_MIGRATION_COUNT="${#EXPECTED_MIGRATION_NUMBERS[@]}"
 MIGRATION_FILES=()
 
 usage() {
@@ -108,11 +109,12 @@ mapfile -t MIGRATION_FILES < <(
 )
 [[ "${#MIGRATION_FILES[@]}" -eq "$EXPECTED_MIGRATION_COUNT" ]] \
   || die "expected exactly $EXPECTED_MIGRATION_COUNT migrations, found ${#MIGRATION_FILES[@]}"
-for ((migration_number = 1; migration_number <= EXPECTED_MIGRATION_COUNT; migration_number += 1)); do
+for migration_index in "${!EXPECTED_MIGRATION_NUMBERS[@]}"; do
+  migration_number="${EXPECTED_MIGRATION_NUMBERS[migration_index]}"
   expected_prefix="$(printf '%03d_' "$migration_number")"
-  migration_name="${MIGRATION_FILES[migration_number - 1]}"
+  migration_name="${MIGRATION_FILES[migration_index]}"
   [[ "$migration_name" == "$expected_prefix"*.sql ]] \
-    || die "migration boundary is not contiguous at $expected_prefix (found $migration_name)"
+    || die "unexpected migration boundary at $expected_prefix (found $migration_name)"
 done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
@@ -283,38 +285,6 @@ assert_private_invoice_cutover_refusal() {
   echo "test-db: migration 065 refused an existing wallet invoice transactionally"
 }
 
-assert_wallet_backup_migration_owner_boundary() {
-  local database="$1"
-  local migration="$2"
-  local runtime_scratch="${database}_migration_076_runtime_role"
-  local refusal_output rollback_state
-
-  docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$runtime_scratch"
-  docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$runtime_scratch"
-  if refusal_output="$(
-    {
-      printf 'SET ROLE %s;\n' "$RUNTIME_ROLE"
-      cat "$migration"
-    } | docker exec --interactive "$CONTAINER" \
-          psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" \
-            --dbname "$runtime_scratch" --set "runtime_role=$RUNTIME_ROLE" 2>&1
-  )"; then
-    die "migration 076 unexpectedly ran as the runtime role"
-  fi
-  [[ "$refusal_output" == *"must run as the schema owner, not the runtime role"* ]] \
-    || die "migration 076 returned the wrong runtime-role failure: $refusal_output"
-  rollback_state="$(
-    docker exec "$CONTAINER" \
-      psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
-        --username "$PG_USER" --dbname "$runtime_scratch" \
-        --command "SELECT (pg_get_constraintdef(oid) LIKE '%wallet_metadata%')::TEXT || ':' || (pg_get_constraintdef(oid) LIKE '%wallet_backup%')::TEXT FROM pg_constraint WHERE conrelid = 'wallet_backup_blobs'::REGCLASS AND conname = 'wallet_backup_blobs_stream_chk';"
-  )"
-  [[ "$rollback_state" == "true:false" ]] \
-    || die "migration 076 runtime-role refusal mutated the stream contract ($rollback_state)"
-  docker exec "$CONTAINER" dropdb --username "$PG_USER" "$runtime_scratch"
-  echo "test-db: migration 076 refused runtime-role execution transactionally"
-}
-
 assert_mixed_claim_fee_migration_owner_boundary() {
   local database="$1"
   local migration="$2"
@@ -467,9 +437,6 @@ apply_migrations() {
     if [[ "$with_hooks" == "true" && "$base" == "065_private_invoice_presentations" ]]; then
       assert_private_invoice_cutover_refusal "$database" "$migration"
     fi
-    if [[ "$with_hooks" == "true" && "$base" == "076_unified_wallet_backup_stream" ]]; then
-      assert_wallet_backup_migration_owner_boundary "$database" "$migration"
-    fi
     if [[ "$with_hooks" == "true" && "$base" == "078_mixed_claim_fee_authority" ]]; then
       assert_mixed_claim_fee_migration_owner_boundary "$database" "$migration"
     fi
@@ -493,7 +460,6 @@ apply_migrations() {
        || "$base" == "061_invoice_quote_versions" \
        || "$base" == "062_invoice_quote_provider_attempts" \
        || "$base" == "063_checkout_private_memo" \
-       || "$base" == "064_wallet_backup_blobs" \
        || "$base" == "065_private_invoice_presentations" \
        || "$base" == "066_get_paid_transaction_history" \
        || "$base" == "067_bull_bitcoin_fiat_settlement" \
@@ -505,7 +471,6 @@ apply_migrations() {
        || "$base" == "073_unfunded_provider_watch" \
        || "$base" == "074_bull_bitcoin_execution_rate" \
        || "$base" == "075_fiat_only_quote_accounting" \
-       || "$base" == "076_unified_wallet_backup_stream" \
        || "$base" == "077_bull_bitcoin_create_correlation" \
        || "$base" == "078_mixed_claim_fee_authority" \
        || "$base" == "079_lightning_address_provider_only" \

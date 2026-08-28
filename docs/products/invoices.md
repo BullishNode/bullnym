@@ -29,8 +29,8 @@ creates the invoice and may create an initial Lightning offer.
 
 The server response contains a fragmentless `invoice_url`. Mobile appends its
 locally generated viewing key and exposes only the resulting private link
-through Copy, Share, and QR. There is no server or wallet-backup recovery path
-for that key. See [private invoice presentation v1](../protocols/private-invoice-v1.md).
+through Copy, Share, and QR. There is no server-side recovery path for that key.
+See [private invoice presentation v1](../protocols/private-invoice-v1.md).
 
 ## Lifetime and quote windows
 

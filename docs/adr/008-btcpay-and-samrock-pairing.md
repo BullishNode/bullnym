@@ -53,5 +53,3 @@ Retained wallets and manifest entries make retries idempotent.
   wallet existence.
 - Manifest/seed restore may recreate the BTCPay path-`100'` wallets, but local
   wallet existence does not recreate server pairing state.
-- Remote backup publication is coordinated by `wallet_backup` from the
-  manifest record signal; it is best-effort and does not gate pairing.
