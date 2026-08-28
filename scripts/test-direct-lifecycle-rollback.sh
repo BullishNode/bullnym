@@ -68,22 +68,6 @@ expect_refused \
   056_future_settlement_schema \
   0
 expect_allowed \
-  064_wallet_backup_blobs \
-  064_wallet_backup_blobs \
-  0
-expect_allowed \
-  064_wallet_backup_blobs \
-  065_future_wallet_backup_aware_schema \
-  0
-expect_refused \
-  063_checkout_private_memo \
-  064_wallet_backup_blobs \
-  0
-expect_refused \
-  063_checkout_private_memo \
-  065_future_wallet_backup_aware_schema \
-  0
-expect_allowed \
   067_bull_bitcoin_fiat_settlement \
   067_bull_bitcoin_fiat_settlement \
   0

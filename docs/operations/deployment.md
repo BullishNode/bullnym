@@ -59,14 +59,6 @@ Rollback the binary only when its migrations and signed API behavior remain
 compatible. Never roll back the database blindly. A rollback does not undo an
 on-chain transaction; reconcile in-flight swaps before and after the change.
 
-Migration 064 advances the exact runtime schema marker even though its new
-wallet-backup table is additive. A schema-063 binary therefore cannot become
-ready against a schema-064 database. Automatic binary/PWA rollback across this
-boundary is refused. To return to the pre-064 release, stop every writer and
-restore the validated schema-063 database backup together with its matching
-binary, PWA, and release record. Otherwise repair or roll forward with a
-schema-064-aware binary.
-
 Migration 047 has an explicit binary boundary. A same-schema rollback remains
 allowed. An initial rollback from a 047 binary to a 046 binary is also allowed
 while `invoice_direct_payment_transitions` is absent or empty. Once any direct
@@ -144,41 +136,6 @@ of obsolete surface fields. Before applying later migrations, a 059 binary's
 After 059, automatic binary rollback is forbidden. Repair or roll forward with
 a compatible binary, or restore the full validated pre-reset database and its
 matching pre-059 binary while every writer remains stopped.
-
-## Migration 064 opaque wallet backups
-
-Apply `064_wallet_backup_blobs.sql` as the privileged schema owner with
-`--set runtime_role=bullnym_app`. The migration creates only the opaque
-current-object table, its tombstone cleanup index, constraints, comments, and
-runtime CRUD grants. It does not transform existing payment or identity rows.
-
-Treat the schema marker as a stopped-writer deployment boundary:
-
-1. Stop every Bullnym writer and confirm the runtime role has no surviving
-   database session.
-2. Take a schema-063 PostgreSQL backup and prove it is readable with
-   `pg_restore --list` or an isolated restore. Preserve the matching binary,
-   PWA, release record, and configuration with it.
-3. Apply migration 064 as the distinct privileged owner. Never apply it as
-   `bullnym_app`.
-4. Start only the reviewed schema-064 binary and require `/ready`, `/version`,
-   the installed artifact digest, and the release record to agree before
-   enabling mobile backup traffic.
-5. Verify the runtime role has only `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
-   on `wallet_backup_blobs`; it must not own the table or hold `TRUNCATE`,
-   `REFERENCES`, `TRIGGER`, or PUBLIC-derived privileges.
-6. Apply the exact wallet-backup locations from `nginx.conf.example`, inspect
-   the effective configuration with `nginx -T`, run `nginx -t`, and reload.
-   Verify that the store route has a 3 MiB proxy ceiling, the fetch route has
-   an 8 KiB ceiling, both retain the Nginx API flood gate with HTTP `429`
-   rejection, and access logging is disabled for both. Exercise an
-   authenticated 2 MiB store through the public proxy before launch; a direct
-   loopback test does not prove the proxy contract.
-
-Rollback is a paired restore, not a table drop: stop the schema-064 writer,
-restore the validated schema-063 database, then restore its matching old
-binary/PWA/release record. Do not start the old binary against schema 064 and
-do not delete the backup table merely to force the old readiness marker.
 
 ## Migration 060 private LNURL comments
 
@@ -351,47 +308,12 @@ not run a schema-070-or-older binary after those migrations commit. Restore the
 validated immediate pre-071 backup with its matching 0.2 binary/PWA/release
 record, or repair and roll forward with a schema-075 build.
 
-## Migration 076 unified wallet backup stream
-
-Apply `076_unified_wallet_backup_stream.sql` as the privileged owner of
-`wallet_backup_blobs`, with `--set runtime_role=bullnym_app`, while every
-Bullnym writer is stopped. Never apply it as `bullnym_app`. Before applying it,
-record this preflight count:
-
-```sql
-SELECT stream, COUNT(*)
-FROM wallet_backup_blobs
-GROUP BY stream
-ORDER BY stream;
-```
-
-Record and retain the result as deployment evidence; both an empty store and
-existing legacy rows are supported. Migration 076 preserves every
-`keychain_manifest` and `wallet_metadata` row under its original stream,
-author, generation, ETag, ciphertext, hash, size, and timestamps. It must never
-relabel a row: legacy and unified signing/encryption keys are independently
-derived. It must never delete a row merely to make the migration pass.
-
-The migration extends the persistence constraint with `wallet_backup` and
-reasserts exactly `SELECT`, `INSERT`, `UPDATE`, and `DELETE` for the runtime
-role. The matching Rust API accepts only `wallet_backup`; retained legacy rows
-are inaccessible through new fetch, store, or delete requests. Readiness
-verifies the coexistence constraint, table ownership separation, absence of
-PUBLIC access, and the exact runtime CRUD grant. Start only a matching
-schema-076 binary.
-
-After startup, certify one signed create, exact replay, byte-exact fetch,
-conditional update, stale-head conflict, and conditional delete using the
-coordinated mobile build. Compare the decoded ciphertext bytes, not parsed or
-re-serialized envelope fields: Bullnym owns no plaintext schema and must never
-rewrite, inject, normalize, or reorder client backup content.
-
 ## Migration 077 Bull Bitcoin create correlation
 
 Apply `077_bull_bitcoin_create_correlation.sql` as the privileged owner of
 `bull_bitcoin_settlements`, with `--set runtime_role=bullnym_app`, while every
 Bullnym writer is stopped. Never apply it as `bullnym_app`. Take and validate a
-fresh schema-076 backup first, then record these preflight counts:
+fresh schema-075 backup first, then record these preflight counts:
 
 ```sql
 SELECT provider_state,
@@ -450,10 +372,10 @@ ambiguous create, and recovers only an exact validated provider order. Follow
 when a row has no safely retained order ID. Never guess that an order is absent
 or attach an order based only on amount.
 
-After migration 077 commits, do not start a schema-076-or-older writer: its
+After migration 077 commits, do not start a schema-075-or-older writer: its
 stale-dispatch recovery can abandon an uncertain provider create and permit a
 second economic path. Roll forward with the schema-077 build, or stop every
-writer and restore the matching validated schema-076 backup and artifact.
+writer and restore the matching validated schema-075 backup and artifact.
 
 ## Migration 078 mixed claim fee authority
 

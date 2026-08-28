@@ -30,9 +30,6 @@ Mobile feature boundaries (all top-level under `lib/features/`):
 - `features/deterministic_wallets` owns shared BIP85 child-wallet
   materialization primitives; `features/bip85_registry` owns reserved
   derivation-path policy.
-- `features/keychain_manifest`, `features/keychain_recovery`, and
-  `features/wallet_backup` own deterministic wallet-inventory recovery and
-  encrypted backup publish/fetch (see ADR 003).
 - `features/nostr_identity` owns Bull's reserved Nostr role mapping.
 
 Server boundaries:

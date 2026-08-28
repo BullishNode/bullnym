@@ -84,7 +84,6 @@ pub mod swap_manifest_witness;
 pub mod utxo;
 pub mod validators;
 pub mod version;
-pub mod wallet_backup;
 pub(crate) mod watcher_schedule;
 pub mod watcher_wakeup;
 

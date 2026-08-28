@@ -106,7 +106,7 @@ expect_refusal \
   058_permanent_public_names \
   'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
 expect_refusal \
-  064_wallet_backup_blobs \
+  063_checkout_private_memo \
   065_private_invoice_presentations \
   'migration 065 replaces wallet-invoice plaintext with required encrypted presentations'
 rollback_writer_stopped=0

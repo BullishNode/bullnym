@@ -82,12 +82,6 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 `RecoveryNotAvailable`, `ElectrumError`, `BoltzError`,
 `ClaimError`, and `InternalError`.
 
-The wallet-backup API uses its own strict error shape/status mapping. Its
-additional stable codes are
-`BackupInvalidRequest`, `BackupAuthError`, `BackupHeadConflict`,
-`BackupBlobTooLarge`, and `BackupCapacityExceeded`; see
-[Opaque wallet backups](wallet-backups.md).
-
 `details` is optional. Currently useful shapes include:
 
 ```json

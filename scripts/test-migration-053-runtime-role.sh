@@ -302,7 +302,6 @@ for later_migration in \
   migrations/061_invoice_quote_versions.sql \
   migrations/062_invoice_quote_provider_attempts.sql \
   migrations/063_checkout_private_memo.sql \
-  migrations/064_wallet_backup_blobs.sql \
   migrations/065_private_invoice_presentations.sql \
   migrations/066_get_paid_transaction_history.sql \
   migrations/067_bull_bitcoin_fiat_settlement.sql \
@@ -314,7 +313,6 @@ for later_migration in \
   migrations/073_unfunded_provider_watch.sql \
   migrations/074_bull_bitcoin_execution_rate.sql \
   migrations/075_fiat_only_quote_accounting.sql \
-  migrations/076_unified_wallet_backup_stream.sql \
   migrations/077_bull_bitcoin_create_correlation.sql \
   migrations/078_mixed_claim_fee_authority.sql \
   migrations/079_lightning_address_provider_only.sql \

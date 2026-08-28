@@ -13,7 +13,6 @@ Reserved Nostr role paths:
 
 | Path suffix | Role |
 | --- | --- |
-| `128002'/100'/1'` | Unified wallet-backup publishing and recovery |
 | `128002'/101'/1'` | Bullnym server authentication |
 | `128002'/102'/1'` | NIP-05 / public nym verification |
 
@@ -21,9 +20,9 @@ Bull Bitcoin reserves identities `100'` through `199'` for application roles.
 User-created identities start at identity `1'`, account `1'`, advance
 monotonically by identity, and skip that application range.
 
-The unified wallet-backup key, Bullnym auth key, and public verification key
-are separate and must not be reused for each other. Pre-release application
-numbers `86'` and `9000'` are unsupported.
+The Bullnym auth key and public verification key are separate and must not be
+reused for each other. Pre-release application numbers `86'` and `9000'` are
+unsupported.
 
 Bullnym registration and authenticated updates are signed by the Bullnym auth
 key. Registration stores the verification npub. NIP-05 resolves to the
@@ -32,11 +31,11 @@ verification npub. Profile publish/clear uses the verification key.
 ## Rationale
 
 The same user seed can safely derive multiple Nostr keys, but those keys have
-different privacy and authority properties. Reusing one key for private wallet
-backup storage, server authentication, and public NIP-05 identity would tie
-unrelated activities together and make rotation harder. Keeping user identities
-outside the application range prevents automatic user allocation from
-colliding with product roles.
+different privacy and authority properties. Reusing one key for server
+authentication and public NIP-05 identity would tie unrelated activities
+together and make rotation harder. Keeping user identities outside the
+application range prevents automatic user allocation from colliding with
+product roles.
 
 ## Consequences
 
